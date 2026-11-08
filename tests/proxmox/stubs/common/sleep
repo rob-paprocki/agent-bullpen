@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for sleep: returns at once so the tests run fast.
+exit 0

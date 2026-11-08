@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Test stub for install: the real one, without changing owners (the test user
+# 'bullpen' does not exist on the test machine).
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o | -g | --owner | --group) shift 2 ;;
+    --owner=* | --group=*) shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec /usr/bin/install "${args[@]}"

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for chown: changes nothing.
+echo "chown $*" >>"$BULLPEN_TEST_STATE/calls.log"

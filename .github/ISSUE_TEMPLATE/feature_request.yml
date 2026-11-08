@@ -1,0 +1,30 @@
+name: An idea or a request
+description: Something Agent Bullpen could do, or do better.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [ROADMAP.md](https://github.com/rob-paprocki/agent-bullpen/blob/main/ROADMAP.md) first: it may
+        already be planned, with the reason it waits.
+  - type: textarea
+    id: what
+    attributes:
+      label: What you would like
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What you are trying to do, and what you do today instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: help
+    attributes:
+      label: Can you help?
+      options:
+        - I can test it on my machines
+        - I can write a pull request
+        - Not right now

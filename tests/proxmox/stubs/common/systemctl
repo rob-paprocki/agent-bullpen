@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Test stub for systemctl: changes nothing, remembers which units were started.
+set -u
+echo "systemctl [${BULLPEN_TEST_ROOT:-host}] $*" >>"$BULLPEN_TEST_STATE/calls.log"
+units="${BULLPEN_TEST_ROOT:-$BULLPEN_TEST_STATE}/.stub-systemd"
+mkdir -p "$units"
+args=()
+for a in "$@"; do [[ "$a" == -* ]] || args+=("$a"); done
+case "${args[0]:-}" in
+  is-active) [[ -f "$units/${args[1]}" ]] ;;
+  enable | start | restart) [[ " $* " == *" --now "* || "${args[0]}" != enable ]] && touch "$units/${args[1]}"; exit 0 ;;
+  disable | stop) rm -f "$units/${args[1]:-none}"; exit 0 ;;
+  *) exit 0 ;;
+esac

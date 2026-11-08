@@ -1,0 +1,9 @@
+# Shell scripts must keep Unix line endings; Windows scripts get Windows ones.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+# The Proxmox installer engine and its test stubs run in bash too.
+*.func                  text eol=lf
+tests/proxmox/stubs/**  text eol=lf
+hub/enroll/install.sh   text eol=lf

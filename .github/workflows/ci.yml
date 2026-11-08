@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # The maintainer's release workflow, in the development repository, runs every check before it releases.
+  workflow_call:
+
+# Read the code, nothing more. No job here needs to write anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: End-to-end test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    # The end-to-end test took about 5 minutes on a developer machine in November 2026, with the
+    # tags and subtasks checks. The limit leaves room for slower runners.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the oldest Python the hub supports; 3.13 is what Debian 13 ships.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: hub/requirements.txt
+      - name: Install the hub's packages
+        run: python -m pip install -r hub/requirements.txt
+      - name: Run tests/test_hub_units.py
+        # The hub's database and shared helpers, and a few parts of the web app.
+        run: python tests/test_hub_units.py
+      - name: Run tests/test_runner_units.py
+        # The runner's own checks on Linux (the compile jobs run them on Windows, macOS and Python 3.9).
+        run: python tests/test_runner_units.py
+      - name: Run tests/smoke_test.py
+        # Starts a hub and two runners with a fake agent; no AI service is called.
+        run: python tests/smoke_test.py
+
+  compile:
+    name: Compile and run the runner (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, python: "3.11", hub: true }
+          - { os: macos-latest, python: "3.11", hub: true }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile the hub (hub/*.py and its sub-folders)
+        if: matrix.hub
+        run: python -c "import glob, py_compile; [py_compile.compile(f, doraise=True) for f in glob.glob('hub/**/*.py', recursive=True)]"
+      - name: Compile the runner
+        run: python -c "import glob, py_compile; [py_compile.compile(f, doraise=True) for f in glob.glob('runner/*.py')]"
+      - name: Run runner.py --help
+        shell: bash
+        run: python runner/runner.py --help
+      - name: Run tests/test_runner_units.py
+        # The runner's own checks, with the fake agent and a stand-in for the hub.
+        run: python tests/test_runner_units.py
+
+  runner-oldest-python:
+    # The runner supports Python 3.9 and newer: that is the python3 macOS's Command Line Tools
+    # install. GitHub's setup-python has no 3.9 for current Ubuntu images, so use the official
+    # Python 3.9 container image instead.
+    name: Compile and run the runner (Python 3.9)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: python:3.9-slim
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile the runner
+        run: python -c "import glob, py_compile; [py_compile.compile(f, doraise=True) for f in glob.glob('runner/*.py')]"
+      - name: Run runner.py --help
+        run: python runner/runner.py --help
+      - name: Run tests/test_runner_units.py
+        run: python tests/test_runner_units.py
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check every shell script
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          # *.func files are sourced by the Proxmox installer and have no shebang line.
+          files=(**/*.sh misc/*.func)
+          shellcheck --version
+          printf 'checking %s\n' "${files[@]}"
+          shellcheck --shell=bash "${files[@]}"
+
+  repo:
+    name: Repository checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Versions, personal references and links (tests/check_repo.py)
+        env:
+          # Optional: private words to keep out, one regular expression per line (never printed).
+          BULLPEN_DENYLIST: ${{ secrets.BULLPEN_DENYLIST }}
+        run: python tests/check_repo.py
+      - name: The release scripts (tests/test_release.py)
+        run: python tests/test_release.py
+
+  proxmox:
+    name: Proxmox installer tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Run tests/proxmox (stand-in commands, nothing is installed)
+        shell: bash
+        run: |
+          if [[ -f tests/proxmox/run.sh ]]; then
+            bash tests/proxmox/run.sh
+          elif [[ -f tests/proxmox/test_installer.py ]]; then
+            # As root, like the installer on a Proxmox host (it refuses otherwise). Everything
+            # happens in a temporary fake root with stand-in commands.
+            sudo -E env "PATH=$PATH" python tests/proxmox/test_installer.py
+          else
+            echo "No Proxmox installer tests in this checkout."
+          fi

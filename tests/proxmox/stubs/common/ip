@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stub for ip: two bridges and a default route.
+case "$*" in
+  *"link show type bridge"*) printf "3: vmbr0: <BROADCAST,MULTICAST,UP> mtu 1500\n4: vmbr1: <BROADCAST,MULTICAST,UP> mtu 1500\n" ;;
+  *"route show default"*) echo "default via 192.168.100.1 dev vmbr0 proto kernel onlink" ;;
+  *) exit 0 ;;
+esac

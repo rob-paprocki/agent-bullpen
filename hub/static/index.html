@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Agent Bullpen</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232f6fdf'/><circle cx='11' cy='16' r='4' fill='white'/><circle cx='21' cy='11' r='3' fill='white'/><circle cx='21' cy='21' r='3' fill='white'/></svg>">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">Agent Bullpen</a>
+    <nav id="nav">
+      <a href="#/" data-route="overview">Overview</a>
+      <a href="#/task" data-route="task">New task</a>
+      <a href="#/council" data-route="council">Council</a>
+      <a href="#/history" data-route="history">History</a>
+      <a href="#/memory" data-route="memory">Memory</a>
+      <a href="#/mcp" data-route="mcp">MCP</a>
+      <a href="#/usage" data-route="usage">Usage</a>
+    </nav>
+    <button id="logout" class="ghost small" hidden>Log out</button>
+  </header>
+
+  <main id="view" aria-live="polite"></main>
+
+  <dialog id="login">
+    <form method="dialog" id="login-form">
+      <h2>Sign in</h2>
+      <p class="muted">Enter the hub password you chose during installation.</p>
+      <input type="password" id="login-password" autocomplete="current-password" required placeholder="Password">
+      <p class="error" id="login-error" hidden></p>
+      <button type="submit">Sign in</button>
+    </form>
+  </dialog>
+
+  <dialog id="add-machine-dialog" class="wide" aria-labelledby="add-machine-title">
+    <div class="row spread dialog-head"><h2 id="add-machine-title">Add a machine</h2>
+      <button type="button" class="ghost small" data-close>Close</button></div>
+    <div id="add-machine-body"></div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+hub/data/
+*.log
+# Private words for tests/check_repo.py to keep out (see that file).
+tests/denylist.local
+.claude/

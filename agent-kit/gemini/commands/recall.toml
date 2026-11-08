@@ -1,0 +1,9 @@
+# managed-by: bullpen
+description = "Search the shared memory every agent and account can see (Agent Bullpen)"
+prompt = """
+Search the user's shared memory on the Agent Bullpen for: {{args}}
+
+Call the `recall` tool of the `bullpen` MCP server with a few keywords (or run
+`bullpen recall <words>` if the tool isn't available). Summarise what you found, quote the
+relevant notes, and say if nothing matched.
+"""

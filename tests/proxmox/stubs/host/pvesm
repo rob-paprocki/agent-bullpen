@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Test stub for pvesm status -content <type>. Storages come from
+# BULLPEN_TEST_STORAGES_ROOTDIR / _VZTMPL as "name:type:avail_kib:used_kib;...".
+set -u
+echo "pvesm $*" >>"$BULLPEN_TEST_STATE/calls.log"
+content=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in -content) content=$2; shift 2 ;; *) shift ;; esac
+done
+case "$content" in
+  rootdir) list=${BULLPEN_TEST_STORAGES_ROOTDIR:-local-lvm:lvmthin:300000000:20000000} ;;
+  vztmpl) list=${BULLPEN_TEST_STORAGES_VZTMPL:-local:dir:80000000:10000000} ;;
+  *) list="" ;;
+esac
+printf '%-16s %8s %8s %16s %16s %16s %8s\n' Name Type Status Total Used Available %
+IFS=';' read -ra items <<<"$list"
+for item in "${items[@]}"; do
+  IFS=: read -r name type avail used <<<"$item"
+  printf '%-16s %8s %8s %16s %16s %16s %8s\n' "$name" "$type" active $((avail + used)) "$used" "$avail" "5.00%"
+done

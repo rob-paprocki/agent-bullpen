@@ -1,0 +1,913 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034,SC2154  # settings are shared with the ct/ script and the container
+# =============================================================================
+#  misc/build.func: the Proxmox VE host side of the Agent Bullpen installers.
+#
+#  A ct/<app>.sh script sets APP (the display name), NSAPP (the short name used
+#  for the hostname, the install script and the banner) and its var_* defaults,
+#  then calls, in order:
+#    header_info, variables, color, catch_errors, start, build_container,
+#    description
+#  and defines update_script() for the "update" command inside the container.
+#  This is the same contract as community-scripts/ProxmoxVE, so the scripts
+#  read the same way. The code here is our own (MIT licence).
+#
+#  Copyright (c) 2026 Agent Bullpen contributors. https://github.com/rob-paprocki/agent-bullpen
+#  Not affiliated with community-scripts or Proxmox Server Solutions GmbH.
+#  No telemetry: the only servers contacted are GitHub (our repository and its
+#  releases) and the ones Proxmox and the container's packages normally use.
+# =============================================================================
+[[ -n "${_BULLPEN_BUILD_LOADED:-}" ]] && return 0
+_BULLPEN_BUILD_LOADED=1
+
+# var_* settings given on the command line or in the environment. They win
+# over My Defaults.
+BULLPEN_ENV_KEYS=" $(compgen -e | grep '^var_' | tr '\n' ' ' || true) "
+BULLPEN_RAW_BASE="${BULLPEN_RAW_BASE:-https://raw.githubusercontent.com/${BULLPEN_REPO:-rob-paprocki/agent-bullpen}/${BULLPEN_REF:-main}}"
+
+if [[ -n "${BULLPEN_ENGINE_ROOT:-}" ]]; then
+  # shellcheck source=misc/core.func
+  source "${BULLPEN_ENGINE_ROOT}/misc/core.func"
+else
+  _bullpen_core=$(curl -fsSL --connect-timeout 10 --max-time 60 "${BULLPEN_RAW_BASE}/misc/core.func") || {
+    echo "Could not download misc/core.func from ${BULLPEN_RAW_BASE}" >&2
+    exit 115
+  }
+  # shellcheck disable=SC1091
+  source /dev/stdin <<<"$_bullpen_core"
+  unset _bullpen_core
+fi
+
+# Keys My Defaults may hold. Passwords and tokens are deliberately not here.
+DEFAULTS_KEYS=(var_unprivileged var_cpu var_ram var_disk var_os var_version var_hostname var_brg
+  var_net var_gateway var_vlan var_ns var_searchdomain var_ssh var_ssh_authorized_key var_verbose
+  var_tags var_container_storage var_template_storage var_hub_port var_hub_public_url var_ref)
+
+variables() {
+  NSAPP=${NSAPP:-$(tr '[:upper:] ' '[:lower:]-' <<<"$APP")}
+  var_install="${NSAPP}-install"
+  SESSION_ID=$(cut -c1-8 /proc/sys/kernel/random/uuid)
+  BUILD_LOG="${TMPDIR:-/tmp}/${NSAPP}-${SESSION_ID}.log"
+  BULLPEN_LOG=$BUILD_LOG
+  (umask 077 && : >"$BUILD_LOG")
+  BULLPEN_STATE_DIR="${FS_ROOT}/usr/local/bullpen"
+  DEFAULTS_FILE="${BULLPEN_STATE_DIR}/default.vars"
+  BACKTITLE="Agent Bullpen"
+  APP_DEFAULT_CPU=${var_cpu:-1} APP_DEFAULT_RAM=${var_ram:-1024} APP_DEFAULT_DISK=${var_disk:-4}
+}
+
+# ------------------------------------------------------- pre-flight checks ---
+shell_check() { [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]] || { msg_error "Please run this with bash 4 or newer."; exit 103; }; }
+root_check() { [[ $EUID -eq 0 ]] || { msg_error "Please run this script as root."; exit 104; }; }
+
+pve_check() {
+  PVEVERSION=$(pveversion 2>/dev/null | awk -F/ '{print $2; exit}') || PVEVERSION=""
+  case "${PVEVERSION%%.*}" in
+    8 | 9) ;;
+    *) msg_error "This version of Proxmox VE (${PVEVERSION:-unknown}) is not supported. Supported: 8.x and 9.x."
+       exit 1 ;;
+  esac
+}
+
+ensure_whiptail() {
+  command -v whiptail >/dev/null 2>&1 && return 0
+  msg_info "Installing whiptail"
+  $STD apt-get install -y whiptail
+  msg_ok "Installed whiptail"
+}
+
+arch_check() {
+  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+  case "$ARCH" in
+    amd64 | x86_64) ARCH=amd64 ;;
+    arm64 | aarch64) ARCH=arm64
+      msg_warn "ARM64 host: Proxmox VE does not support ARM officially, and the template must exist for arm64." ;;
+    *) msg_error "This installer needs an amd64 or arm64 host (this one is ${ARCH})."; exit 106 ;;
+  esac
+}
+
+ssh_check() {
+  [[ -n "${SSH_CLIENT:-}" ]] || return 0
+  msg_warn "You are connected over SSH. Keep the session open until the install finishes; closing it stops the install."
+}
+
+# ----------------------------------------------------------------- dialogs ---
+# wt KIND TITLE TEXT HEIGHT WIDTH [ARGS]: one whiptail dialog. The answer is
+# left in WT. Returns 0 for Next/OK/Yes, 1 for Back/Cancel/No, 255 for Esc.
+# Callers can set local wt_opts=(...), WT_OK and WT_CANCEL first.
+wt() {
+  local kind=$1 title=$2 text=$3 rc=0
+  shift 3
+  WT=$(whiptail --backtitle "$BACKTITLE" --title "$title" --ok-button "${WT_OK:-Next}" \
+    --cancel-button "${WT_CANCEL:-Back}" ${wt_opts[@]+"${wt_opts[@]}"} "--${kind}" "$text" "$@" 3>&1 1>&2 2>&3) || rc=$?
+  return "$rc"
+}
+wt_msg() { whiptail --backtitle "$BACKTITLE" --title "$1" --msgbox "$2" 12 70 || true; }
+
+# ------------------------------------------------------------- validators ---
+# valid_KIND VALUE: prints why VALUE is not acceptable and returns 1, or returns 0.
+_is_ipv4() {
+  local IFS=. o
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  for o in $1; do (( o <= 255 )) || return 1; done
+}
+_is_int() { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= $2 && $1 <= $3 )); }
+valid_ctid() {
+  _is_int "$1" 100 999999999 || { echo "The container ID must be a number from 100 up."; return 1; }
+  pvesh get /cluster/nextid --vmid "$1" >/dev/null 2>&1 || { echo "Container/VM ID $1 is already in use."; return 1; }
+}
+valid_hostname() {
+  [[ $1 =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$ ]] ||
+    { echo "Use lowercase letters, digits and hyphens, for example bullpen."; return 1; }
+}
+valid_disk() { _is_int "$1" 2 65536 || { echo "Use a whole number of GB, 2 or more."; return 1; }; }
+valid_cpu() { _is_int "$1" 1 128 || { echo "Use a whole number of cores from 1 to 128."; return 1; }; }
+valid_ram() { _is_int "$1" 256 1048576 || { echo "Use a whole number of MiB, 256 or more (1024 is a good size)."; return 1; }; }
+valid_unpriv() { [[ $1 == 0 || $1 == 1 ]] || { echo "Use 1 (unprivileged) or 0 (privileged)."; return 1; }; }
+valid_yesno() { [[ $1 == yes || $1 == no ]] || { echo "Use yes or no."; return 1; }; }
+valid_bridge() { [[ $1 =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || { echo "Use a bridge name like vmbr0."; return 1; }; }
+valid_net() {
+  [[ $1 == dhcp ]] && return 0
+  { [[ $1 =~ ^[0-9.]+/([0-9]|[12][0-9]|3[0-2])$ ]] && _is_ipv4 "${1%/*}"; } ||
+    { echo "Use dhcp, or an address with its prefix like 192.168.100.20/24."; return 1; }
+}
+valid_gateway() { [[ -z $1 ]] || _is_ipv4 "$1" || { echo "Use an IPv4 address like 192.168.100.1."; return 1; }; }
+valid_vlan() { [[ -z $1 ]] || _is_int "$1" 1 4094 || { echo "Use a VLAN number from 1 to 4094, or leave it blank."; return 1; }; }
+valid_dns() {
+  local ip
+  for ip in $1; do
+    _is_ipv4 "$ip" || [[ $ip =~ ^[0-9a-fA-F:]+$ ]] || { echo "Use IP addresses separated by spaces, or leave it blank."; return 1; }
+  done
+}
+valid_domain() { [[ -z $1 || $1 =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Use a domain like home.lan, or leave it blank."; return 1; }; }
+valid_tags() { [[ $1 =~ ^[a-z0-9_+.-]+(;[a-z0-9_+.-]+)*$ ]] || { echo "Use tags made of lowercase letters, digits, - and _, separated by ;"; return 1; }; }
+valid_sshkey() {
+  [[ -z $1 || $1 =~ ^(ssh-|ecdsa-|sk-)[A-Za-z0-9@.-]+\ [A-Za-z0-9+/=]+( .*)?$ ]] ||
+    { echo "That doesn't look like a public SSH key (one line starting with ssh-)."; return 1; }
+}
+valid_rootpw() { [[ -z $1 ]] || { [[ $1 != *" "* && ${#1} -ge 5 ]] || { echo "Use at least 5 characters and no spaces."; return 1; }; }; }
+valid_hubpw() {
+  [[ -z $1 ]] || { [[ ${#1} -ge 8 && $1 != *"'"* && $1 != *$'\n'* ]] ||
+    { echo "Use at least 8 characters and no single quote (')."; return 1; }; }
+}
+# The hub runs as an ordinary service user, which can't listen on ports below 1024; put a reverse
+# proxy in front of it for 80/443.
+valid_port() { _is_int "$1" 1024 65535 || { echo "Use a port from 1024 to 65535 (put a reverse proxy in front for 80 or 443)."; return 1; }; }
+valid_url() {
+  [[ -z $1 || $1 =~ ^https?://[^[:space:]\'\"\<\>]+$ ]] ||
+    { echo "Use a full address starting with http:// or https://, or leave it blank."; return 1; }
+}
+valid_token() {
+  [[ -z $1 || $1 =~ ^[A-Za-z0-9+/=_.-]{20,}$ ]] ||
+    { echo "That doesn't look like a tunnel token. Paste only the long string that starts with ey."; return 1; }
+}
+valid_ref() { [[ -z $1 || $1 =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$ ]] || { echo "Use a release tag like v1.0.0, a branch name, or leave it blank."; return 1; }; }
+
+# The settings, with the name a user sets them by and the check they need.
+SETTINGS_CHECKS=(var_ctid:CTID:ctid var_hostname:HN:hostname var_disk:DISK_SIZE:disk var_cpu:CORE_COUNT:cpu
+  var_ram:RAM_SIZE:ram var_unprivileged:CT_TYPE:unpriv var_brg:BRG:bridge var_net:NET:net var_gateway:GATE:gateway
+  var_vlan:VLAN:vlan var_ns:NS:dns var_searchdomain:SD:domain var_ssh:SSH:yesno var_ssh_authorized_key:SSH_KEY:sshkey
+  var_verbose:VERBOSE:yesno var_tags:TAGS:tags var_pw:PW:rootpw var_hub_password:var_hub_password:hubpw
+  var_hub_port:var_hub_port:port var_hub_runner_url:var_hub_runner_url:url var_hub_public_url:var_hub_public_url:url
+  var_cf_tunnel_token:var_cf_tunnel_token:token var_ref:var_ref:ref)
+
+validate_settings() {
+  local entry user name check err
+  for entry in "${SETTINGS_CHECKS[@]}"; do
+    IFS=: read -r user name check <<<"$entry"
+    err=$("valid_${check}" "${!name:-}") || fatal "${user}: ${err}" 1
+  done
+  [[ $NET == dhcp || -n $GATE ]] || fatal "A fixed address (var_net) also needs a gateway (var_gateway)." 1
+}
+
+# ------------------------------------------------------------- My Defaults ---
+saved_default() { # saved_default KEY: the value saved in My Defaults, if any
+  [[ -f "$DEFAULTS_FILE" ]] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$DEFAULTS_FILE" | tail -n1 | sed -e "s/^['\"]//" -e "s/['\"]$//"
+}
+
+set_default() { # set_default KEY VALUE: saves one setting in My Defaults
+  local tmp
+  install -d -m 0700 "$BULLPEN_STATE_DIR"
+  [[ -f "$DEFAULTS_FILE" ]] || defaults_header >"$DEFAULTS_FILE"
+  tmp=$(mktemp "${DEFAULTS_FILE}.XXXXXX")
+  { grep -v "^[[:space:]]*$1=" "$DEFAULTS_FILE" || true; printf '%s=%s\n' "$1" "$2"; } >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$DEFAULTS_FILE"
+}
+
+defaults_header() {
+  cat <<'EOF'
+# Agent Bullpen: My Defaults, used by "My Defaults" in the installer menu.
+# One setting per line, as var_name=value. Settings given on the command line win.
+# CPU, RAM and disk never go below what the app itself needs.
+# Passwords and tokens are never stored here.
+EOF
+}
+
+# load_my_defaults: fills in settings from My Defaults. Returns 1 when the file
+# holds nothing but the storage choices.
+load_my_defaults() {
+  local line key val found=1
+  [[ -f "$DEFAULTS_FILE" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ $line =~ ^[[:space:]]*(var_[a-z0-9_]+)=(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]} val=${BASH_REMATCH[2]}
+    val=${val#[\'\"]} val=${val%[\'\"]}
+    if [[ " ${DEFAULTS_KEYS[*]} " != *" $key "* ]]; then
+      msg_warn "My Defaults: ignoring ${key} (not a setting that can be saved)"
+      continue
+    fi
+    [[ $key == var_container_storage || $key == var_template_storage ]] || found=0
+    [[ $BULLPEN_ENV_KEYS == *" $key "* ]] && continue
+    case $key in
+      var_cpu | var_ram | var_disk) [[ $val =~ ^[0-9]+$ ]] && (( val > ${!key:-0} )) && printf -v "$key" '%s' "$val" ;;
+      *) printf -v "$key" '%s' "$val" ;;
+    esac
+  done <"$DEFAULTS_FILE"
+  return "$found"
+}
+
+save_my_defaults() {
+  local pair key name tmp
+  install -d -m 0700 "$BULLPEN_STATE_DIR"
+  tmp=$(mktemp "${DEFAULTS_FILE}.XXXXXX")
+  {
+    defaults_header
+    for pair in var_unprivileged:CT_TYPE var_cpu:CORE_COUNT var_ram:RAM_SIZE var_disk:DISK_SIZE var_hostname:HN \
+      var_brg:BRG var_net:NET var_gateway:GATE var_vlan:VLAN var_ns:NS var_searchdomain:SD var_ssh:SSH \
+      var_ssh_authorized_key:SSH_KEY var_verbose:VERBOSE var_hub_port:var_hub_port var_hub_public_url:var_hub_public_url; do
+      key=${pair%%:*} name=${pair#*:}
+      printf '%s=%s\n' "$key" "${!name:-}"
+    done
+    grep -E '^var_(container|template)_storage=' "$DEFAULTS_FILE" 2>/dev/null || true
+  } >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$DEFAULTS_FILE"
+  msg_ok "Saved My Defaults to ${DEFAULTS_FILE#"$FS_ROOT"}"
+}
+
+settings_menu() {
+  local WT_OK=Select WT_CANCEL=Back wt_opts=(--notags) shown
+  while wt menu "SETTINGS" "\nMy Defaults are kept in ${DEFAULTS_FILE#"$FS_ROOT"} (root only)." 15 70 3 \
+    1 "Edit My Defaults (opens nano)" 2 "Show My Defaults" 3 "Delete My Defaults"; do
+    case $WT in
+      1) if [[ ! -f "$DEFAULTS_FILE" ]]; then
+           install -d -m 0700 "$BULLPEN_STATE_DIR"
+           (umask 077 && { defaults_header; printf '#%s=\n' "${DEFAULTS_KEYS[@]}"; } >"$DEFAULTS_FILE")
+         fi
+         "${EDITOR:-nano}" "$DEFAULTS_FILE" || true ;;
+      2) shown="You have no saved defaults yet."
+         [[ -f "$DEFAULTS_FILE" ]] && shown=$(cat "$DEFAULTS_FILE")
+         wt_msg "MY DEFAULTS" "$shown" ;;
+      3) if whiptail --backtitle "$BACKTITLE" --title "MY DEFAULTS" --defaultno --yesno "Delete My Defaults?" 8 50; then
+           rm -f "$DEFAULTS_FILE"
+         fi ;;
+    esac
+  done
+}
+
+# --------------------------------------------------------------- settings ---
+base_settings() {
+  CT_TYPE=${var_unprivileged:-1}
+  CTID=${var_ctid:-}
+  [[ -n "$CTID" ]] || CTID=$(pvesh get /cluster/nextid 2>/dev/null) || CTID=""
+  [[ -n "$CTID" ]] || fatal "Could not get a free container ID from Proxmox (pvesh get /cluster/nextid)." 1
+  HN=${var_hostname:-$NSAPP} HN=${HN,,}
+  DISK_SIZE=${var_disk} CORE_COUNT=${var_cpu} RAM_SIZE=${var_ram}
+  BRG=${var_brg:-vmbr0} NET=${var_net:-dhcp} GATE=${var_gateway:-} VLAN=${var_vlan:-}
+  NS=${var_ns:-} SD=${var_searchdomain:-} SSH=${var_ssh:-no} SSH_KEY=${var_ssh_authorized_key:-}
+  VERBOSE=${var_verbose:-no} PW=${var_pw:-}
+  local tag tags="bullpen"
+  for tag in ${var_tags//[,;]/ }; do [[ ";$tags;" == *";$tag;"* ]] || tags+=";$tag"; done
+  TAGS=$tags
+}
+
+_summary_line() { printf '%s%s%s:%s %s%s%s\n' "$1" "$BOLD$DGN" "$2" "$CL" "$BGN" "$3" "$CL"; }
+
+echo_default() {
+  local label=$1 icon=$DEFAULT colour=$BL
+  [[ $MODE == advanced ]] && icon=$ADVANCED colour=$RD
+  printf '%s%s%sUsing %s on node %s%s\n' "$icon" "$BOLD" "$colour" "$label" "$(hostname)" "$CL"
+  _summary_line "$INFO" "PVE Version" "${PVEVERSION} (Kernel: $(uname -r))"
+  _summary_line "$CONTAINERID" "Container ID" "$CTID"
+  _summary_line "$OS" "Operating System" "${var_os} (${var_version})"
+  _summary_line "$CONTAINERTYPE" "Container Type" "$([[ $CT_TYPE == 1 ]] && echo Unprivileged || echo Privileged)"
+  _summary_line "$DISKSIZE" "Disk Size" "${DISK_SIZE} GB"
+  _summary_line "$CPUCORE" "CPU Cores" "$CORE_COUNT"
+  _summary_line "$RAMSIZE" "RAM Size" "${RAM_SIZE} MiB"
+  if [[ $MODE != default ]]; then
+    _summary_line "$HOSTNAME_ICON" "Hostname" "$HN"
+    _summary_line "$BRIDGE" "Bridge" "$BRG"
+    _summary_line "$NETWORK" "IPv4" "$NET${GATE:+ (gateway $GATE)}"
+    [[ -n $VLAN ]] && _summary_line "$VLANTAG" "VLAN" "$VLAN"
+    [[ $SSH == yes ]] && _summary_line "$ROOTSSH" "Root SSH" "enabled"
+  fi
+  [[ $VERBOSE == yes ]] && _summary_line "$SEARCH" "Verbose Mode" "Enabled"
+  printf '%s%s%sCreating the %s container with the settings above%s\n' "$CREATING" "$BOLD" "$colour" "$APP" "$CL"
+}
+
+settings_summary() {
+  cat <<EOF
+Container
+  Type:         $([[ $CT_TYPE == 1 ]] && echo Unprivileged || echo Privileged)
+  ID / name:    $CTID / $HN
+  Resources:    $CORE_COUNT CPU, $RAM_SIZE MiB RAM, $DISK_SIZE GB disk
+  Root login:   $([[ -n $PW ]] && echo "password set" || echo "console without password")$([[ $SSH == yes ]] && echo ", SSH on")
+
+Network
+  Bridge:       $BRG${VLAN:+ (VLAN $VLAN)}
+  IPv4:         $NET${GATE:+, gateway $GATE}
+  DNS:          ${NS:-from the host}
+
+Hub
+  Password:     $([[ -n ${var_hub_password:-} ]] && echo "set" || echo "generate one")
+  Port:         ${var_hub_port}
+  For machines: ${var_hub_runner_url:-http://<container IP>:${var_hub_port}}
+  Public URL:   ${var_hub_public_url:-none}
+  Tunnel:       $([[ -n ${var_cf_tunnel_token:-} ]] && echo "Cloudflare Tunnel" || echo "none")
+  Release:      ${var_ref:-newest release}
+EOF
+}
+
+# ----------------------------------------------------------------- wizard ---
+_check() { # _check KIND VALUE TITLE: shows why VALUE is wrong, if it is
+  local err
+  err=$("valid_$1" "$2") && return 0
+  wt_msg "$3" "$err"
+  return 1
+}
+
+_ask() { # _ask VAR KIND TITLE TEXT: an input box for one setting
+  local var=$1 kind=$2 title=$3 text=$4
+  wt inputbox "$title" "$text" 12 72 "${!var:-}" || return
+  _check "$kind" "$WT" "$title" || return 2
+  printf -v "$var" '%s' "$WT"
+}
+
+_ask_secret() { # _ask_secret VAR KIND TITLE TEXT: a password box, typed twice
+  local var=$1 kind=$2 title=$3 text=$4 first
+  wt passwordbox "$title" "$text" 12 72 || return
+  first=$WT
+  _check "$kind" "$first" "$title" || return 2
+  if [[ -n $first ]]; then
+    wt passwordbox "$title" "Type it again to check" 10 72 || return 2
+    [[ $WT == "$first" ]] || { wt_msg "$title" "The two entries do not match. Please try again."; return 2; }
+  fi
+  printf -v "$var" '%s' "$first"
+}
+
+_adv_type() {
+  local wt_opts=(--default-item "$CT_TYPE") WT_CANCEL=Exit
+  wt menu "CONTAINER TYPE" "Choose the container type" 12 60 2 1 "Unprivileged (recommended)" 0 "Privileged" || return
+  CT_TYPE=$WT
+}
+_adv_rootpw() { _ask_secret PW rootpw "ROOT PASSWORD" $'Root password for the container (needed for root SSH with a password).\n\nLeave blank to log in on the Proxmox console without a password.'; }
+_adv_ctid() { _ask CTID ctid "CONTAINER ID" "Container ID (the next free one is filled in)"; }
+_adv_hostname() { _ask HN hostname "HOSTNAME" "Hostname for the container"; }
+_adv_disk() { _ask DISK_SIZE disk "DISK SIZE" "Disk size in GB"; }
+_adv_cpu() { _ask CORE_COUNT cpu "CPU CORES" "Number of CPU cores"; }
+_adv_ram() { _ask RAM_SIZE ram "RAM SIZE" "Memory in MiB (the hub itself uses about 150 MiB)"; }
+_adv_bridge() {
+  local bridges=() items=() b
+  mapfile -t bridges < <(ip -o link show type bridge 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}' | sort)
+  (( ${#bridges[@]} )) || { _ask BRG bridge "NETWORK BRIDGE" "Network bridge, for example vmbr0"; return; }
+  for b in "${bridges[@]}"; do items+=("$b" ""); done
+  local wt_opts=(--default-item "$BRG")
+  wt menu "NETWORK BRIDGE" "Which network bridge should the container use?" 16 60 6 "${items[@]}" || return
+  BRG=$WT
+}
+_host_gateway() { ip route show default 2>/dev/null | awk '{print $3; exit}' || true; }
+_adv_ipv4() {
+  local current=dhcp address
+  [[ $NET != dhcp ]] && current=static
+  local wt_opts=(--default-item "$current")
+  wt menu "IPv4 ADDRESS" "How should the container get its IPv4 address?" 12 64 2 \
+    dhcp "Automatic (DHCP, recommended)" static "A fixed address" || return
+  if [[ $WT == dhcp ]]; then NET=dhcp GATE=""; return 0; fi
+  address=$NET
+  [[ $address == dhcp ]] && address=""
+  wt_opts=()
+  wt inputbox "STATIC IPv4 ADDRESS" "Address and prefix, for example 192.168.100.20/24" 10 64 "$address" || return 2
+  if [[ -z $WT || $WT == dhcp ]]; then wt_msg "STATIC IPv4 ADDRESS" "Enter an address like 192.168.100.20/24."; return 2; fi
+  _check net "$WT" "STATIC IPv4 ADDRESS" || return 2
+  address=$WT
+  wt inputbox "GATEWAY IP" "Gateway (usually your router), for example 192.168.100.1" 10 64 "${GATE:-$(_host_gateway)}" || return 2
+  [[ -n $WT ]] || { wt_msg "GATEWAY IP" "A fixed address needs a gateway."; return 2; }
+  _check gateway "$WT" "GATEWAY IP" || return 2
+  NET=$address GATE=$WT
+}
+_adv_vlan() { _ask VLAN vlan "VLAN TAG" "VLAN tag (leave blank for none)"; }
+_adv_dns() { _ask NS dns "DNS SERVER" "DNS server addresses, separated by spaces (leave blank to use the host's)"; }
+_adv_ssh() {
+  local wt_opts=(--default-item "$SSH")
+  wt menu "SSH ACCESS" "Allow root to log in to the container over SSH?" 12 70 2 \
+    no "No (recommended; use the Proxmox console)" yes "Yes" || return
+  if [[ $WT == no ]]; then SSH=no SSH_KEY=""; return 0; fi
+  wt_opts=()
+  wt inputbox "SSH KEY" $'Paste a public SSH key for root (one line starting with ssh-).\n\nLeave blank to log in with the root password instead.' 12 72 "$SSH_KEY" || return 2
+  _check sshkey "$WT" "SSH KEY" || return 2
+  [[ -n $WT || -n $PW ]] || { wt_msg "SSH ACCESS" "SSH needs a root password (step 2) or a key. Add one, or choose No."; return 2; }
+  SSH=yes SSH_KEY=$WT
+}
+_adv_verbose() {
+  local wt_opts=(--default-item "$VERBOSE")
+  wt menu "VERBOSE MODE" "Show the output of every command while installing?" 12 70 2 \
+    no "No: one line per step" yes "Yes: everything (useful when something fails)" || return
+  VERBOSE=$WT
+}
+_adv_hubpw() { _ask_secret var_hub_password hubpw "DASHBOARD PASSWORD" $'Password for the hub\'s web dashboard.\n\nLeave blank to generate one. It is shown once at the end.'; }
+_adv_port() { _ask var_hub_port port "HUB PORT" "Port the dashboard listens on"; }
+_adv_runner_url() {
+  _ask var_hub_runner_url url "ADDRESS FOR MACHINES" "The address your machines use to reach the hub, usually its LAN address.
+
+Leave blank for http://<container IP>:${var_hub_port}"
+}
+_adv_public_url() {
+  _ask var_hub_public_url url "PUBLIC ADDRESS" "Optional: the https address you open the dashboard at through a tunnel or reverse proxy, for example https://hub.example.com. MCP sign-ins return to it.
+
+Leave blank if you only use the hub on your network."
+}
+_adv_tunnel() {
+  local first
+  wt passwordbox "CLOUDFLARE TUNNEL" "Optional: a Cloudflare Tunnel token, to reach the hub from outside your network (see docs/03-cloudflare.md).
+
+Leave blank for no tunnel. You can add one later." 14 72 || return
+  first=$WT
+  _check token "$first" "CLOUDFLARE TUNNEL" || return 2
+  var_cf_tunnel_token=$first
+}
+_adv_release() {
+  _ask var_ref ref "RELEASE" "Which version to install.
+
+Leave blank for the newest release. You can also give a release tag like v1.0.0, or main for the newest code (not verified)."
+}
+_adv_confirm() {
+  local wt_opts=(--yes-button "Create" --no-button "Back" --scrolltext)
+  wt yesno "CONFIRM SETTINGS" "$(settings_summary)" 22 76 || return
+}
+
+ADVANCED_STEPS=(_adv_type _adv_rootpw _adv_ctid _adv_hostname _adv_disk _adv_cpu _adv_ram _adv_bridge
+  _adv_ipv4 _adv_vlan _adv_dns _adv_ssh _adv_verbose _adv_hubpw _adv_port _adv_runner_url _adv_public_url
+  _adv_tunnel _adv_release _adv_confirm)
+
+advanced_settings() {
+  local step=1 total=${#ADVANCED_STEPS[@]} rc
+  while (( step >= 1 && step <= total )); do
+    BACKTITLE="Agent Bullpen [Step ${step}/${total}]"
+    rc=0
+    "${ADVANCED_STEPS[step - 1]}" || rc=$?
+    case $rc in
+      0) step=$((step + 1)) ;;
+      1) step=$((step - 1)) ;;
+      2) ;; # the answer was not accepted: ask again
+      *) exit_script ;;
+    esac
+  done
+  BACKTITLE="Agent Bullpen"
+  (( step > 0 )) || exit_script
+}
+
+maybe_save_defaults() {
+  local wt_opts=(--defaultno) WT_OK=Yes WT_CANCEL=No
+  wt yesno "MY DEFAULTS" "Save these settings as My Defaults?
+
+They go in ${DEFAULTS_FILE#"$FS_ROOT"}, readable only by root. Passwords and tokens are never saved." 12 72 || return 0
+  save_my_defaults
+}
+
+# ---------------------------------------------------------------- storage ---
+_gb() { awk -v k="$1" 'BEGIN {printf "%.1fGB", k / 1048576}'; }
+
+select_storage() { # select_storage container|template
+  local class=$1 content key label want result="" i best=0
+  local names=() types=() frees=() useds=() name type used free
+  if [[ $class == container ]]; then
+    content=rootdir key=var_container_storage label="the container disk"
+  else
+    content=vztmpl key=var_template_storage label="container templates"
+  fi
+  while read -r name type _ _ used free _; do
+    names+=("$name") types+=("$type") useds+=("$used") frees+=("$free")
+  done < <(pvesm status -content "$content" 2>/dev/null | awk 'NR > 1 && $3 == "active"')
+  (( ${#names[@]} )) || fatal "No active storage can hold ${label} (content '${content}'). Enable one under Datacenter, Storage." 1
+  want=${!key:-}
+  [[ -n $want ]] || want=$(saved_default "$key")
+  for i in "${!names[@]}"; do
+    [[ ${frees[i]} -gt ${frees[best]} ]] && best=$i
+    [[ ${names[i]} == "$want" ]] && result=$i
+  done
+  if [[ -n $want && -z $result ]]; then
+    fatal "Storage '${want}' (${key}) can't hold ${label}. Choices: ${names[*]}" 1
+  elif [[ -z $result && ${#names[@]} -eq 1 ]]; then
+    result=0
+  elif [[ -z $result && $BULLPEN_UNATTENDED == yes ]]; then
+    result=$best
+    msg_warn "Several storages can hold ${label}; using ${names[best]} (most free space). Set ${key} to choose."
+  elif [[ -z $result ]]; then
+    local items=() WT_OK=OK WT_CANCEL=Exit wt_opts=()
+    for i in "${!names[@]}"; do
+      items+=("${names[i]}" "$(printf '%-9s Free: %s  Used: %s' "${types[i]}" "$(_gb "${frees[i]}")" "$(_gb "${useds[i]}")")" \
+        "$([[ $i == "$best" ]] && echo ON || echo OFF)")
+    done
+    wt radiolist "STORAGE POOLS" "Which storage pool for ${label}?
+(Spacebar to select)" 16 72 6 "${items[@]}" || exit_script
+    for i in "${!names[@]}"; do [[ ${names[i]} == "$WT" ]] && result=$i; done
+    [[ -n $result ]] || exit_script
+    set_default "$key" "${names[result]}"
+  fi
+  if [[ $class == container ]]; then
+    CONTAINER_STORAGE=${names[result]}
+    (( frees[result] >= DISK_SIZE * 1048576 )) ||
+      fatal "Storage ${CONTAINER_STORAGE} has only $(_gb "${frees[result]}") free; the container needs ${DISK_SIZE} GB." 1
+  else
+    TEMPLATE_STORAGE=${names[result]}
+  fi
+  msg_ok "Storage for ${label}: ${names[result]} (${types[result]}), free $(_gb "${frees[result]}")"
+}
+
+# ------------------------------------------------------------------ start ---
+main_menu() {
+  local WT_OK=Select WT_CANCEL=Exit wt_opts=(--notags --default-item 1)
+  local rc=0
+  wt menu "$APP" $'\nChoose an option:\n Use TAB or Arrow keys to navigate, ENTER to select.\n' 16 60 4 \
+    1 "Default Install" 2 "Advanced Install" 3 "My Defaults" 4 "Settings" || rc=$?
+  (( rc == 0 )) && return 0
+  # whiptail answers 1 for the Exit button. Anything else without a terminal means the menu
+  # couldn't be shown: automation that forgot mode= must not be told everything went fine.
+  if (( rc != 1 )) && [[ ! -t 0 ]]; then
+    fatal "No terminal for the menu, so nothing was installed. For an unattended install, set mode=default." 1
+  fi
+  exit_script
+}
+
+update_menu() {
+  local WT_OK=OK WT_CANCEL=Cancel wt_opts=(--notags --default-item 1)
+  [[ -z "${mode:-}" && -t 0 && -t 1 ]] && command -v whiptail >/dev/null 2>&1 || return 0
+  wt menu "${APP} update" "Update ${APP} in this container. Choose an option:" 14 64 3 \
+    1 "Yes (quiet)" 2 "Yes (show every command)" 3 "No, cancel" || exit_script
+  case $WT in 2) VERBOSE=yes ;; 3) exit_script ;; esac
+}
+
+install_script() {
+  shell_check
+  root_check
+  pve_check
+  ensure_whiptail
+  arch_check
+  ssh_check
+  local choice=${mode:-}
+  BULLPEN_UNATTENDED=no
+  case "${choice,,}" in default | 1 | mydefaults | 3 | userdefaults) BULLPEN_UNATTENDED=yes ;; esac
+  [[ "${var_unattended:-}" =~ ^(yes|true|1)$ ]] && BULLPEN_UNATTENDED=yes
+  while :; do
+    if [[ -z $choice ]]; then
+      header_info "$APP"
+      main_menu
+      choice=$WT
+    fi
+    header_info "$APP"
+    case "${choice,,}" in
+      1 | default) MODE=default; base_settings; validate_settings; echo_default "Default Settings"; break ;;
+      2 | advanced) MODE=advanced; base_settings; advanced_settings; validate_settings
+        maybe_save_defaults; echo_default "Advanced Settings"; break ;;
+      3 | mydefaults | userdefaults)
+        MODE=mydefaults
+        if load_my_defaults; then base_settings; validate_settings; echo_default "My Defaults"; break; fi
+        if [[ $BULLPEN_UNATTENDED == yes ]]; then
+          msg_warn "No My Defaults saved yet; using the default settings."
+          MODE=default; base_settings; validate_settings; echo_default "Default Settings"; break
+        fi
+        wt_msg "MY DEFAULTS" "You have no saved defaults yet. Run Advanced Install once and save its settings, or add them under Settings."
+        choice="" ;;
+      4 | settings) settings_menu; choice="" ;;
+      *) msg_error "Unknown mode '${choice}'. Use mode=default, advanced, mydefaults or settings."; exit 1 ;;
+    esac
+  done
+  app_settings
+  select_storage template
+  select_storage container
+}
+
+app_settings() {
+  GENERATED_PASSWORD=""
+  HUB_UI_PASSWORD=${var_hub_password:-}
+  if [[ -z $HUB_UI_PASSWORD ]]; then HUB_UI_PASSWORD=$(gen_password) GENERATED_PASSWORD=yes; fi
+  HUB_PORT=${var_hub_port:-8080}
+  HUB_PUBLIC_URL=${var_hub_public_url:-}
+  HUB_RUNNER_URL=${var_hub_runner_url:-}
+  CF_TUNNEL_TOKEN=${var_cf_tunnel_token:-}
+  BULLPEN_TRACK=${var_ref:-}
+  [[ $BULLPEN_TRACK =~ ^v[0-9] ]] && BULLPEN_TRACK=""  # a release tag: later updates follow new releases
+  return 0
+}
+
+start() {
+  if command -v pveversion >/dev/null 2>&1; then
+    install_script
+  else
+    # Not a Proxmox VE host: this is the update inside the container.
+    check_hub_installed
+    update_menu
+    update_script
+  fi
+}
+
+# ------------------------------------------------------------- build steps ---
+resolve_release() {
+  if [[ -n "${BULLPEN_LOCAL_SRC:-}" ]]; then
+    [[ -f "${BULLPEN_LOCAL_SRC}/hub/app.py" ]] ||
+      fatal "BULLPEN_LOCAL_SRC must be a folder with a copy of Agent Bullpen (no hub/app.py in ${BULLPEN_LOCAL_SRC})." 1
+    BULLPEN_SOURCE_KIND=local BULLPEN_SOURCE_REF="" BULLPEN_SOURCE_VERSION=$(bullpen_tree_version "$BULLPEN_LOCAL_SRC")
+    msg_ok "Source: the local copy in ${BULLPEN_LOCAL_SRC} (${BULLPEN_SOURCE_VERSION:-unknown version}, not verified)"
+    return 0
+  fi
+  msg_info "Checking for the newest release"
+  bullpen_resolve_ref "${var_ref:-}" || exit $?
+  if [[ $BULLPEN_SOURCE_KIND == release ]]; then
+    msg_ok "Release ${BULLPEN_SOURCE_REF} (the download is checked against its SHA256SUMS)"
+  else
+    msg_warn "Installing '${BULLPEN_SOURCE_REF}': not a release, so the download can't be verified."
+  fi
+}
+
+_find_template() { # _find_template VERSION: the newest matching template for this host's CPU, offered or downloaded
+  # Proxmox VE 9 lists amd64 and arm64 templates side by side; match the architecture in the file
+  # name (PVE 8 has no architecture column), or "arm64" would sort after "amd64" and win.
+  local pattern="^${var_os}-$1-standard_.*_${ARCH:-amd64}\.tar\." found
+  found=$(grep -E "$pattern" <<<"$_offered" | sort -V | tail -n1) || found=""
+  [[ -n $found ]] || found=$(grep -E "$pattern" <<<"$_have" | sort -V | tail -n1) || found=""
+  printf '%s' "$found"
+}
+
+get_template() {
+  local have
+  msg_info "Looking for the newest ${var_os} ${var_version} template"
+  $STD pveam update || msg_warn "Could not refresh the template list; using the list Proxmox already has."
+  _offered=$(pveam available --section system 2>/dev/null | awk '{print $2}') || _offered=""
+  _have=$(pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk 'NR > 1 {sub(/.*\//, "", $1); print $1}') || _have=""
+  have=$_have
+  TEMPLATE=$(_find_template "$var_version")
+  # Older Proxmox VE 8 releases offer no Debian 13 template. Unless Debian 13 was asked for, use 12.
+  if [[ -z $TEMPLATE && $var_os == debian && $var_version == 13 && $BULLPEN_ENV_KEYS != *" var_version "* ]]; then
+    TEMPLATE=$(_find_template 12)
+    if [[ -n $TEMPLATE ]]; then
+      var_version=12
+      msg_warn "This Proxmox VE offers no Debian 13 template, so the container uses Debian 12."
+    fi
+  fi
+  [[ -n $TEMPLATE ]] || fatal "No ${var_os} ${var_version} template found. Check the host's internet access; see: pveam available --section system" 1
+  if grep -qxF "$TEMPLATE" <<<"$have"; then
+    msg_ok "Template ${TEMPLATE} [local]"
+  else
+    msg_info "Downloading template ${TEMPLATE}"
+    $STD pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
+    msg_ok "Template ${TEMPLATE} [online]"
+  fi
+}
+
+create_container() {
+  local net0="name=eth0,bridge=${BRG},ip=${NET}" opts
+  [[ $NET != dhcp && -n $GATE ]] && net0+=",gw=${GATE}"
+  [[ -n $VLAN ]] && net0+=",tag=${VLAN}"
+  opts=(--hostname "$HN" --ostype "$var_os" --cores "$CORE_COUNT" --memory "$RAM_SIZE" --swap 512
+    --rootfs "${CONTAINER_STORAGE}:${DISK_SIZE}" --net0 "$net0" --unprivileged "$CT_TYPE"
+    --features nesting=1 --onboot 1 --tags "$TAGS")
+  [[ -n $NS ]] && opts+=(--nameserver "$NS")
+  [[ -n $SD ]] && opts+=(--searchdomain "$SD")
+  msg_info "Creating container ${CTID}"
+  # The ID was free when it was chosen, but minutes may have passed (storage dialog, template
+  # download): check again so a clash gets a clear message.
+  if ! pvesh get /cluster/nextid --vmid "$CTID" >/dev/null 2>&1; then
+    fatal "Container or VM ID ${CTID} was taken while the template downloaded. Run the installer again." 1
+  fi
+  $STD pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" "${opts[@]}" --arch "${ARCH:-amd64}"
+  # Only now is it ours: a failed create cleans up after itself, and a container with this ID that
+  # someone else made in the meantime must never be offered for removal.
+  BULLPEN_CT_CREATED=1
+  msg_ok "Container ${CTID} created"
+}
+
+start_container() {
+  local i
+  msg_info "Starting the container"
+  $STD pct start "$CTID"
+  msg_ok "Container started"
+  msg_info "Waiting for the container network"
+  IP=""
+  for ((i = 0; i < ${BULLPEN_NET_WAIT:-60}; i++)); do
+    IP=$(pct exec "$CTID" -- ip -4 -o addr show dev eth0 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}') || IP=""
+    [[ -n $IP ]] && break
+    sleep 1
+  done
+  [[ -n $IP ]] || fatal "The container got no IPv4 address in ${BULLPEN_NET_WAIT:-60} seconds. Check the bridge, VLAN and DHCP or the fixed address." 1
+  msg_ok "Network reachable (${IP})"
+}
+
+push_local_source() {
+  local tmp
+  _CT_LOCAL_SRC=""
+  [[ -n "${BULLPEN_LOCAL_SRC:-}" ]] || return 0
+  bullpen_mktemp tmp
+  msg_info "Copying the local source into the container"
+  tar -C "$BULLPEN_LOCAL_SRC" --exclude=.git --exclude=__pycache__ --exclude=hub/data --exclude=.venv \
+    --exclude=venv --exclude=node_modules -czf "$tmp/src.tar.gz" .
+  $STD pct push "$CTID" "$tmp/src.tar.gz" /root/.bullpen-src.tar.gz
+  _CT_LOCAL_SRC=/root/.bullpen-src.tar.gz
+  msg_ok "Copied the local source into the container"
+}
+
+# Runs install/<app>-install.sh inside the container. Settings travel as
+# exported environment variables (lxc-attach --keep-env), never as arguments,
+# so passwords and tokens don't show up in ps or in a log.
+run_install() {
+  local core funcs script rc=0
+  core=$(bullpen_get_file misc/core.func) ||
+    fatal "Could not fetch misc/core.func from ${BULLPEN_ENGINE_ROOT:-$BULLPEN_RAW_BASE}." 115
+  funcs=$(bullpen_get_file misc/install.func) ||
+    fatal "Could not fetch misc/install.func from ${BULLPEN_ENGINE_ROOT:-$BULLPEN_RAW_BASE}." 115
+  funcs="${core}"$'\n'"${funcs}"
+  script=$(bullpen_get_file "install/${var_install}.sh") ||
+    fatal "Could not fetch install/${var_install}.sh from ${BULLPEN_ENGINE_ROOT:-$BULLPEN_RAW_BASE}." 115
+  export FUNCTIONS_FILE_PATH=$funcs
+  export APPLICATION=$APP NSAPP CTID CTTYPE=$CT_TYPE VERBOSE SESSION_ID INSTALL_LOG="/root/.install-${SESSION_ID}.log"
+  export PASSWORD=$PW SSH_ROOT=$SSH SSH_AUTHORIZED_KEY=$SSH_KEY
+  export BULLPEN_REPO BULLPEN_REF=$BULLPEN_SOURCE_REF BULLPEN_SOURCE_REF BULLPEN_SOURCE_KIND BULLPEN_SOURCE_VERSION BULLPEN_TRACK
+  export HUB_UI_PASSWORD HUB_PORT HUB_PUBLIC_URL HUB_RUNNER_URL CF_TUNNEL_TOKEN
+  stop_spinner
+  if [[ $VERBOSE == yes ]]; then
+    msg_custom "ℹ️" "$YW" "Follow the install from another shell with: pct exec ${CTID} -- tail -f ${INSTALL_LOG}"
+  fi
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 BULLPEN_LOCAL_SRC=$_CT_LOCAL_SRC \
+    lxc-attach -n "$CTID" --keep-env -- bash -c "$script" || rc=$?
+  # The container has them now; later commands on the host don't need them.
+  export -n PASSWORD HUB_UI_PASSWORD CF_TUNNEL_TOKEN FUNCTIONS_FILE_PATH
+  (( rc == 0 )) || install_failed "$rc"
+}
+
+build_container() {
+  resolve_release
+  get_template
+  create_container
+  start_container
+  [[ -n $HUB_RUNNER_URL ]] || HUB_RUNNER_URL="http://${IP}:${HUB_PORT}"
+  push_local_source
+  run_install
+}
+
+# The Notes panel in the Proxmox web interface.
+description() {
+  local repo="https://github.com/${BULLPEN_REPO}" url="http://${IP}:${HUB_PORT}" version=${BULLPEN_SOURCE_VERSION:-}
+  DESCRIPTION=$(cat <<EOF
+<div align='center'>
+  <h2 style='font-size: 24px; margin: 20px 0;'>${APP} LXC</h2>
+  <p style='margin: 12px 0;'>Dashboard: <a href='${url}' target='_blank' rel='noopener noreferrer'>${url}</a></p>
+  <p style='margin: 12px 0;'>${version:+Version ${version} &middot; }Update: run <code>update</code> in the container console</p>
+  <p style='margin: 12px 0;'>
+    <a href='${repo}' target='_blank' rel='noopener noreferrer'>GitHub</a> &middot;
+    <a href='${repo}/tree/main/docs' target='_blank' rel='noopener noreferrer'>Guides</a> &middot;
+    <a href='${repo}/issues' target='_blank' rel='noopener noreferrer'>Issues</a>
+  </p>
+  <p style='margin: 12px 0; font-size: 12px;'>Agent Bullpen is an independent project. It is not affiliated with Proxmox Server Solutions GmbH or community-scripts.</p>
+</div>
+EOF
+  )
+  $STD pct set "$CTID" --description "$DESCRIPTION"
+}
+
+# ------------------------------------------------------- errors on the host ---
+offer_removal() {
+  local answer="" rc=0
+  [[ "${BULLPEN_CT_CREATED:-}" == 1 && -n "${CTID:-}" ]] || return 0
+  pct status "$CTID" >/dev/null 2>&1 || return 0
+  BULLPEN_CT_CREATED=""
+  printf '%s%s❓%sRemove broken container %s? (Y/n) [auto-remove in %ss]: %s' \
+    "$TAB" "$YW" "$TAB" "$CTID" "$BULLPEN_PROMPT_TIMEOUT" "$CL" >&2
+  read -r -t "$BULLPEN_PROMPT_TIMEOUT" answer || rc=$?
+  if (( rc > 128 )); then
+    printf '\n' >&2
+    answer=y
+  elif (( rc != 0 )); then
+    printf '\n' >&2
+    msg_warn "No answer could be read, so container ${CTID} was kept. Look inside with: pct enter ${CTID}"
+    return 0
+  fi
+  case "${answer,,}" in
+    "" | y | yes)
+      pct stop "$CTID" >/dev/null 2>&1 || true
+      if pct destroy "$CTID" >/dev/null 2>&1; then msg_ok "Removed container ${CTID}"; else msg_warn "Could not remove container ${CTID}; remove it in the Proxmox web interface."; fi ;;
+    *) msg_custom "🔍" "$YW" "Container ${CTID} kept. Look inside with: pct enter ${CTID}" ;;
+  esac
+}
+
+on_error() {
+  [[ -s "${BUILD_LOG:-}" ]] && msg_custom "📋" "$YW" "Full log: ${BUILD_LOG}"
+  offer_removal
+}
+
+install_failed() {
+  local rc=$1 combined="${TMPDIR:-/tmp}/${NSAPP}-${CTID}-${SESSION_ID}.log" tmp
+  trap - ERR
+  bullpen_mktemp tmp
+  pct pull "$CTID" "$INSTALL_LOG" "$tmp/install.log" >/dev/null 2>&1 || : >"$tmp/install.log"
+  (
+    umask 077
+    { echo "=== Host log: ${BUILD_LOG} ==="; cat "$BUILD_LOG"
+      echo "=== Container log: ${INSTALL_LOG} ==="; cat "$tmp/install.log"; } >"$combined"
+  )
+  printf '\n' >&2
+  msg_error "Installation failed in container ${CTID} (exit code: ${rc})"
+  msg_custom "📋" "$YW" "Full log: ${combined}"
+  offer_removal
+  exit "$rc"
+}
+
+# ------------------------------------------------- update (in the container) ---
+check_hub_installed() {
+  [[ -f "${FS_ROOT}/etc/bullpen/hub.env" && -d "${FS_ROOT}/opt/bullpen/app" ]] && return 0
+  msg_error "No ${APP} installation found on this machine."
+  msg_custom "💡" "$YW" "To create the hub container, run this command on the Proxmox VE host itself."
+  msg_custom "💡" "$YW" "On another Debian or Ubuntu machine, use scripts/linux/install-hub.sh (see docs/04-proxmox-hub.md)."
+  exit 1
+}
+
+_save_release_track() { # remember what "update" follows (releases, or a branch) even when nothing is installed
+  local file="${FS_ROOT}/opt/bullpen/release.env"
+  [[ -f $file ]] || return 0
+  [[ "$(_release_setting BULLPEN_TRACK)" == "${BULLPEN_TRACK:-}" ]] && return 0
+  if grep -q "^BULLPEN_TRACK=" "$file"; then
+    sed -i "s|^BULLPEN_TRACK=.*|BULLPEN_TRACK='${BULLPEN_TRACK:-}'|" "$file"
+  else
+    printf "BULLPEN_TRACK='%s'\n" "${BULLPEN_TRACK:-}" >>"$file"
+  fi
+}
+
+_release_setting() { # _release_setting KEY: a value from /opt/bullpen/release.env
+  sed -n "s/^$1='\(.*\)'$/\1/p" "${FS_ROOT}/opt/bullpen/release.env" 2>/dev/null | tail -n1
+}
+
+# Sets HUB_OLD_VERSION and decides what to download. Returns 1 (after saying
+# so) when there is nothing newer.
+check_for_hub_release() {
+  local track
+  HUB_OLD_VERSION=$(_release_setting BULLPEN_VERSION)
+  # Without release.env (an install that stopped before writing it), read the version from the code.
+  [[ -n $HUB_OLD_VERSION ]] ||
+    HUB_OLD_VERSION=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "${FS_ROOT}/opt/bullpen/app/app.py" 2>/dev/null | head -n1)
+  track=$(_release_setting BULLPEN_TRACK)
+  if [[ -n "${BULLPEN_LOCAL_SRC:-}" ]]; then
+    msg_ok "Updating ${APP} ${HUB_OLD_VERSION} from the local copy ${BULLPEN_LOCAL_SRC}"
+    BULLPEN_TRACK=$track
+    return 0
+  fi
+  msg_info "Checking for a newer release"
+  bullpen_resolve_ref "${BULLPEN_REF:-$track}" || exit $?
+  if [[ -n "${BULLPEN_REF:-}" ]]; then
+    BULLPEN_TRACK=$BULLPEN_REF
+    [[ $BULLPEN_SOURCE_KIND == release ]] && BULLPEN_TRACK=""
+  else
+    BULLPEN_TRACK=$track
+  fi
+  if [[ $BULLPEN_SOURCE_KIND == branch ]]; then
+    msg_warn "Updating to the newest '${BULLPEN_SOURCE_REF}' (not a release, so not verified)"
+    return 0
+  fi
+  # The same version number is still an update when what is installed isn't that release: code
+  # from a branch (main between releases has the newest release's number) or from a local copy.
+  # Moving it to the verified release is what "BULLPEN_REF=vX.Y.Z update" asks for, and what a hub
+  # installed before the first release should do once it exists.
+  local old_kind
+  old_kind=$(_release_setting BULLPEN_SOURCE_KIND)
+  if [[ $BULLPEN_SOURCE_VERSION == "$HUB_OLD_VERSION" && -n $old_kind && $old_kind != release ]]; then
+    msg_ok "Moving ${APP} ${HUB_OLD_VERSION} from ${old_kind} code to the verified release"
+    return 0
+  fi
+  if [[ $BULLPEN_SOURCE_VERSION == "$HUB_OLD_VERSION" ]] ||
+    { [[ -z "${BULLPEN_REF:-}" ]] && version_gt "$HUB_OLD_VERSION" "$BULLPEN_SOURCE_VERSION"; }; then
+    _save_release_track
+    msg_ok "No update available: ${APP} (${HUB_OLD_VERSION})"
+    return 1
+  fi
+  if [[ -n $HUB_OLD_VERSION ]] && version_gt "$HUB_OLD_VERSION" "$BULLPEN_SOURCE_VERSION"; then
+    msg_warn "Going back to an older release, as asked: ${APP} ${HUB_OLD_VERSION} → ${BULLPEN_SOURCE_VERSION}"
+    return 0
+  fi
+  msg_ok "Update available: ${APP} ${HUB_OLD_VERSION:-unknown} → ${BULLPEN_SOURCE_VERSION}"
+}
+
+fetch_hub_source() {
+  bullpen_mktemp BULLPEN_SRC
+  bullpen_fetch_source "$BULLPEN_SRC"
+}
+
+# Runs the new release's install-hub.sh, which keeps hub.env and the data,
+# fills in settings that are new, and restarts the service.
+upgrade_hub() {
+  msg_info "Updating ${APP} to ${BULLPEN_SOURCE_VERSION}"
+  export BULLPEN_NONINTERACTIVE=1 BULLPEN_REPO BULLPEN_SOURCE_REF BULLPEN_SOURCE_KIND BULLPEN_TRACK
+  $STD bash "$BULLPEN_SRC/scripts/linux/install-hub.sh" </dev/null
+  # Write the "update" command again, from the new release. On a plain Debian
+  # or Ubuntu machine, /usr/bin/update is left alone.
+  if [[ -n "$FS_ROOT" ]] || systemd-detect-virt --container --quiet 2>/dev/null; then write_update_command; fi
+  msg_ok "Updated to ${BULLPEN_SOURCE_VERSION}"
+}

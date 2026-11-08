@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for pveversion.
+echo "pve-manager/${BULLPEN_TEST_PVE:-9.0.10}/0123456789abcdef (running kernel: 6.14.8-2-pve)"

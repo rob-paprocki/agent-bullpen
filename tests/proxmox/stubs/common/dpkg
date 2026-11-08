@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for dpkg --print-architecture.
+if [[ "${1:-}" == --print-architecture ]]; then echo "${BULLPEN_TEST_ARCH:-amd64}"; exit 0; fi
+exit 0

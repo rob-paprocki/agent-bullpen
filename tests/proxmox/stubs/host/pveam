@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Test stub for pveam (template list and download).
+set -u
+echo "pveam $*" >>"$BULLPEN_TEST_STATE/calls.log"
+dir="$BULLPEN_TEST_STATE/templates"
+case "${1:-}" in
+  update) echo "update successful" ;;
+  available)
+    # BULLPEN_TEST_TEMPLATES (space separated) replaces the usual list.
+    # Like Proxmox VE 9's list, with arm64 templates next to the amd64 ones (they sort after them).
+    for t in ${BULLPEN_TEST_TEMPLATES:-debian-12-standard_12.12-1_amd64.tar.zst debian-13-standard_13.1-2_amd64.tar.zst \
+      debian-13-standard_13.1-2_arm64.tar.zst debian-13-standard_13.0-1_amd64.tar.zst \
+      ubuntu-24.04-standard_24.04-2_amd64.tar.zst}; do
+      printf '%-15s %s\n' system "$t"
+    done ;;
+  list)
+    printf '%-60s %s\n' NAME SIZE
+    if [[ -d "$dir/$2" ]]; then
+      for f in "$dir/$2"/*; do [[ -e "$f" ]] && printf '%-60s %s\n' "$2:vztmpl/${f##*/}" 120.00MB; done
+    fi ;;
+  download) mkdir -p "$dir/$2" && touch "$dir/$2/$3" && echo "download of '$3' finished" ;;
+  *) echo "stub pveam: unknown $*" >&2; exit 1 ;;
+esac

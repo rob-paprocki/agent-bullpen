@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for hostname.
+if [[ "${1:-}" == -I ]]; then echo "${BULLPEN_TEST_IP:-192.168.100.50} "; else echo "${BULLPEN_TEST_HOSTNAME:-test-node}"; fi

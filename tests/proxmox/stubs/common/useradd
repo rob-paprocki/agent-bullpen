@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for useradd: remembers the user in the fake root.
+echo "useradd [${BULLPEN_TEST_ROOT:-host}] $*" >>"$BULLPEN_TEST_STATE/calls.log"
+mkdir -p "${BULLPEN_TEST_ROOT:?}/.stub-users" && touch "${BULLPEN_TEST_ROOT}/.stub-users/${*: -1}"

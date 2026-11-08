@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub for nano (the Settings menu opens My Defaults in it).
+echo "nano $*" >>"$BULLPEN_TEST_STATE/calls.log"

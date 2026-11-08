@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stub for id: "id <user>" knows only users the useradd stub made; anything else is the real id.
+if [[ $# -eq 1 && "$1" != -* ]]; then
+  [[ -f "${BULLPEN_TEST_ROOT:-/nonexistent}/.stub-users/$1" ]] && { echo "uid=999($1) gid=999($1) groups=999($1)"; exit 0; }
+  echo "id: '$1': no such user" >&2; exit 1
+fi
+exec /usr/bin/id "$@"

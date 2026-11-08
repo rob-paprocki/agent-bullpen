@@ -1,0 +1,14 @@
+# managed-by: bullpen
+description = "Save a note to the shared memory every agent and account can see (Agent Bullpen)"
+prompt = """
+Save this to the user's shared memory on the Agent Bullpen: {{args}}
+
+Write it as one short, self-contained note that another agent on another machine will
+understand later (one fact per note; save several notes for several facts). Choose the
+scope: "global" (default), "project:<name>" or "agent:<name>". Call the `remember` tool of
+the `bullpen` MCP server with text, scope and a few lowercase tags. Only set pin=true if I
+asked to pin it (that only requests pinning; I approve it on the hub's Memory page). If the tool isn't available, run the shell command
+`bullpen remember --scope <scope> --tags "<tags>" "<note>"` instead.
+Do not write the note into GEMINI.md or any other local file. Never save secrets.
+Then confirm in one line what you saved.
+"""

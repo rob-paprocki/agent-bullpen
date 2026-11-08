@@ -1,0 +1,19 @@
+# managed-by: bullpen
+description = "Ask Claude Code for an adversarial second opinion on a change, plan or answer"
+prompt = """
+Get an independent second opinion from Claude on: {{args}}
+
+1. Collect the material. For code changes run `git diff` and `git diff --staged`.
+   For a plan or answer, use the text from this conversation. Keep it under ~200 KB.
+2. Write a request file in the system temp folder (not in the project) that starts with:
+   "You are an adversarial reviewer. Find real problems in the material below: bugs, wrong
+   facts, security issues, missed requirements, edge cases. Give each finding a severity
+   (critical/major/minor), where it is, and a concrete fix. If it is solid, say so; don't
+   invent issues. Do not modify any files."
+   Then add the goal in one or two sentences, then the material.
+3. Run Claude Code read-only with the request on stdin:
+   claude -p --permission-mode dontAsk < REQUEST_FILE
+4. Check each of Claude's findings against the code yourself. Tell me which you agree with,
+   which you reject and why, and what you would change. Don't edit files unless I asked you to.
+5. Delete the request file.
+"""

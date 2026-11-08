@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Test stub: while the installer downloads its template, someone else creates CT 100 (for example
+# in the web interface, whose Create CT wizard offers the same next free ID). Then it hands over
+# to the normal pveam stub.
+if [[ "${1:-}" == download && ! -d "$BULLPEN_TEST_STATE/ct/100" ]]; then
+  mkdir -p "$BULLPEN_TEST_STATE/ct/100/rootfs"
+  echo running >"$BULLPEN_TEST_STATE/ct/100/status"
+  echo "someone else's container" >"$BULLPEN_TEST_STATE/ct/100/OTHER-CONTAINER"
+fi
+exec "$BULLPEN_TEST_REAL_STUBS/pveam" "$@"

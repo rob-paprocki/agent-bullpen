@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Test stub for pvesh get /cluster/nextid [--vmid N]. IDs in BULLPEN_TEST_USED_IDS
+# (space separated) and containers the pct stub made count as taken.
+set -u
+echo "pvesh $*" >>"$BULLPEN_TEST_STATE/calls.log"
+taken() { [[ " ${BULLPEN_TEST_USED_IDS:-} " == *" $1 "* || -d "$BULLPEN_TEST_STATE/ct/$1" ]]; }
+[[ "${1:-} ${2:-}" == "get /cluster/nextid" ]] || { echo "stub pvesh: unknown $*" >&2; exit 1; }
+if [[ "${3:-}" == --vmid ]]; then
+  if taken "$4"; then echo "VM $4 already exists" >&2; exit 2; fi
+  echo "$4"
+  exit 0
+fi
+id=100
+while taken "$id"; do id=$((id + 1)); done
+echo "$id"

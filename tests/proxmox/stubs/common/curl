@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Test stub for curl. Answers only the addresses the installers should use,
+from local files, and logs every address to $BULLPEN_TEST_STATE/curl.log:
+
+  raw.githubusercontent.com/<repo>/<ref>/<path>  -> $BULLPEN_TEST_RAW_DIR/<path>
+  github.com/<repo>/releases/latest               -> 302 to the tag in $BULLPEN_TEST_LATEST
+                                                     (404 when it is empty)
+  github.com/<repo>/releases/download/<tag>/<f>   -> $BULLPEN_TEST_RELEASES/<tag>/<f>
+  codeload.github.com/<repo>/tar.gz/<ref>         -> $BULLPEN_TEST_RELEASES/codeload/<ref>.tar.gz
+  http://127.0.0.1:<port>/healthz                 -> {"ok": true}
+  pkg.cloudflare.com/cloudflare-main.gpg          -> a dummy key
+
+Anything else fails like an unknown host (exit 6) and is logged as UNEXPECTED."""
+import os, sys
+
+state = os.environ["BULLPEN_TEST_STATE"]
+repo = os.environ.get("BULLPEN_TEST_REPO", "rob-paprocki/agent-bullpen")
+args = sys.argv[1:]
+out = None
+fmt = ""
+fail = False
+url = ""
+i = 0
+takes_value = {"-o", "--output", "-w", "--write-out", "--connect-timeout", "--max-time", "-m", "--retry", "-H", "-X"}
+while i < len(args):
+    a = args[i]
+    if a in takes_value:
+        v = args[i + 1]
+        if a in ("-o", "--output"):
+            out = v
+        elif a in ("-w", "--write-out"):
+            fmt = v
+        i += 2
+        continue
+    if a.startswith("--"):
+        fail = fail or a == "--fail"
+    elif a.startswith("-"):
+        fail = fail or "f" in a[1:]
+        if a.endswith("o") and len(a) > 2:  # e.g. -fsSLo FILE
+            out = args[i + 1]
+            i += 1
+    else:
+        url = a
+    i += 1
+
+def log(line):
+    with open(os.path.join(state, "curl.log"), "a") as f:
+        f.write(line + "\n")
+
+def finish(code, body=b"", location=""):
+    if fmt:
+        sys.stdout.write(fmt.replace("%{http_code}", str(code)).replace("%{redirect_url}", location)
+                         .replace("%{url_effective}", url))
+    if code >= 400 and fail:
+        sys.stderr.write(f"curl: (22) The requested URL returned error: {code}\n")
+        sys.exit(22)
+    if out:
+        if out != "/dev/null":
+            with open(out, "wb") as f:
+                f.write(body)
+    elif not fmt:
+        sys.stdout.buffer.write(body)
+    sys.exit(0)
+
+def serve_file(path):
+    if os.path.isfile(path):
+        finish(200, open(path, "rb").read())
+    finish(404, b"404: Not Found")
+
+log(url)
+raw = f"https://raw.githubusercontent.com/{repo}/"
+gh = f"https://github.com/{repo}/"
+if url.startswith(raw):
+    ref_and_path = url[len(raw):]
+    path = ref_and_path.split("/", 1)[1] if "/" in ref_and_path else ""
+    serve_file(os.path.join(os.environ["BULLPEN_TEST_RAW_DIR"], path))
+elif os.environ.get("BULLPEN_TEST_OLD_REPO") and url == f"https://github.com/{os.environ['BULLPEN_TEST_OLD_REPO']}/releases/latest":
+    finish(301, b"", gh + "releases/latest")  # a renamed repository: GitHub points at its new name
+elif url == gh + "releases/latest":
+    tag = os.environ.get("BULLPEN_TEST_LATEST", "")
+    if tag:
+        finish(302, b"", gh + "releases/tag/" + tag)
+    finish(404, b"Not Found")
+elif url.startswith(gh + "releases/download/"):
+    tag, name = url[len(gh + "releases/download/"):].split("/", 1)
+    serve_file(os.path.join(os.environ["BULLPEN_TEST_RELEASES"], tag, name))
+elif url.startswith(f"https://codeload.github.com/{repo}/tar.gz/"):
+    ref = url.rsplit("/", 1)[1]
+    serve_file(os.path.join(os.environ["BULLPEN_TEST_RELEASES"], "codeload", ref + ".tar.gz"))
+elif url.startswith("http://127.0.0.1:") and url.endswith("/healthz"):
+    fail = os.environ.get("BULLPEN_TEST_HEALTH_FAIL", "")
+    if fail and fail != "1":  # a version: only that version fails to start (the old one comes back fine)
+        try:
+            with open(os.path.join(os.environ.get("BULLPEN_TEST_ROOT", ""), "opt/bullpen/app/VERSION")) as fh:
+                fail = "1" if fh.read().strip() == fail else ""
+        except OSError:
+            fail = ""
+    if fail:
+        sys.stderr.write("curl: (7) Failed to connect\n")
+        sys.exit(7)
+    finish(200, b'{"ok": true}')
+elif url == "https://pkg.cloudflare.com/cloudflare-main.gpg":
+    finish(200, b"dummy key")
+log("UNEXPECTED " + url)
+sys.stderr.write(f"curl: (6) Could not resolve host (test stub): {url}\n")
+sys.exit(6)

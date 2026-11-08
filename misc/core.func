@@ -1,0 +1,372 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # these are used by the scripts that load this file
+# =============================================================================
+#  misc/core.func: helpers shared by the Agent Bullpen installers, on the Proxmox VE
+#  host (build.func) and inside the container (install.func).
+#
+#  Copyright (c) 2026 Agent Bullpen contributors. MIT licence.
+#  https://github.com/rob-paprocki/agent-bullpen
+#
+#  The colours, icons and message layout follow community-scripts/ProxmoxVE
+#  (MIT licence) so the installer feels familiar. The code is our own. This
+#  project is not affiliated with community-scripts or with Proxmox Server
+#  Solutions GmbH, and it sends no telemetry anywhere.
+# =============================================================================
+[[ -n "${_BULLPEN_CORE_LOADED:-}" ]] && return 0
+_BULLPEN_CORE_LOADED=1
+
+BULLPEN_REPO="${BULLPEN_REPO:-rob-paprocki/agent-bullpen}"
+# Tests only: a fake filesystem root, so a test run changes nothing on the
+# machine it runs on. Always empty in real use.
+FS_ROOT="${BULLPEN_TEST_ROOT:-}"
+# Seconds a yes/no question on the console waits before taking its default.
+BULLPEN_PROMPT_TIMEOUT="${BULLPEN_PROMPT_TIMEOUT:-60}"
+BULLPEN_LOG="${BULLPEN_LOG:-/dev/null}"
+STD="silent"
+_BULLPEN_TMP=()
+
+# ----------------------------------------------------------------- colours ---
+color() {
+  if [[ -n "${NO_COLOR:-}" || "${TERM:-}" == dumb ]]; then
+    YW="" YWB="" BL="" RD="" GN="" DGN="" BGN="" CL="" BOLD=""
+  else
+    YW=$'\033[33m' YWB=$'\033[93m' BL=$'\033[36m' RD=$'\033[01;31m'
+    GN=$'\033[1;92m' DGN=$'\033[32m' BGN=$'\033[4;92m' CL=$'\033[m' BOLD=$'\033[1m'
+  fi
+  TAB="  " TAB3="      " BFR=$'\r\033[K'
+  CM="${TAB}✔️${TAB}" CROSS="${TAB}✖️${TAB}" INFO="${TAB}💡${TAB}" HOURGLASS="${TAB}⏳${TAB}"
+  CREATING="${TAB}🚀${TAB}" GATEWAY="${TAB}🌐${TAB}" NETWORK="${TAB}📡${TAB}" BRIDGE="${TAB}🌉${TAB}"
+  CONTAINERID="${TAB}🆔${TAB}" HOSTNAME_ICON="${TAB}🏠${TAB}" OS="${TAB}🖥️${TAB}" CONTAINERTYPE="${TAB}📦${TAB}"
+  DISKSIZE="${TAB}💾${TAB}" CPUCORE="${TAB}🧠${TAB}" RAMSIZE="${TAB}🛠️${TAB}" DEFAULT="${TAB}⚙️${TAB}"
+  ADVANCED="${TAB}🧩${TAB}" SEARCH="${TAB}🔍${TAB}" ROOTSSH="${TAB}🔑${TAB}" VLANTAG="${TAB}🏷️${TAB}"
+  VERIFYPW="${TAB}🔐${TAB}" LOGFILE="${TAB}📋${TAB}"
+}
+color
+
+# ---------------------------------------------------------------- messages ---
+_animate() { [[ "${VERBOSE:-no}" != yes && -t 2 && "${TERM:-dumb}" != dumb ]]; }
+
+_spinner() {
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏') i=0 cols text=$1
+  cols=$(( $(tput cols 2>/dev/null || echo 80) - 4 ))
+  (( ${#text} > cols )) && text="${text:0:cols-1}…"
+  while :; do
+    printf '\r\033[2K%s %s%s%s' "${frames[i]}" "$YWB" "$text" "$CL" >&2
+    i=$(( (i + 1) % 10 ))
+    sleep 0.1
+  done
+}
+
+stop_spinner() {
+  local pid="${SPINNER_PID:-}" n=0
+  [[ -n "$pid" ]] || return 0
+  SPINNER_PID=""
+  kill "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && (( n++ < 20 )); do sleep 0.02; done
+  printf '\r\033[2K' >&2
+}
+
+msg_info() {
+  [[ "$1" == "${_MSG_OPEN:-}" ]] && return 0
+  stop_spinner
+  _MSG_OPEN="$1"
+  BULLPEN_STEP="$1"
+  if _animate; then
+    _spinner "$1" &
+    SPINNER_PID=$!
+    disown "$SPINNER_PID" 2>/dev/null || true
+  else
+    printf '%s%s%s%s\n' "$HOURGLASS" "$YW" "$1" "$CL" >&2
+  fi
+}
+msg_ok() { stop_spinner; _MSG_OPEN=""; printf '%s%s%s%b%s\n' "$BFR" "$CM" "$GN" "$1" "$CL"; }
+msg_error() { stop_spinner; _MSG_OPEN=""; printf '%s%s%s%b%s\n' "$BFR" "$CROSS" "$RD" "$1" "$CL" >&2; }
+msg_warn() { stop_spinner; printf '%s%s%s%b%s\n' "$BFR" "$INFO" "$YWB" "$1" "$CL" >&2; }
+msg_custom() { stop_spinner; printf '%s%s%s%b%s\n' "$BFR" "${TAB}$1${TAB}" "$2" "$3" "$CL"; }
+
+# $STD cmd ...: runs cmd with its output going to the log (and also to the
+# screen in verbose mode). Never put a secret in the arguments of a command run
+# this way: the error report shows the command.
+silent() {
+  local rc=0 start
+  _SILENT_FAILED=""
+  start=$(wc -c <"$BULLPEN_LOG" 2>/dev/null) || start=0
+  if [[ "${VERBOSE:-no}" == yes ]]; then
+    { "$@" 2>&1 | tee -a "$BULLPEN_LOG"; rc=${PIPESTATUS[0]}; } || true
+  else
+    "$@" >>"$BULLPEN_LOG" 2>&1 || rc=$?
+  fi
+  if (( rc != 0 )); then
+    _SILENT_FAILED="$*"
+    _SILENT_START=$start
+  fi
+  return "$rc"
+}
+
+# ------------------------------------------------------------------ errors ---
+explain_exit() {
+  case "$1" in
+    1) echo "General error" ;;
+    2) echo "Wrong use of a shell command" ;;
+    6) echo "Could not resolve a host name (DNS)" ;;
+    7) echo "Could not connect to the server" ;;
+    22) echo "The server answered with an error (page not found?)" ;;
+    28) echo "Timed out" ;;
+    100) echo "Package manager (apt) error" ;;
+    103) echo "Not running in bash" ;;
+    104) echo "Not running as root" ;;
+    106) echo "Unsupported CPU architecture" ;;
+    115) echo "Download failed" ;;
+    116) echo "Checksum did not match" ;;
+    126) echo "Command could not run" ;;
+    127) echo "Command not found" ;;
+    130) echo "Stopped with Ctrl+C" ;;
+    232) echo "Not a Proxmox VE host" ;;
+    *) echo "Error" ;;
+  esac
+}
+
+# Prints a short hint when the failing output matches a common problem.
+error_hint() {
+  local out=$1
+  if grep -qiE 'Temporary failure resolving|Could not resolve|Name or service not known' <<<"$out"; then
+    msg_custom "💡" "$YW" "DNS is not working. Check the container's network and DNS settings."
+  elif grep -qiE 'Could not get lock|dpkg was interrupted' <<<"$out"; then
+    msg_custom "💡" "$YW" "Another package install is running, or one was interrupted. Wait, then run: dpkg --configure -a"
+  elif grep -qiE 'No space left on device' <<<"$out"; then
+    msg_custom "💡" "$YW" "The disk is full. Give the container more disk space."
+  elif grep -qiE 'command not found' <<<"$out"; then
+    msg_custom "💡" "$YW" "A command is missing. Check the dependency step above."
+  fi
+}
+
+error_handler() {
+  local rc=$1 line=$2 cmd=$3 out="" from_std=0
+  trap - ERR
+  set +e
+  # A failure inside $(...) is reported once, by the command that used it.
+  (( BASH_SUBSHELL > 0 )) && exit "$rc"
+  stop_spinner
+  # A command run with $STD fails at silent's "return": report the command itself.
+  if [[ "$cmd" == return* && -n "${_SILENT_FAILED:-}" ]]; then cmd=$_SILENT_FAILED from_std=1; fi
+  printf '\n%s%sin line %s: exit code %s (%s): while executing command %s%s%s\n' \
+    "$CROSS" "$RD" "$line" "$rc" "$(explain_exit "$rc")" "$YW" "$cmd" "$CL" >&2
+  if [[ -s "$BULLPEN_LOG" ]]; then
+    if (( from_std )); then
+      out=$(tail -c +"$(( ${_SILENT_START:-0} + 1 ))" "$BULLPEN_LOG" | tail -n 25)
+      printf '%s\n' "--- Output of the failing command ---" >&2
+    else
+      out=$(tail -n 20 "$BULLPEN_LOG")
+      printf '%s\n' "--- Last 20 lines of the log ---" >&2
+    fi
+    printf '%s\n%s\n' "$out" "-------------------------------------" >&2
+    error_hint "$out"
+  fi
+  if declare -F on_error >/dev/null; then on_error "$rc"; fi
+  exit "$rc"
+}
+
+on_exit() {
+  local rc=$? d
+  stop_spinner
+  for d in "${_BULLPEN_TMP[@]}"; do [[ -n "$d" ]] && rm -rf -- "$d"; done
+  exit "$rc"
+}
+
+on_interrupt() {
+  trap - ERR INT TERM
+  stop_spinner
+  printf '\n' >&2
+  msg_error "Stopped by the user"
+  if declare -F on_error >/dev/null; then on_error 130; fi
+  exit 130
+}
+
+catch_errors() {
+  set -Eeo pipefail
+  trap 'error_handler $? $LINENO "$BASH_COMMAND"' ERR
+  trap on_exit EXIT
+  trap on_interrupt INT TERM
+}
+
+# Stops with a message (and, on the host, the offer to remove the container).
+fatal() {
+  local msg=$1 rc=${2:-1}
+  trap - ERR
+  msg_error "$msg"
+  if declare -F on_error >/dev/null; then on_error "$rc"; fi
+  exit "$rc"
+}
+
+exit_script() {
+  stop_spinner
+  [[ -t 1 ]] && clear
+  printf '\n%s%sUser exited script%s\n\n' "$CROSS" "$RD" "$CL"
+  exit 0
+}
+
+bullpen_mktemp() { # bullpen_mktemp VAR: a temporary folder, removed when the script ends
+  local d
+  d=$(mktemp -d "${TMPDIR:-/tmp}/bullpen.XXXXXX")
+  _BULLPEN_TMP+=("$d")
+  printf -v "$1" '%s' "$d"
+}
+
+gen_password() { # 24 letters and digits, from the kernel's random source
+  local raw
+  raw=$(head -c 96 /dev/urandom | base64 -w0)
+  raw=${raw//[^A-Za-z0-9]/}
+  printf '%s' "${raw:0:24}"
+}
+
+version_gt() { # version_gt A B: true when A is newer than B
+  [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# ------------------------------------------------------- installer files ---
+# The installer's own files come from a local copy (BULLPEN_ENGINE_ROOT) or
+# from the repository at BULLPEN_RAW_BASE.
+bullpen_get_file() {
+  if [[ -n "${BULLPEN_ENGINE_ROOT:-}" ]]; then
+    cat -- "${BULLPEN_ENGINE_ROOT}/$1"
+  else
+    curl -fsSL --connect-timeout 10 --max-time 60 "${BULLPEN_RAW_BASE}/$1"
+  fi
+}
+
+header_info() {
+  local app="${1:-${APP:-Agent Bullpen}}" slug
+  slug=${NSAPP:-$(tr '[:upper:] ' '[:lower:]-' <<<"$app")}
+  if [[ -z "${_BULLPEN_HEADER:-}" ]]; then
+    _BULLPEN_HEADER=$(bullpen_get_file "misc/headers/${slug}" 2>/dev/null) || _BULLPEN_HEADER=""
+    [[ -n "$_BULLPEN_HEADER" ]] || _BULLPEN_HEADER="  ${app}"
+  elif [[ ! -t 1 ]]; then
+    return 0 # no screen to clear: show the banner only once
+  fi
+  [[ -t 1 ]] && clear
+  printf '%s\n\n' "$_BULLPEN_HEADER"
+}
+
+# ------------------------------------------------------- release download ---
+# bullpen_resolve_ref [REF]: decides what to download. Sets BULLPEN_SOURCE_REF,
+# BULLPEN_SOURCE_KIND (release: a vX.Y.Z tag with a checksummed release; branch:
+# anything else, unverified) and BULLPEN_SOURCE_VERSION (releases only).
+# Blank REF means the newest release, or main when there is no release yet.
+bullpen_resolve_ref() {
+  local want=${1-${BULLPEN_REF:-}} answer code loc url hops=0
+  if [[ -z "$want" ]]; then
+    url="https://github.com/${BULLPEN_REPO}/releases/latest"
+    while :; do
+      answer=$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' --connect-timeout 10 --max-time 30 \
+        "$url" 2>/dev/null) || answer="000"
+      code=${answer%% *} loc=${answer#* }
+      # A renamed or moved repository first redirects to its new name; follow that (a few hops at
+      # most) to the release it points at, rather than taking it for "no release".
+      if [[ $code == 30? && "$loc" == https://github.com/*/releases/latest && $hops -lt 3 ]]; then
+        url=$loc hops=$((hops + 1))
+        continue
+      fi
+      break
+    done
+    case "$code" in
+      30?) if [[ "$loc" == */releases/tag/* ]]; then want=${loc##*/releases/tag/}; else want=main; fi ;;
+      404) want=main ;;
+      *) msg_error "Could not ask GitHub for the newest release of ${BULLPEN_REPO} (HTTP ${code})."
+         msg_custom "💡" "$YW" "Check this machine's internet access, or set BULLPEN_REF=vX.Y.Z to name a release."
+         return 115 ;;
+    esac
+  fi
+  BULLPEN_SOURCE_REF=$want
+  if [[ "$want" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+.][0-9A-Za-z.-]+)?$ ]]; then
+    BULLPEN_SOURCE_KIND=release BULLPEN_SOURCE_VERSION=${want#v}
+  else
+    BULLPEN_SOURCE_KIND=branch BULLPEN_SOURCE_VERSION=""
+  fi
+  export BULLPEN_SOURCE_REF BULLPEN_SOURCE_KIND BULLPEN_SOURCE_VERSION
+}
+
+bullpen_tree_version() { # bullpen_tree_version DIR: the version of a source tree
+  if [[ -f "$1/VERSION" ]]; then
+    tr -d '[:space:]' <"$1/VERSION"
+  else
+    sed -n 's/^VERSION = "\(.*\)"/\1/p' "$1/hub/app.py" 2>/dev/null | head -n1
+  fi
+}
+
+_download() { # _download URL FILE
+  curl -fsSL --retry 2 --connect-timeout 15 --max-time 900 -o "$2" "$1"
+}
+
+# bullpen_fetch_source DIR: puts the Agent Bullpen source tree in DIR. Uses
+# BULLPEN_LOCAL_SRC (a folder or .tar.gz) when set; otherwise downloads the
+# release named by bullpen_resolve_ref and checks it against SHA256SUMS.
+bullpen_fetch_source() {
+  local dest=$1 tmp file name expected actual src
+  mkdir -p "$dest"
+  if [[ -n "${BULLPEN_LOCAL_SRC:-}" ]]; then
+    src="${FS_ROOT}${BULLPEN_LOCAL_SRC}"
+    msg_info "Using the local copy ${BULLPEN_LOCAL_SRC}"
+    if [[ -d "$src" ]]; then
+      tar -C "$src" --exclude=.git --exclude=__pycache__ --exclude=hub/data -cf - . | tar -C "$dest" -xf -
+    elif [[ -f "$src" ]]; then
+      tar -xzf "$src" -C "$dest" --strip-components=1
+    else
+      fatal "BULLPEN_LOCAL_SRC=${BULLPEN_LOCAL_SRC} is neither a folder nor a .tar.gz file." 115
+    fi
+    BULLPEN_SOURCE_KIND=local BULLPEN_SOURCE_REF=""
+    msg_ok "Using the local copy ${BULLPEN_LOCAL_SRC} (not verified)"
+  else
+    [[ -n "${BULLPEN_SOURCE_KIND:-}" ]] || bullpen_resolve_ref || exit $?
+    bullpen_mktemp tmp
+    if [[ "$BULLPEN_SOURCE_KIND" == release ]]; then
+      name="agent-bullpen-${BULLPEN_SOURCE_VERSION}.tar.gz"
+      file="$tmp/$name"
+      msg_info "Downloading ${name}"
+      _download "https://github.com/${BULLPEN_REPO}/releases/download/${BULLPEN_SOURCE_REF}/${name}" "$file" ||
+        fatal "Could not download ${name} from the ${BULLPEN_SOURCE_REF} release of ${BULLPEN_REPO}." 115
+      _download "https://github.com/${BULLPEN_REPO}/releases/download/${BULLPEN_SOURCE_REF}/SHA256SUMS" "$tmp/SHA256SUMS" ||
+        fatal "Could not download SHA256SUMS for ${BULLPEN_SOURCE_REF}, so the download can't be checked." 115
+      expected=$(awk -v n="$name" '{f=$2; sub(/^\*/, "", f)} f == n {print tolower($1); exit}' "$tmp/SHA256SUMS")
+      actual=$(sha256sum "$file" | awk '{print tolower($1)}')
+      [[ -n "$expected" && "$expected" == "$actual" ]] ||
+        fatal "The checksum of ${name} does not match SHA256SUMS. Nothing was installed." 116
+      msg_ok "Downloaded and verified ${name}"
+    else
+      file="$tmp/source.tar.gz"
+      msg_info "Downloading ${BULLPEN_SOURCE_REF} from GitHub"
+      _download "https://codeload.github.com/${BULLPEN_REPO}/tar.gz/${BULLPEN_SOURCE_REF}" "$file" ||
+        fatal "Could not download '${BULLPEN_SOURCE_REF}' of ${BULLPEN_REPO}." 115
+      msg_warn "Downloaded '${BULLPEN_SOURCE_REF}' without a checksum: it is not a release, so it is unverified."
+    fi
+    tar -xzf "$file" -C "$dest" --strip-components=1 --no-same-owner
+  fi
+  [[ -f "$dest/hub/app.py" && -f "$dest/scripts/linux/install-hub.sh" ]] ||
+    fatal "The downloaded files don't look like Agent Bullpen (hub/app.py is missing)." 115
+  BULLPEN_SOURCE_VERSION=$(bullpen_tree_version "$dest")
+  export BULLPEN_SOURCE_REF BULLPEN_SOURCE_KIND BULLPEN_SOURCE_VERSION
+}
+
+# Writes /usr/bin/update, the command that updates the hub in this container.
+write_update_command() {
+  local f="${FS_ROOT}/usr/bin/update" tmp
+  mkdir -p "${f%/*}"
+  tmp=$(mktemp "${f}.XXXXXX")
+  cat >"$tmp" <<EOF
+#!/usr/bin/env bash
+# Updates the Agent Bullpen in this container to the newest release.
+# Your settings (/etc/bullpen/hub.env) and data (/var/lib/bullpen) are kept.
+# Written by the Agent Bullpen installer: https://github.com/${BULLPEN_REPO}
+export BULLPEN_REPO="\${BULLPEN_REPO:-${BULLPEN_REPO}}"
+script="\${BULLPEN_TEST_ROOT:-}/opt/bullpen/src/ct/bullpen.sh"
+if [[ -f "\$script" ]]; then exec bash "\$script" "\$@"; fi
+exec bash -c "\$(curl -fsSL "https://raw.githubusercontent.com/\${BULLPEN_REPO}/main/ct/bullpen.sh")"
+EOF
+  chmod 0755 "$tmp"
+  mv -f "$tmp" "$f"
+}
+
+# Tests only: refuse to run with a fake root unless the stub commands come first.
+if [[ -n "$FS_ROOT" && "$(command -v apt-get)" != "${BULLPEN_TEST_STUBS:-/nonexistent}/"* ]]; then
+  echo "BULLPEN_TEST_ROOT is for tests only, with the test stubs first on PATH." >&2
+  exit 1
+fi

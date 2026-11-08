@@ -1,0 +1,40 @@
+# LiteLLM: one OpenAI/Anthropic-compatible gateway in front of your API keys
+# (any number of Anthropic Console organizations, plus an optional Gemini API key),
+# with per-key spend tracking and a web dashboard at http://<this-machine>:4000/ui
+#
+# Started by scripts/linux/setup-api-gateway.sh, which also writes .env and config.yaml
+# (from stack/gateway-config.py). Set LITELLM_TAG to pin a LiteLLM version.
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:${LITELLM_TAG:-main-stable}
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata: {}

@@ -1,0 +1,121 @@
+# shellcheck shell=bash
+# =============================================================================
+#  misc/install.func: helpers for install/<app>-install.sh, inside the new
+#  container. The host sends this file (after misc/core.func) in the
+#  FUNCTIONS_FILE_PATH variable; an install script loads it with
+#      source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
+#
+#  Settings arrive as environment variables from the host (build.func,
+#  run_install): APPLICATION, PASSWORD, SSH_ROOT, SSH_AUTHORIZED_KEY,
+#  VERBOSE, INSTALL_LOG and the app's own settings.
+#
+#  Copyright (c) 2026 Agent Bullpen contributors. MIT licence.
+#  https://github.com/rob-paprocki/agent-bullpen
+# =============================================================================
+[[ -n "${_BULLPEN_INSTALL_LOADED:-}" ]] && return 0
+_BULLPEN_INSTALL_LOADED=1
+
+BULLPEN_LOG="${FS_ROOT}${INSTALL_LOG:-/root/.install.log}"
+(umask 077 && : >>"$BULLPEN_LOG")
+export DEBIAN_FRONTEND=noninteractive
+
+setting_up_container() {
+  msg_info "Setting up the container OS"
+  if [[ -n "${PASSWORD:-}" ]]; then
+    chpasswd <<<"root:${PASSWORD}"
+  fi
+  if [[ -n "${SSH_AUTHORIZED_KEY:-}" ]]; then
+    install -d -m 0700 "${FS_ROOT}/root/.ssh"
+    printf '%s\n' "$SSH_AUTHORIZED_KEY" >>"${FS_ROOT}/root/.ssh/authorized_keys"
+    chmod 0600 "${FS_ROOT}/root/.ssh/authorized_keys"
+  fi
+  # Containers have no use for this wait, and it slows every boot.
+  systemctl disable -q --now systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+  msg_ok "Set up the container OS"
+}
+
+network_check() {
+  local ip host bad=()
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}') || ip=""
+  [[ -n "$ip" ]] || fatal "The container has no IP address. Check its network settings in Proxmox." 1
+  msg_ok "Network connected: ${ip}"
+  for host in deb.debian.org pypi.org github.com; do
+    getent hosts "$host" >/dev/null 2>&1 || bad+=("$host")
+  done
+  (( ${#bad[@]} == 0 )) || fatal "DNS does not work in the container (can't resolve ${bad[*]}). Check its DNS settings." 6
+  msg_ok "DNS works (deb.debian.org, pypi.org, github.com)"
+}
+
+update_os() {
+  msg_info "Updating the container OS"
+  $STD apt-get update
+  $STD apt-get -o Dpkg::Options::=--force-confold -y dist-upgrade
+  msg_ok "Updated the container OS"
+}
+
+motd_ssh() {
+  local profile="${FS_ROOT}/etc/profile.d/00_bullpen-details.sh"
+  mkdir -p "${profile%/*}"
+  cat >"$profile" <<EOF
+# Login message for the ${APPLICATION} container (written by the Agent Bullpen installer).
+port=\$(sed -n "s/^HUB_PORT='\\(.*\\)'\$/\\1/p" /etc/bullpen/hub.env 2>/dev/null)
+ip=\$(hostname -I 2>/dev/null | awk '{print \$1}')
+yw='\\033[33m' bold='\\033[1m' cl='\\033[m'
+echo ""
+echo -e "\${bold}\${yw}${APPLICATION} LXC Container\${cl}"
+echo -e "  🌐  \${yw}Provided by: Agent Bullpen | GitHub: https://github.com/${BULLPEN_REPO}\${cl}"
+echo -e "  🖥️  \${yw}OS: \$(. /etc/os-release && echo "\$NAME - Version: \$VERSION_ID")\${cl}"
+echo -e "  🏠  \${yw}Hostname: \$(hostname)\${cl}"
+echo -e "  💡  \${yw}IP Address: \${ip}\${cl}"
+echo -e "  🚀  \${yw}Dashboard: http://\${ip}:\${port:-8080}    Update the hub: type update\${cl}"
+EOF
+  printf '%s LXC Container\n' "$APPLICATION" >"${FS_ROOT}/etc/motd"
+  chmod -x "${FS_ROOT}"/etc/update-motd.d/* 2>/dev/null || true
+
+  if [[ "${SSH_ROOT:-no}" == yes ]]; then
+    msg_info "Turning on root SSH"
+    command -v sshd >/dev/null 2>&1 || $STD apt-get install -y openssh-server
+    mkdir -p "${FS_ROOT}/etc/ssh/sshd_config.d"
+    if [[ -n "${PASSWORD:-}" ]]; then
+      echo "PermitRootLogin yes" >"${FS_ROOT}/etc/ssh/sshd_config.d/10-bullpen.conf"
+    else
+      echo "PermitRootLogin prohibit-password" >"${FS_ROOT}/etc/ssh/sshd_config.d/10-bullpen.conf"
+    fi
+    $STD systemctl enable ssh
+    # sshd may already be running (the templates include it): reload it so the setting above applies.
+    $STD systemctl reload-or-restart ssh
+    msg_ok "Turned on root SSH"
+  else
+    systemctl disable -q --now ssh >/dev/null 2>&1 || true
+  fi
+}
+
+customize() {
+  local unit
+  msg_info "Customizing the container"
+  if [[ -z "${PASSWORD:-}" ]]; then
+    # No root password: log in automatically on the Proxmox console.
+    for unit in container-getty@1.service console-getty.service; do
+      mkdir -p "${FS_ROOT}/etc/systemd/system/${unit}.d"
+      cat >"${FS_ROOT}/etc/systemd/system/${unit}.d/override.conf" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --noissue --keep-baud tty%I 115200,38400,9600 $TERM
+EOF
+    done
+    sed -i 's/tty%I/console/' "${FS_ROOT}/etc/systemd/system/console-getty.service.d/override.conf"
+    touch "${FS_ROOT}/root/.hushlogin"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart container-getty@1.service >/dev/null 2>&1 || true
+  fi
+  write_update_command
+  msg_ok "Customized the container"
+}
+
+cleanup_lxc() {
+  msg_info "Cleaning up"
+  $STD apt-get -y autoremove
+  $STD apt-get -y autoclean
+  rm -f "${FS_ROOT}/root/.bullpen-src.tar.gz"
+  msg_ok "Cleaned up"
+}

@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Test stub for Proxmox's pct. Keeps each container's state, and a fake root
+file system for it, under $BULLPEN_TEST_STATE/ct/<id>/. Nothing real is touched."""
+import json, os, shutil, sys
+
+state = os.environ["BULLPEN_TEST_STATE"]
+args = sys.argv[1:]
+with open(os.path.join(state, "pct.log"), "a") as log:
+    log.write(json.dumps(args) + "\n")
+
+def ct_dir(ctid):
+    return os.path.join(state, "ct", ctid)
+
+def rootfs(ctid):
+    return os.path.join(ct_dir(ctid), "rootfs")
+
+def fail_if(step):
+    if os.environ.get("BULLPEN_TEST_FAIL_PCT") == step:
+        print(f"stub pct: {step} failed (injected)", file=sys.stderr)
+        sys.exit(1)
+
+def exists(ctid):
+    return os.path.isdir(ct_dir(ctid))
+
+cmd = args[0] if args else ""
+if cmd == "create":
+    ctid = args[1]
+    if exists(ctid):
+        print(f"CT {ctid} already exists", file=sys.stderr)
+        sys.exit(255)
+    fail_if("create")
+    root = rootfs(ctid)
+    for d in ("etc/systemd/system", "etc/apt/sources.list.d", "etc/profile.d", "etc/update-motd.d",
+              "etc/ssh", "usr/bin", "usr/sbin", "root", "opt", "var/lib", "tmp"):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    with open(os.path.join(root, "etc/update-motd.d/10-uname"), "w") as f:
+        f.write("#!/bin/sh\nuname -snrvm\n")
+    os.chmod(os.path.join(root, "etc/update-motd.d/10-uname"), 0o755)
+    with open(os.path.join(ct_dir(ctid), "create.json"), "w") as f:
+        json.dump(args, f)
+    with open(os.path.join(ct_dir(ctid), "status"), "w") as f:
+        f.write("stopped")
+    print(f"  extracting archive '{args[2]}'")
+elif cmd in ("start", "stop"):
+    ctid = args[1]
+    if not exists(ctid):
+        sys.exit(2)
+    fail_if(cmd)
+    with open(os.path.join(ct_dir(ctid), "status"), "w") as f:
+        f.write("running" if cmd == "start" else "stopped")
+elif cmd == "status":
+    ctid = args[1]
+    if not exists(ctid):
+        print(f"Configuration file 'nodes/pve/lxc/{ctid}.conf' does not exist", file=sys.stderr)
+        sys.exit(2)
+    print("status: " + open(os.path.join(ct_dir(ctid), "status")).read())
+elif cmd == "destroy":
+    ctid = args[1]
+    if not exists(ctid):
+        sys.exit(2)
+    dest = os.path.join(state, "destroyed", ctid)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.move(ct_dir(ctid), dest)
+elif cmd == "exec":
+    ctid = args[1]
+    rest = args[args.index("--") + 1:]
+    if rest[:5] == ["ip", "-4", "-o", "addr", "show"]:
+        if not os.environ.get("BULLPEN_TEST_NO_IP"):
+            ip = os.environ.get("BULLPEN_TEST_IP", "192.168.100.50")
+            print(f"2: eth0    inet {ip}/24 brd 192.168.100.255 scope global dynamic eth0\\       valid_lft 86400sec")
+    else:
+        # Never run anything else: it would run on the test machine itself.
+        print(f"stub pct: exec of {rest} is not simulated", file=sys.stderr)
+        sys.exit(1)
+elif cmd == "push":
+    ctid, src, dst = args[1:4]
+    target = os.path.join(rootfs(ctid), dst.lstrip("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy(src, target)
+elif cmd == "pull":
+    ctid, src, dst = args[1:4]
+    shutil.copy(os.path.join(rootfs(ctid), src.lstrip("/")), dst)
+elif cmd == "set":
+    ctid = args[1]
+    if "--description" in args:
+        with open(os.path.join(ct_dir(ctid), "description.html"), "w") as f:
+            f.write(args[args.index("--description") + 1])
+else:
+    print(f"stub pct: unknown command {args}", file=sys.stderr)
+    sys.exit(1)

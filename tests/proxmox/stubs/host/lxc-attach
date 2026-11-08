@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Test stub for lxc-attach: runs the command against the container's fake root,
+# keeping the caller's environment (as --keep-env does), and records that
+# environment so the test can check what the container received.
+set -u
+printf '%s\n' "$*" | head -c 300 >>"$BULLPEN_TEST_STATE/lxc-attach.log"
+printf '\n' >>"$BULLPEN_TEST_STATE/lxc-attach.log"
+ctid=""
+while [[ $# -gt 0 && "$1" != "--" ]]; do
+  case "$1" in -n) ctid=$2; shift 2 ;; *) shift ;; esac
+done
+shift
+rootfs="$BULLPEN_TEST_STATE/ct/$ctid/rootfs"
+[[ -d "$rootfs" ]] || { echo "stub lxc-attach: no container $ctid" >&2; exit 1; }
+env -0 >"$BULLPEN_TEST_STATE/ct/$ctid/attach-env"
+# The script inside sees its own root and no Proxmox commands.
+exec env BULLPEN_TEST_ROOT="$rootfs" PATH="$BULLPEN_TEST_STUBS:$rootfs/usr/bin:$BULLPEN_TEST_SYS_PATH" "$@"

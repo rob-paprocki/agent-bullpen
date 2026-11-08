@@ -1,0 +1,9 @@
+# Mounts our librechat.yaml into the LibreChat container.
+services:
+  api:
+    volumes:
+      - type: bind
+        source: ./librechat.yaml
+        target: /app/librechat.yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

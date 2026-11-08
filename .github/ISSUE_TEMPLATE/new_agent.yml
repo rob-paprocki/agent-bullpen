@@ -1,0 +1,34 @@
+name: Support another agent CLI
+description: Ask for (or offer) support for a coding agent such as Codex CLI, OpenCode or Qwen Code.
+labels: ["enhancement", "agent support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Many CLIs already work as a plain "text" agent without any code:
+        [guide 11](https://github.com/rob-paprocki/agent-bullpen/blob/main/docs/11-adding-agents.md) shows how.
+        [ROADMAP.md](https://github.com/rob-paprocki/agent-bullpen/blob/main/ROADMAP.md) lists the ones already planned.
+  - type: input
+    id: cli
+    attributes:
+      label: Which CLI
+      placeholder: "name, version, link to its repository or docs"
+    validations:
+      required: true
+  - type: textarea
+    id: headless
+    attributes:
+      label: How it runs without a person
+      description: |
+        As far as you know: does it read the prompt on stdin? Does it print JSON lines (and do they carry a
+        session id)? How does it resume a session? Which flags give read only, edit files and full auto?
+        Where does it keep its MCP servers and its instructions file? Is running it this way allowed on
+        a subscription, or only with an API key?
+  - type: dropdown
+    id: tried
+    attributes:
+      label: Have you tried it as a "text" agent?
+      options:
+        - "Yes, and it works"
+        - "Yes, and it doesn't (say why above)"
+        - "No"

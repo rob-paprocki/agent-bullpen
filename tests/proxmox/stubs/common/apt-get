@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Test stub for apt-get: installs nothing. "install cloudflared" adds a fake
+# cloudflared to the fake root. BULLPEN_TEST_FAIL_APT=<package> makes installing
+# that package fail like apt does.
+set -u
+echo "apt-get [${BULLPEN_TEST_ROOT:-host}] $*" >>"$BULLPEN_TEST_STATE/calls.log"
+if [[ -n "${BULLPEN_TEST_FAIL_APT:-}" && " $* " == *" ${BULLPEN_TEST_FAIL_APT} "* ]]; then
+  echo "E: Unable to locate package ${BULLPEN_TEST_FAIL_APT}"
+  exit 100
+fi
+if [[ " $* " == *" install "* && " $* " == *" cloudflared "* ]]; then
+  mkdir -p "${BULLPEN_TEST_ROOT}/usr/bin"
+  # shellcheck disable=SC2016  # the fake cloudflared expands these itself
+  printf '#!/usr/bin/env bash\necho "cloudflared $*" >>"$BULLPEN_TEST_STATE/calls.log"\necho "cloudflared version 2026.10.0 (built 2026-10-01)"\n' \
+    >"${BULLPEN_TEST_ROOT}/usr/bin/cloudflared"
+  chmod +x "${BULLPEN_TEST_ROOT}/usr/bin/cloudflared"
+fi
+echo "Reading package lists... Done"

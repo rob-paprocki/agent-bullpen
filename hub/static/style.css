@@ -1,0 +1,459 @@
+[hidden] { display: none !important; }  /* rules like label{display:block} must not undo it */
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --text: #1c2230;
+  --muted: #5f6b7d;
+  --line: #dde1e8;
+  --accent: #2f6fdf;
+  --accent-text: #ffffff;
+  --ok: #1f8a4c;
+  --warn: #b86e00;
+  --bad: #c43838;
+  --run: #2f6fdf;
+  --code-bg: #f0f2f5;
+  --chip-bg: #eef1f6;
+  --shadow: 0 1px 2px rgba(20, 30, 50, .06), 0 2px 8px rgba(20, 30, 50, .04);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b;
+    --panel: #1b2029;
+    --text: #e6e9ef;
+    --muted: #98a2b3;
+    --line: #2c3340;
+    --accent: #5b8ff0;
+    --ok: #4cc47f;
+    --warn: #e0a040;
+    --bad: #ef6b6b;
+    --run: #6f9cf5;
+    --code-bg: #12161d;
+    --chip-bg: #252c38;
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); }
+a { color: var(--accent); }
+
+.topbar {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+.brand { font-weight: 700; color: var(--text); text-decoration: none; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
+nav a { padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; white-space: nowrap; }
+/* On a phone the menu wraps onto a second line, so every page stays in view, and the bar
+   scrolls away with the page instead of taking up the top of the screen. */
+@media (max-width: 640px) {
+  .topbar { gap: 6px 12px; padding: 8px 16px; position: static; }
+  .brand { flex: 1; }
+  nav { order: 3; flex: 1 0 100%; flex-wrap: wrap; gap: 2px 4px; margin: 0 -8px; }
+  nav a { padding: 5px 8px; }
+}
+nav a.active, nav a:hover { background: var(--chip-bg); color: var(--text); }
+
+main { max-width: 1180px; margin: 0 auto; padding: 18px 16px 60px; }
+h1 { font-size: 1.45rem; margin: 4px 0 14px; }
+h2 { font-size: 1.15rem; margin: 22px 0 10px; }
+h3 { font-size: 1rem; margin: 0 0 6px; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+.error { color: var(--bad); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px; box-shadow: var(--shadow);
+}
+.card + .card { margin-top: 12px; }
+.grid .card + .card { margin-top: 0; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spread { justify-content: space-between; }
+
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--muted); }
+.dot.on { background: var(--ok); }
+
+.chip {
+  display: inline-block; padding: 1px 8px; border-radius: 99px; background: var(--chip-bg);
+  font-size: .8rem; margin: 2px 4px 2px 0; white-space: nowrap;
+}
+.chip.ok { color: var(--ok); }
+.chip.warn { color: var(--warn); }
+.chip.bad { color: var(--bad); }
+a.chip { text-decoration: none; }
+a.chip:hover { text-decoration: underline; }
+.status { font-weight: 600; font-size: .8rem; padding: 1px 8px; border-radius: 99px; background: var(--chip-bg); }
+.status.queued { color: var(--muted); }
+.status.running { color: var(--run); }
+.status.done { color: var(--ok); }
+.status.error { color: var(--bad); }
+.status.cancelled { color: var(--warn); }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: .8rem; color: var(--muted); font-weight: 600; }
+tr.link { cursor: pointer; }
+tr.link:hover td { background: var(--chip-bg); }
+.table-wrap { overflow-x: auto; }
+/* Tables marked "stack" become one card per row on phones, so their buttons stay in view. */
+@media (max-width: 640px) {
+  table.stack thead { display: none; }
+  table.stack tr { display: block; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  table.stack td { display: block; border: 0; padding: 3px 0; }
+  table.stack td.row { display: flex; padding-top: 6px; }
+}
+
+/* Job lists (Overview, History, a machine's page). On a phone each row is a small card:
+   title and status on the first line, where and when below. */
+table.jobs .j-num { display: none; }
+table.jobs td.j-id { width: 3.2em; }
+table.jobs td.j-what a { color: inherit; text-decoration: none; }
+table.jobs tr.link:hover td.j-what a { text-decoration: underline; }
+table.jobs td.j-what, table.jobs td.j-where { overflow-wrap: anywhere; }
+table.jobs td.j-when { white-space: nowrap; }
+@media (max-width: 640px) {
+  table.jobs tbody tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 8px 0; }
+  table.jobs td { padding: 0; }
+  table.jobs td.j-id { display: none; }
+  table.jobs .j-num { display: inline; color: var(--muted); font-weight: 400; }
+  table.jobs td.j-what { grid-column: 1; grid-row: 1; font-weight: 600; }
+  table.jobs td.j-status { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+  table.jobs td.j-status .chip { margin: 0; }
+  table.jobs td.j-where, table.jobs td.j-when { grid-column: 1 / -1; }
+}
+
+/* Machines: cards, or a compact list. Long names wrap instead of pushing "online" out. */
+.m-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.m-head h3 { min-width: 0; overflow-wrap: anywhere; }
+.m-state { white-space: nowrap; flex-shrink: 0; }
+.m-agents { margin: 8px 0 6px; }
+.clash { color: var(--warn); font-weight: 600; margin: 2px 0 4px; }
+h1.m-title { min-width: 0; overflow-wrap: anywhere; }
+code.path { overflow-wrap: anywhere; }
+table.machines td { vertical-align: middle; }
+table.machines td.ml-name { overflow-wrap: anywhere; min-width: 9em; font-weight: 600; }
+table.machines td.ml-state, table.machines td.ml-busy { white-space: nowrap; }
+.phone-only { display: none; }
+/* On a phone: name and status, then the agents, the tags, then busy, runner and Forget on one line. */
+@media (max-width: 640px) {
+  table.machines tbody tr { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 8px 0; }
+  table.machines td { padding: 0; }
+  table.machines td.ml-name { flex: 1 1 0; min-width: 0; }
+  table.machines td.ml-state { flex: 0 0 auto; text-align: right; }
+  table.machines td.ml-agents, table.machines td.ml-tags { flex: 1 0 100%; }
+  table.machines td.ml-tags:empty { display: none; }
+  table.machines td.ml-busy, table.machines td.ml-ver { flex: 0 0 auto; }
+  table.machines td.ml-act { margin-left: auto; }
+  table.machines td.ml-act:empty { display: none; }
+  .phone-only { display: inline; }
+  table.stack tbody tr:last-child { border-bottom: 0; }
+}
+h2.tight { margin: 4px 0 10px; }
+.m-tools { margin: 0 0 12px; }
+.m-tools input[type=search] { flex: 1 1 220px; width: auto; min-width: 0; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; }
+.seg button:first-child { border-radius: 7px 0 0 7px; }
+.seg button:last-child { border-radius: 0 7px 7px 0; border-left-width: 0; }
+.seg button.active { background: var(--accent); color: var(--accent-text); }
+details.offline { background: transparent; border: 0; padding: 0; margin: 14px 0 0; }
+details.offline > summary { color: var(--muted); margin-bottom: 10px; }
+
+/* History */
+.filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1.4fr); gap: 10px; align-items: end; }
+.filters label { margin: 0; }
+.filters select, .filters input { font-weight: 400; }
+.filters select, .filters input, .seat select, .seat input { height: 38px; }
+@media (max-width: 900px) {
+  .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .filters .wide { grid-column: 1 / -1; }
+}
+#h-list { margin-top: 12px; }
+.pager { margin-top: 10px; }
+
+label { display: block; font-weight: 600; font-size: .88rem; margin: 12px 0 4px; }
+label .muted { font-weight: 400; }
+input[type=text], input[type=password], input[type=number], input[type=search], select, textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--panel); color: var(--text); font: inherit;
+}
+textarea { min-height: 160px; resize: vertical; font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: .9rem; }
+.radio-row { display: flex; gap: 14px; flex-wrap: wrap; }
+.radio-row label, .check { font-weight: 400; display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+
+button {
+  font: inherit; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text);
+  border-radius: 7px; padding: 8px 14px; cursor: pointer;
+}
+button.ghost { background: transparent; color: var(--accent); }
+button.danger { border-color: var(--bad); background: transparent; color: var(--bad); }
+button.small { padding: 4px 10px; font-size: .85rem; }
+button:disabled { opacity: .5; cursor: default; }
+
+/* A seat: [name] machine agent project model [remove]. The name and remove columns have a fixed
+   width, so participants, the judge and the builder line up. Captions show above the first
+   seat of a list (and on every seat on a phone, where each seat is a small block). */
+.seat { display: grid; grid-template-columns: 7.5em repeat(4, minmax(0, 1fr)) 5.5em; gap: 8px; align-items: end; margin: 6px 0; }
+.seat.solo { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.seat datalist { display: none; }
+.seat .tag { font-size: .85rem; font-weight: 600; color: var(--muted); padding-bottom: 9px; overflow-wrap: anywhere; }
+.seat .rm { padding-bottom: 4px; }
+.seat .part { margin: 0; font-weight: 400; min-width: 0; }
+.seat .part > span { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 2px; }
+.seat-list > .seat:not(:first-child) .part > span { display: none; }
+.finder { margin: 4px 0 8px; }
+@media (max-width: 640px) {
+  .seat, .seat.solo { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 8px; }
+  .seat:not(.solo) { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 10px; }
+  .seat .tag { grid-column: 1; grid-row: 1; padding: 0; align-self: center; }
+  .seat .rm { grid-column: 2; grid-row: 1; justify-self: end; padding: 0; }
+  .seat-list > .seat:not(:first-child) .part > span { display: block; }
+}
+
+pre, code { font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: .86rem; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; }
+.log { max-height: 420px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+.md { overflow-wrap: anywhere; }
+.md pre { white-space: pre; }
+.md code { background: var(--code-bg); padding: 0 4px; border-radius: 4px; }
+.md pre code { padding: 0; background: none; }
+.md table { margin: 8px 0; }
+.md blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+
+details { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel); margin: 8px 0; }
+details > summary { cursor: pointer; font-weight: 600; }
+details[open] > summary { margin-bottom: 8px; }
+
+.stages { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 14px; }
+.stage { padding: 4px 10px; border-radius: 99px; background: var(--chip-bg); font-size: .82rem; color: var(--muted); }
+.stage.current { color: var(--run); font-weight: 700; }
+.stage.past { color: var(--ok); }
+
+.bars { display: flex; align-items: flex-end; gap: 2px; height: 46px; margin-top: 8px; }
+.bars span { flex: 1; background: var(--accent); opacity: .75; min-height: 1px; border-radius: 2px 2px 0 0; }
+
+.notice { border-left: 4px solid var(--warn); background: var(--panel); padding: 10px 14px; border-radius: 6px; margin: 10px 0; }
+.notice.bad { border-left-color: var(--bad); }
+.empty { padding: 30px; text-align: center; color: var(--muted); }
+
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text); width: min(380px, 92vw); }
+dialog::backdrop { background: rgba(0, 0, 0, .45); }
+#login form button { margin-top: 12px; width: 100%; }
+dialog.wide { width: min(660px, 94vw); padding: 16px 20px 20px; }
+dialog .dialog-head h2 { margin: 0; }
+dialog #am-form button[type=submit] { margin-top: 12px; }
+.cmd-title { margin-top: 12px; }
+.cmd { display: flex; gap: 8px; align-items: flex-start; background: var(--code-bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; margin: 4px 0 8px; }
+.cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; word-break: break-all; font-size: .82rem; }
+.cmd button { flex-shrink: 0; }
+ul.codes { list-style: none; padding: 0; margin: 0; }
+ul.codes li { padding: 6px 0; border-bottom: 1px solid var(--line); }
+.am-codes-title { margin-top: 18px; }
+.offscreen { position: fixed; top: 0; left: -9999px; opacity: 0; }
+
+.note .md { margin: 6px 0; }
+.note .row { gap: 6px; }
+
+/* Job page */
+h1.j-title { min-width: 0; overflow-wrap: anywhere; }
+button.linkish { background: none; border: 0; border-radius: 0; padding: 0; color: var(--accent); text-decoration: underline; }
+.thread-bar { margin: 12px 0 8px; }
+.card.continue, .card.follow { margin-top: 12px; }
+.follow textarea { min-height: 90px; }
+.radio-row label.off { color: var(--muted); cursor: default; }
+.card.continue h3 { margin-bottom: 2px; }
+.card.continue .cmd { margin-bottom: 0; }
+
+/* Conversations: your turns on the right, the agent's on the left; full width on a phone. */
+.chat { display: flex; flex-direction: column; gap: 8px; }
+.chat .me, .chat .agent { max-width: 85%; min-width: 0; padding: 6px 12px 8px; border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
+.chat .me { align-self: flex-end; background: var(--chip-bg); border-bottom-right-radius: 4px; }
+.chat .agent { align-self: flex-start; background: var(--panel); border-bottom-left-radius: 4px; }
+.chat .who { font-size: .75rem; font-weight: 600; color: var(--muted); }
+.chat .plain { white-space: pre-wrap; }
+.chat .md > :first-child, .chat .agent > p:first-of-type { margin-top: 2px; }
+.chat .md > :last-child, .chat .agent > p:last-child { margin-bottom: 0; }
+.chat .turn { font-size: .8rem; color: var(--muted); text-align: center; margin-top: 10px; }
+.chat .turn:first-child { margin-top: 0; }
+@media (max-width: 640px) {
+  .chat .me, .chat .agent { max-width: 100%; align-self: stretch; }
+}
+
+/* Plan limits and tokens (Usage page, machine page, job page). A meter is a track with a fill:
+   amber when close to a limit, red at or over it. */
+.meter { height: 8px; border-radius: 99px; background: var(--chip-bg); overflow: hidden; margin: 4px 0 3px; }
+.meter > span { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.meter.warn > span { background: var(--warn); }
+.meter.bad > span { background: var(--bad); }
+.grid.accounts { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); }
+.card.account h3 { overflow-wrap: anywhere; margin-bottom: 2px; }
+.card.account .win { margin-top: 12px; }
+.w-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.w-label { font-weight: 600; font-size: .9rem; min-width: 0; overflow-wrap: anywhere; }
+.w-used { font-size: .85rem; white-space: nowrap; }
+.w-used.warn, .w-note.warn { color: var(--warn); }
+.w-used.bad, .w-note.bad { color: var(--bad); }
+.w-used.warn, .w-used.bad, .w-note.bad { font-weight: 600; }
+.w-note { margin: 6px 0 0; }
+.card.waiting { margin-top: 12px; }
+.card.waiting ul { margin: 0; padding-left: 18px; }
+p.flush { margin-top: 0; }
+p.flush-bottom { margin-bottom: 0; }
+.usage-line { margin: 10px 0; }
+.hint { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+.m-limits .chip { white-space: normal; }
+th.num, td.num { text-align: right; white-space: nowrap; }
+table.use td.u-break { display: none; }
+/* On a phone each agent's row is two lines: machine, agent and account, then the figures. */
+@media (max-width: 640px) {
+  table.use tbody tr { display: flex; flex-wrap: wrap; gap: 2px 12px; }
+  table.use td { padding: 0; }
+  table.use td.u-who { font-weight: 600; overflow-wrap: anywhere; }
+  table.use td.u-break { display: block; flex-basis: 100%; height: 0; }
+  table.use td.num { text-align: left; }
+}
+
+/* Questions from 'ask' jobs. A card shows the whole input, however long, and Allow comes after it.
+   Nothing in a waiting card scrolls on its own: phones show no scroll bar until you scroll, so a
+   box could hide the end of a command. Hidden characters are written as codes and highlighted, and
+   blank lines in a row as one highlighted line. Answered questions stay compact. */
+.status.warn, .status.expired { color: var(--warn); }
+.status.bad, .status.denied, .status.failed { color: var(--bad); }
+.status.allowed { color: var(--ok); }
+.status.starting { color: var(--run); }
+.status.stopped, .status.unknown { color: var(--muted); }
+.card.approval { border: 2px solid var(--accent); margin: 12px 0; }
+.a-head { display: flex; justify-content: space-between; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; }
+.a-head h3 { min-width: 0; overflow-wrap: anywhere; }
+.a-flags { display: inline-flex; flex-wrap: wrap; gap: 4px 6px; }
+.a-origin { margin: 4px 0; }
+.a-key { font-size: .75rem; font-weight: 600; color: var(--muted); margin-top: 8px; overflow-wrap: anywhere; }
+.card.approval pre { margin: 2px 0 6px; }
+.a-cmd, .a-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* One block per line of the input, wrapped parts indented under it. */
+.a-lines .ln { display: block; padding-left: 1.6em; text-indent: -1.6em; }
+.a-lines .ln:empty::before { content: " "; }
+code.a-path { display: block; overflow-wrap: anywhere; background: var(--code-bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 2px 0 6px; }
+.a-said { margin: 8px 0; overflow-wrap: anywhere; }
+.a-when { margin: 8px 0 0; }
+.a-buttons { margin-top: 10px; }
+.a-buttons button { min-width: 6.5em; }
+.hc { color: var(--bad); background: var(--chip-bg); border: 1px solid var(--bad); border-radius: 3px; padding: 0 2px;
+  font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: .85em; }
+.hc.blank { color: var(--warn); border-color: var(--warn); }
+.a-past .a-old { border-top: 1px solid var(--line); padding: 8px 0 2px; }
+.a-past .a-old:first-of-type { border-top: 0; padding-top: 0; }
+.a-past pre { max-height: 12rem; overflow: auto; margin: 2px 0 6px; }
+
+/* Live sessions: the message form under the conversation. */
+.live-chat { margin-top: 12px; }
+.card.live-form { margin-top: 12px; }
+.live-form textarea { min-height: 80px; }
+.live-send { margin-top: 6px; }
+.live-opt { margin: 6px 0; }
+.live-idle { gap: 8px; margin: 0 0 2px 24px; font-size: .88rem; }
+.live-idle label { margin: 0; font-weight: 400; font-size: inherit; }
+.live-idle input[type=number] { width: 80px; }
+.live-opt p { margin: 2px 0 0 24px; }
+.notice.ok { border-left-color: var(--ok); }
+.notice .plain { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Remote Control: the Overview's list of running servers and the machine page's section. */
+.rc-running { margin: 10px 0; }
+.rc-line { display: flex; justify-content: space-between; align-items: center; gap: 4px 10px; padding: 6px 0;
+  border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.rc-running h3 + .rc-line { border-top: 0; }
+.rc-line button { flex-shrink: 0; }
+.rc-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 8px; align-items: end; margin-top: 12px; }
+.rc-form .part { margin: 0; font-weight: 400; min-width: 0; }
+.rc-form .part > span { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 2px; }
+.rc-form select { height: 38px; }
+.rc-detail { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; max-width: 46em; }
+.rc-act { gap: 6px; justify-content: flex-end; flex-wrap: nowrap; }
+.rc-why { margin: 12px 0 0; padding-left: 18px; }
+.rc-table td { vertical-align: middle; }
+a.button { display: inline-block; border: 1px solid var(--accent); border-radius: 7px; text-decoration: none; }
+a.button.small { padding: 4px 10px; font-size: .85rem; }
+a.button.ghost { background: transparent; color: var(--accent); }
+@media (max-width: 640px) {
+  .rc-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .rc-form button { grid-column: 1 / -1; }
+  .rc-act { justify-content: flex-start; padding-top: 4px; }
+  .rc-table td.rc-none { display: none; }
+  .a-buttons button { flex: 1 1 0; }
+}
+details.rc-more { border: 0; padding: 0; margin: 2px 0 0; background: transparent; }
+details.rc-more > summary { font-weight: 400; color: var(--muted); }
+details.rc-more[open] > summary { margin-bottom: 2px; }
+
+/* Machine tags: the ones that count, and dimmed the ones reported but not accepted. */
+.chip.tag { border: 1px solid var(--line); }
+.chip.tag.dim { color: var(--muted); border-style: dashed; background: transparent; }
+.m-line { overflow-wrap: anywhere; }
+.m-line .chip { margin-top: 0; margin-bottom: 0; }
+button.chip-x { background: none; border: 0; border-radius: 99px; padding: 0 2px 0 6px; margin: 0; color: var(--muted); font-size: 1rem; line-height: 1; }
+button.chip-x:hover, button.chip-x:focus-visible { color: var(--bad); }
+.card.to-accept { border: 2px solid var(--warn); }
+.card.accepted .small { margin: 2px 0; }
+
+/* A seat aimed at a tag: the account it runs under (when the agent is a different account on
+   different machines with the tag) and what a tag seat does, on a line of their own. */
+.seat .seat-acct { grid-column: 2 / span 2; }
+.seat.solo .seat-acct { grid-column: 1 / span 2; }
+.seat-list > .seat .part.seat-acct > span { display: block; }
+.seat .seat-note { grid-column: 2 / -1; margin: 0; }
+.seat.solo .seat-note { grid-column: 1 / -1; }
+@media (max-width: 640px) {
+  .seat .seat-acct, .seat.solo .seat-acct, .seat .seat-note { grid-column: 1 / -1; }
+}
+
+/* "May hand subtasks to other machines" and its scope, indented under the checkbox. */
+.dg-opt { margin: 6px 0; }
+.dg-scope { margin: 2px 0 4px 24px; padding-left: 12px; border-left: 2px solid var(--line); }
+.dg-part { margin: 8px 0; }
+.dg-head { font-weight: 600; font-size: .88rem; }
+.dg-checks { display: flex; flex-wrap: wrap; gap: 0 16px; }
+.dg-checks label.check { overflow-wrap: anywhere; }
+.dg-warn { border-left: 3px solid var(--warn); padding: 2px 0 2px 8px; margin: 6px 0 0; }
+.dg-scope p.flush { margin-bottom: 4px; }
+@media (max-width: 640px) {
+  .dg-scope { margin-left: 8px; padding-left: 10px; }
+}
+
+/* The subtasks a job handed out. On a phone each row is a small card, as in job lists. */
+.card.subtasks { margin-top: 12px; }
+table.subtasks td { overflow-wrap: anywhere; }
+table.subtasks td a { color: inherit; text-decoration: none; }
+table.subtasks tr.link:hover td a { text-decoration: underline; }
+table.subtasks .st-num { display: none; }
+table.subtasks td.st-id { width: 3.2em; }
+@media (max-width: 640px) {
+  table.subtasks tbody tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; padding: 8px 0; }
+  table.subtasks td { padding: 0; }
+  table.subtasks td.st-id { display: none; }
+  table.subtasks .st-num { display: inline; color: var(--muted); font-weight: 400; }
+  table.subtasks td.st-title { grid-column: 1; grid-row: 1; font-weight: 600; }
+  table.subtasks td.st-status { grid-column: 2; grid-row: 1; text-align: right; }
+  table.subtasks td.st-where, table.subtasks td.st-agent, table.subtasks td.st-account { grid-column: 1 / -1; }
+  table.subtasks td:empty { display: none; }
+}
+
+/* Platform credits (Usage page, machine page, job page). */
+.chip.credits { color: var(--accent); }
+.grid.credits { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); }
+.card.credit-org h3 { overflow-wrap: anywhere; margin: 0; }
+.credit-lines { padding-left: 18px; margin: 8px 0; }
+.credit-lines li { margin: 2px 0; overflow-wrap: anywhere; }
+.credit-form .row { align-items: flex-end; gap: 8px; flex-wrap: wrap; }
+.credit-field { display: flex; flex-direction: column; font-size: .82rem; flex: 1 1 130px; min-width: 0; }
+.credit-field input { margin-top: 2px; width: 100%; }
+.credit-lines .bad { color: var(--bad); font-weight: 600; }

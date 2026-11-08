@@ -1,0 +1,69 @@
+name: Something doesn't work
+description: A bug in the hub, a runner, an installer or the guides.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting it. For a security problem, don't open an issue: follow
+        [SECURITY.md](https://github.com/rob-paprocki/agent-bullpen/blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to see it again
+      placeholder: |
+        1. Open the dashboard, New task
+        2. Pick machine build-box, agent claude, project chat
+        3. ...
+  - type: input
+    id: version
+    attributes:
+      label: Agent Bullpen version
+      description: A machine's page on the dashboard shows its runner version and the hub's ("hub has ...").
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: part
+    attributes:
+      label: Which part
+      multiple: true
+      options:
+        - Proxmox installer (ct/bullpen.sh, update)
+        - Hub on another Linux machine (install-hub.sh)
+        - Dashboard
+        - Adding a machine (enrollment)
+        - Runner on Linux
+        - Runner on macOS
+        - Runner on Windows
+        - Shared memory or MCP servers
+        - API gateway (LiteLLM, LibreChat)
+        - Guides
+  - type: input
+    id: systems
+    attributes:
+      label: Systems
+      description: Proxmox VE version, the hub's OS, and the machine's OS and agent versions, as far as they matter.
+      placeholder: "Proxmox VE 9.1, Debian 13 container; machine: Ubuntu 24.04, Claude Code 2.x"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: |
+        Hub: `journalctl -u bullpen -n 100`. Runner: `~/.bullpen/runner.log`. A job: its Live log.
+        Remove passwords, tokens and API keys first. Runner tokens, the hub's MCP token and enrollment codes count.
+      render: text
+  - type: checkboxes
+    id: secrets
+    attributes:
+      label: Before you send it
+      options:
+        - label: I removed passwords, tokens, API keys and enrollment codes from everything above.
+          required: true

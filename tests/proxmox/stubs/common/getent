@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for getent hosts (DNS works unless BULLPEN_TEST_NO_DNS is set).
+[[ -z "${BULLPEN_TEST_NO_DNS:-}" ]] || exit 2
+echo "192.0.2.1       ${2:-}"
