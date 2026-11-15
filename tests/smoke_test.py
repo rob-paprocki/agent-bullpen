@@ -11,9 +11,10 @@ and Check limits, tokens per job, Gemini's quota error, live sessions, approvals
 from the dashboard, Remote Control, notifications (to a fake webhook), adding a
 third machine with a one-time code and its own token, moving the two runners to
 their own tokens, machine tags and account labels accepted on the dashboard,
-tasks for "any machine tagged ...", subtasks handed to other machines, the
-runner's setup questions, and platform credits (on a hub of their own, with Anthropic's cost report
-faked). No AI service is called.
+tasks for "any machine tagged ...", subtasks handed to other machines, git
+accounts and MCP servers picked per task (on a machine of their own), the
+runner's setup questions, and platform credits (on a hub of their own, with
+Anthropic's cost report faked). No AI service is called.
 
     pip install -r hub/requirements.txt     (once, ideally in a virtualenv)
     python3 tests/smoke_test.py
@@ -46,6 +47,9 @@ TOKEN = "smoke-token"
 # start without them, so a key or token on the computer running the test can't change its results.
 CLAUDE_SIGN_IN_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN",
                        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+# The variables the fake agent names for "SELFTEST: git-env" (runner/selftest_agent.py). The machine with git
+# accounts starts its runner without them, so this computer's own git and ssh setup can't change what its jobs see.
+GIT_ENV_PREFIXES = ("GIT_", "GH_", "GITHUB_", "GITLAB_", "GLAB_", "BULLPEN_GIT_", "SSH_")
 
 
 def free_port() -> int:
@@ -1894,6 +1898,192 @@ def main() -> int:
         check(data["job"]["status"] == "done" and build.get("runner") == "alpha" and build.get("target_tag") == "gpu"
               and fix.get("runner") == "alpha" and fix.get("resume_session") == build.get("session_id"),
               "council seats can target a tag; the fix step stays on the machine that built")
+
+        print("git accounts and MCP picks")
+        # A machine with two git accounts: "a", a machine account on github.com with a token, and "b", on a
+        # self-hosted GitLab with an ssh key (a dummy file: no job here runs git against a host). Its project
+        # "gitproj" uses "b" by default. The token is made up for this run and must show up nowhere. And an
+        # MCP server on demand, which no agent gets unless a task picks it. The fake agent names the git
+        # variables it sees and the MCP flags it got (SELFTEST: git-env, mcp-flags), never a value.
+        st_lazy, lazy = c.call("/api/mcp", {"name": "lazy-tools", "url": "https://lazy.example.invalid/mcp",
+                                            "route": "direct", "on_demand": True})
+        git_token = "smoke-git-" + secrets.token_hex(16)
+        key_file = tmp / "gitbox-key"
+        key_file.write_text("not a real key\n")
+        key_file.chmod(0o600)
+        _, made = c.call("/api/enroll-codes", {"name": "gitbox"})
+        st, enrolled = c.call("/api/enroll", {"code": made.get("code", ""), "hostname": socket.gethostname()})
+        if st != 200:
+            raise AssertionError(f"gitbox couldn't get its own token: {st} {enrolled}")
+        gbox_home = tmp / "gitbox-home"
+        gbox_projects = {"chat": tmp / "gitbox-chat", "gitproj": tmp / "gitbox-proj"}
+        for folder in (gbox_home, *gbox_projects.values()):
+            folder.mkdir()
+        (tmp / "gitbox.json").write_text(json.dumps({
+            "name": "gitbox", "hub_url": hub, "token": enrolled["token"], "max_parallel": 3,
+            "accept_delegated_tasks": True, "projects": {name: str(p) for name, p in gbox_projects.items()},
+            "agents": {"sel": {"preset": "selftest", "env": {"SELFTEST_DELAY": "0.2"}}},
+            "git_accounts": {
+                "a": {"host": "github.com", "token": git_token, "name": "build-box bot", "email": "bot@example.com"},
+                "b": {"host": "gitlab.example.com", "kind": "gitlab", "ssh_key": str(key_file), "name": "Your Name",
+                      "email": "you@example.com"}},
+            "project_git_accounts": {"gitproj": "b"}}))
+        gbox_env = {k: v for k, v in os.environ.items()
+                    if not k.upper().startswith(GIT_ENV_PREFIXES) and k not in CLAUDE_SIGN_IN_VARS}
+        gbox_env.update(HOME=str(gbox_home), BULLPEN_HOME=str(gbox_home / ".bullpen"))
+        gbox_env.pop("BULLPEN_TEST_IDLE_SECONDS", None)
+        procs.append(subprocess.Popen([sys.executable, str(ROOT / "runner" / "runner.py"), "--config",
+                                       str(tmp / "gitbox.json"), "run"], env=gbox_env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        gbox_log = gbox_home / ".bullpen" / "runner.log"
+
+        def gitbox_line(job_id: int) -> str:
+            """The agent's command line, as gitbox's runner logged it for job `job_id`."""
+            return next((ln for ln in gbox_log.read_text().splitlines()
+                         if f"job {job_id}:" in ln and "selftest_agent.py" in ln), "")
+
+        def reported(job: dict, what: str) -> str:
+            """What the fake agent's answer says after "<what>: " (SELFTEST: git-env and mcp-flags)."""
+            return next((ln[len(what) + 2:] for ln in (job.get("result") or "").splitlines()
+                         if ln.startswith(what + ": ")), "")
+
+        gbox = wait_for(lambda: (runner_of("gitbox").get("info") or {}).get("git_accounts") and runner_of("gitbox"),
+                        30) or {}
+        info = gbox.get("info") or {}
+        state_text = json.dumps(c.call("/api/state")[1])
+        check([(g.get("name"), g.get("host"), g.get("kind")) for g in info.get("git_accounts") or []]
+              == [("a", "github.com", "github"), ("b", "gitlab.example.com", "gitlab")]
+              and info.get("project_git_accounts") == {"gitproj": "b"} and not info.get("git_account_problems")
+              and not any(s in state_text for s in (git_token, str(key_file), "bot@example.com")),
+              "a machine tells the hub its git accounts by name, host and kind only")
+
+        probe = "SELFTEST: git-env\nSELFTEST: mcp-flags\nReply with pong"
+        with_a = run_task({"runner": "gitbox", "agent": "sel", "git_account": "a", "prompt": probe})
+        names_a = set(reported(with_a, "git-env").split(","))
+        check(with_a["status"] == "done" and (with_a.get("options") or {}).get("git_account") == "a"
+              and {"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GIT_SSH_COMMAND", "GH_CONFIG_DIR",
+                   "GH_TOKEN", "BULLPEN_GIT_TOKEN"} <= names_a
+              and not any(n.startswith(("GITLAB_", "GLAB_")) for n in names_a)
+              and log_line(with_a["id"], "Git account: a (github.com)")
+              and reported(with_a, "mcp-flags") == "none"
+              and gitbox_line(with_a["id"]).endswith("selftest_agent.py --permission-mode dontAsk"),
+              "a task with a git account gets that account's settings, its log says which, and its command line "
+              "doesn't change")
+        with_b = run_task({"follow_up_of": with_a["id"], "runner": "x", "agent": "y", "git_account": "b",
+                           "prompt": probe})
+        names_b = set(reported(with_b, "git-env").split(","))
+        # b has no token: glab gets a stand-in one, so it can't fall back to the machine user's own login.
+        check(with_b["status"] == "done" and with_b["runner"] == "gitbox"
+              and with_b["resume_session"] == with_a["session_id"]
+              and f"--resume {with_a['session_id']}" in gitbox_line(with_b["id"])
+              and (with_b.get("options") or {}).get("git_account") == "b"
+              and {"GIT_AUTHOR_NAME", "GIT_SSH_COMMAND", "GLAB_CONFIG_DIR", "GITLAB_HOST", "GITLAB_TOKEN"} <= names_b
+              and not any(n.startswith(("GH_", "BULLPEN_GIT_")) for n in names_b)
+              and log_line(with_b["id"], "Git account: b (gitlab.example.com)"),
+              "a follow-up switches to the other git account and resumes the same session")
+        hub_files = b"".join(p.read_bytes() for p in sorted((tmp / "hubdata").glob("hub.db*")))
+        check(git_token not in json.dumps([job_view(j["id"]) for j in (with_a, with_b)])
+              and git_token not in gbox_log.read_text() and git_token.encode() not in hub_files,
+              "the token shows nowhere: not in the jobs' logs or answers, the runner's log or the hub's database")
+
+        parent = run_task({"runner": "gitbox", "agent": "sel", "project": "gitproj", "delegate": True, "prompt": (
+            "SELFTEST: git-env\nSELFTEST: delegate machine=gitbox agent=sel prompt=SELFTEST: git-env\nGo")},
+            timeout=120)
+        kid = job_or_empty((subtask_ids(parent) + [0])[0])
+        check(parent["status"] == "done" and log_line(parent["id"], "Git account: b (gitlab.example.com)")
+              and "GIT_SSH_COMMAND" in reported(parent, "git-env").split(",")
+              and kid.get("status") == "done" and kid.get("runner") == "gitbox" and kid.get("project") == "gitproj"
+              and "git_account" not in (kid.get("options") or {}) and reported(kid, "git-env") == "none"
+              and not log_line(kid["id"], "Git account:"),
+              "a subtask on that machine gets no git account, not even the project's default its parent got")
+
+        # The machine's list of MCP servers is up to date before a task picks one.
+        _, made = c.call("/api/runners/gitbox/actions", {"action": "sync", "params": {}})
+        synced = c.wait_job(made["id"], timeout=120)["job"]
+        added = run_task({"runner": "gitbox", "agent": "sel", "mcp_add": ["lazy-tools"],
+                          "prompt": "SELFTEST: mcp-flags\nReply with pong"})
+        added_line = gitbox_line(added["id"])
+        check(st_lazy == 200 and lazy.get("on_demand") is True and synced["status"] == "done"
+              and added["status"] == "done" and reported(added, "mcp-flags") == "--mcp-config servers=lazy-tools"
+              and "--allowedTools mcp__lazy-tools" in added_line and "--strict-mcp-config" not in added_line
+              and log_line(added["id"], "MCP servers for this job: lazy-tools"),
+              "a task adds an on-demand MCP server: the agent gets it with --mcp-config, not --strict-mcp-config")
+        narrowed = run_task({"runner": "gitbox", "agent": "sel", "mcp_only": ["lazy-tools"],
+                             "prompt": "SELFTEST: mcp-flags\nReply with pong"})
+        check(narrowed["status"] == "done"
+              and reported(narrowed, "mcp-flags") == "--mcp-config --strict-mcp-config servers=bullpen,lazy-tools"
+              and "--allowedTools mcp__lazy-tools" in gitbox_line(narrowed["id"]),
+              "a task narrowed to its MCP servers gets --strict-mcp-config too, and keeps the hub's own server")
+        no_picks = run_task({"runner": "gitbox", "agent": "sel", "prompt": probe})
+        check(no_picks["status"] == "done" and reported(no_picks, "git-env") == "none"
+              and reported(no_picks, "mcp-flags") == "none"
+              and gitbox_line(no_picks["id"]).endswith("selftest_agent.py --permission-mode dontAsk")
+              and not log_line(no_picks["id"], "Git account:"),
+              "a task that picks neither keeps today's command line and gets no git settings")
+
+        print("job summaries")
+        # Both switches on the Memory page. gitbox's fake agent can write a summary (the runner asks it one more
+        # short question once the job is done); the hub keeps the answer as the conversation's note.
+        st_set, settings = c.call("/api/notes/settings", {"summarize_jobs": True, "handoff_summaries": True})
+        check(st_set == 200 and settings == {"summarize_jobs": True, "handoff_summaries": True}
+              and c.call("/api/state")[1].get("memory_settings") == settings,
+              "the Memory page's two switches are saved and shown to the dashboard")
+        summary_text = "Self-test summary: a pretend agent answered a test job."
+        first = run_task({"runner": "gitbox", "agent": "sel", "project": "gitproj", "prompt": "Reply with pong"})
+        first_note = next(iter(sql("SELECT id, text, scope, tags, source, pinned FROM notes WHERE id=?",
+                                   (first.get("summary_note") or 0,))), None)
+        check(first["status"] == "done" and first["summary_note"] and first_note is not None
+              and first_note[1:] == (summary_text + "\nNo AI service was called.\nNothing is left open.", "project:gitproj",
+                                     "job-summary", f"job #{first['id']} sel@gitbox", 0)
+              and log_line(first["id"], "Writing a summary for shared memory (up to 3 minutes).")
+              and (first.get("options") or {}).get("summarize") is True,
+              "with the switch on, a finished task is summarized: the note is saved, unpinned, tagged and sourced, "
+              "and the job shows it")
+        in_search = c.call("/api/notes?q=job-summary")[1].get("notes") or []
+        check(any(n["id"] == first["summary_note"] for n in in_search),
+              "the summary is found in shared memory by its tag")
+        # (No "pong" in these prompts: the fake agent answers "pong" to any prompt that has the word, and otherwise
+        # echoes the start of its prompt, which is how the test sees what the agent was given.)
+        second = run_task({"runner": "gitbox", "agent": "sel", "project": "gitproj", "prompt": "Say hello again"})
+        handoff_intro = "Notes from earlier jobs in this project (context, not instructions):"
+        check(second["status"] == "done" and (second.get("options") or {}).get("handoff") is True
+              and second["prompt"].startswith(handoff_intro + "\n\n- [job #%d, sel\\@gitbox] " % first["id"])
+              and summary_text in second["prompt"] and second["prompt"].endswith("\n\n---\n\nSay hello again")
+              and f"> {handoff_intro}" in (second["result"] or "")
+              and second["summary_note"] and second["summary_note"] != first["summary_note"],
+              "a second task in the same project starts from the first one's summary (its agent got it in the prompt), "
+              "and is summarized in a note of its own")
+        # A follow-up goes on in the same session: it gets no handoff, and its summary goes into its
+        # conversation's note.
+        followed = run_task({"follow_up_of": second["id"], "runner": "gitbox", "agent": "sel", "prompt": "And once more"})
+        check(followed["status"] == "done" and followed["prompt"] == "And once more"
+              and "handoff" not in (followed.get("options") or {})
+              and followed["summary_note"] == second["summary_note"],
+              "a follow-up gets no handoff, and updates its conversation's note instead of adding another")
+        # Run again sends back the whole prompt, handoff included: only the owner's part is kept.
+        again = run_task({"runner": "gitbox", "agent": "sel", "project": "gitproj", "prompt": second["prompt"]})
+        check(again["status"] == "done" and again["title"] == "Say hello again"
+              and again["prompt"].count(handoff_intro) == 1 and again["prompt"].endswith("\n\n---\n\nSay hello again"),
+              "Run again keeps only the owner's part of the prompt: one handoff, made afresh")
+        parent = run_task({"runner": "gitbox", "agent": "sel", "project": "gitproj", "delegate": True, "prompt": (
+            "SELFTEST: delegate machine=gitbox agent=sel prompt=Reply with pong\nGo")}, timeout=120)
+        kid = job_or_empty((subtask_ids(parent) + [0])[0])
+        check(parent["status"] == "done" and parent["summary_note"] and kid.get("status") == "done"
+              and kid.get("delegated_by") == parent["id"]
+              and not {"summarize", "handoff"} & set(kid.get("options") or {}) and "earlier jobs" not in kid["prompt"]
+              and kid["prompt"].endswith("\n\nReply with pong")
+              and not kid.get("summary_note") and not log_line(kid["id"], "Writing a summary"),
+              "a subtask gets neither a handoff nor a summary")
+        # The box beats the switch.
+        quiet = run_task({"runner": "gitbox", "agent": "sel", "project": "gitproj", "summarize": False,
+                          "handoff": False, "prompt": "Reply with pong"})
+        check(quiet["status"] == "done" and not quiet.get("summary_note") and quiet["prompt"] == "Reply with pong"
+              and not {"summarize", "handoff"} & set(quiet.get("options") or {})
+              and not log_line(quiet["id"], "Writing a summary"),
+              "a box left unticked beats the switch")
+        c.call("/api/notes/settings", {"summarize_jobs": False, "handoff_summaries": False})
+        check(c.call("/api/notes/settings")[1] == {"summarize_jobs": False, "handoff_summaries": False},
+              "the switches go off again")
 
         # Last of the enrollment checks: it keeps this address from enrolling for ten minutes.
         tries = [c.call("/api/enroll", {"code": f"2345-6789-ABCD-{i:04d}".replace("0", "Z").replace("1", "Y"),

@@ -10,7 +10,7 @@ It checks that:
 1. the version numbers agree: VERSION, hub/app.py, runner/runner.py, and that CHANGELOG.md has
    a section for that version (with --tag, a dated one, and the tag must match too);
 2. no personal references are left (DENYLIST below, plus tests/denylist.local and
-   $BULLPEN_DENYLIST if there are any). A private entry is named by its number, and anything it
+   $PRIVATE_WORDLIST, if there are any). A private entry is named by its number, and anything it
    matches, in any message, is printed as <private>;
 3. every email, IP and MAC address, in a file or in its name, is one of the allowed examples:
    hi@rpaprocki.com or an example.com address; private addresses only from 192.168.100.0/24, public
@@ -43,11 +43,12 @@ ROOT = Path(__file__).resolve().parent.parent
 REPO_SLUG = "rob-paprocki/agent-bullpen"  # scripts/release/set-repo.sh rewrites this line too
 
 # Personal references that must not appear. Each entry is (regular expression, what to write
-# instead). Matching is case-sensitive unless the expression says otherwise with (?i). The owner's
+# instead). Matching is case-sensitive unless the expression says otherwise with (?i). The maintainer's
 # name is public anyway (LICENSE, the repository's address); keep anything more private out of this
 # file and put it in one of these, which are read too and never printed:
 #   tests/denylist.local   one regular expression per line, # for comments (git ignores this file)
-#   BULLPEN_DENYLIST         the same, in an environment variable (CI reads it from a repository secret)
+#   PRIVATE_WORDLIST         the same, in an environment variable (CI reads it from the PRIVATE_WORDLIST
+#                            repository secret).
 DENYLIST: list[tuple[str, str]] = [
     (r"rob-paprocki", f"the repository slug only, as {REPO_SLUG}"),
     (r"\bRob\b", "a neutral word such as 'the user'"),
@@ -56,8 +57,8 @@ DENYLIST: list[tuple[str, str]] = [
 LOCAL_DENYLIST = ROOT / "tests" / "denylist.local"
 PRIVATE_HINT = "a neutral word (it matches a word on your private list)"
 # Files the denylist doesn't apply to: the licence (the copyright holder's name), FUNDING.yml (it
-# names the owner's public funding accounts on purpose, as LICENSE names the copyright holder) and
-# the changelog (history), this file (it holds the list), and set-repo.sh (it may name old owners).
+# names the maintainer's public funding accounts on purpose, as LICENSE names the copyright holder) and
+# the changelog (history), this file (it holds the list), and set-repo.sh (it may name old repository owners).
 # The personal-value check (emails, IP and MAC addresses) still covers them all.
 DENYLIST_SKIP = {"LICENSE", ".github/FUNDING.yml", "CHANGELOG.md", "tests/check_repo.py",
                  "scripts/release/set-repo.sh", "tests/denylist.local"}
@@ -169,8 +170,9 @@ def check_changelog_sections(text: str, tag: str | None) -> None:
 
 # ------------------------------------------------------------- personal refs
 def private_patterns() -> list[str]:
-    """The extra expressions from tests/denylist.local and $BULLPEN_DENYLIST (blank lines and # skipped)."""
-    lines = os.environ.get("BULLPEN_DENYLIST", "").splitlines()
+    """The extra expressions from tests/denylist.local and $PRIVATE_WORDLIST
+    (blank lines and # skipped)."""
+    lines = os.environ.get("PRIVATE_WORDLIST", "").splitlines()
     if LOCAL_DENYLIST.is_file():
         lines += LOCAL_DENYLIST.read_text(encoding="utf-8").splitlines()
     return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
@@ -498,7 +500,10 @@ def check_links(files: list[str]) -> None:
 # The hub (approval lines, stored approval inputs) masks secrets with copies of the runner's
 # patterns. Both files must define these names with the same re.compile(...) calls.
 REDACTION_FILES = ("runner/runner.py", "hub/redact.py")
-REDACTION_NAMES = ("SECRET_VALUE_RES", "AUTH_WORD_RE", "URL_USERINFO_RE", "NAMED_SECRET_RE")
+REDACTION_NAMES = ("SECRET_VALUE_RES", "AUTH_WORD_RE", "URL_USERINFO_RE", "NAMED_SECRET_RE", "URL_AUTHORITY_RE")
+# Also compared: the clone-URL credentials check, a function and its refusal sentence.
+REDACTION_FUNCS = ("url_has_userinfo",)
+REDACTION_STRINGS = ("NO_URL_CREDENTIALS",)
 
 
 def compiled_patterns(value: ast.expr) -> list | None:
@@ -544,6 +549,36 @@ def check_redaction_patterns() -> None:
                   "patterns as the runner (change both)")
 
 
+def redaction_defs(rel: str) -> tuple[dict[str, str], dict[str, str]]:
+    """ast dumps of the REDACTION_FUNCS functions and REDACTION_STRINGS constants defined at the top level."""
+    tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+    funcs: dict[str, str] = {}
+    strings: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in REDACTION_FUNCS:
+            funcs[node.name] = ast.dump(node)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in REDACTION_STRINGS:
+                    strings[target.id] = ast.dump(node.value)
+    return funcs, strings
+
+
+def check_redaction_defs() -> None:
+    runner_rel, hub_rel = REDACTION_FILES
+    if not all((ROOT / rel).exists() for rel in REDACTION_FILES):
+        return
+    runner, hub = redaction_defs(runner_rel), redaction_defs(hub_rel)
+    for i, names in enumerate((REDACTION_FUNCS, REDACTION_STRINGS)):
+        for name in names:
+            for rel, found in ((runner_rel, runner[i]), (hub_rel, hub[i])):
+                if name not in found:
+                    error(f"{rel}: no top-level {name}")
+            if name in runner[i] and name in hub[i] and runner[i][name] != hub[i][name]:
+                error(f"{hub_rel}: {name} differs from {runner_rel}'s; a clone URL with credentials must be "
+                      "refused the same way on the hub and the runner (change both)")
+
+
 # --------------------------------------------------------------- reminders
 def check_reminders() -> None:
     coc = ROOT / "CODE_OF_CONDUCT.md"
@@ -564,6 +599,7 @@ def main(argv: list[str]) -> int:
     check_personal_values(files)
     check_links(files)
     check_redaction_patterns()
+    check_redaction_defs()
     check_reminders()
     for msg in warnings:
         print(f"warning: {msg}")

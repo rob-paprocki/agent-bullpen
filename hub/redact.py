@@ -2,7 +2,7 @@
 approval's stored input once its job has ended.
 
 The patterns are copies of the runner's (runner/runner.py: SECRET_VALUE_RES, AUTH_WORD_RE,
-URL_USERINFO_RE, NAMED_SECRET_RE), so the hub hides what the runner hides. tests/check_repo.py
+URL_USERINFO_RE, NAMED_SECRET_RE, URL_AUTHORITY_RE, url_has_userinfo), so the hub hides what the runner hides. tests/check_repo.py
 fails when the two copies differ: change both together.
 
 Standard library only; imports nothing from app.py and nothing from the `mcp` package.
@@ -20,6 +20,11 @@ SECRET_VALUE_RES = [
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"),                         # Google API keys
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),  # GitHub tokens
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),                   # Slack tokens
+    # GitLab tokens. Prefixes from GitLab's "Token prefixes" table
+    # (https://docs.gitlab.com/security/tokens/, last checked 2026-11-08): glpat personal/project/group access,
+    # gldt deploy, glrt/glrtr runner (glrtr: made from a registration token), glptt trigger, glft feed, glimt incoming email, glagent Kubernetes agent,
+    # gloas OAuth application secret, glcbt CI job, glsoat SCIM, glffct feature flags client, glwt workspace.
+    re.compile(r"\bgl(?:pat|dt|rtr?|ptt|ft|imt|agent|oas|cbt|soat|ffct|wt)-[A-Za-z0-9_-]{20,}"),
     # Agent Bullpen machine and job tokens: "bp_" or "bpj_" and secrets.token_urlsafe(32), which is always
     # 43 URL-safe characters. Only that exact shape, so names like bp_admin_routes are left alone.
     re.compile(r"\bbpj?_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
@@ -37,6 +42,25 @@ AUTH_WORD_RE = re.compile(r"(?i)\b(bearer|basic|token)(\s+|=)[A-Za-z0-9._~+/=-]{
 URL_USERINFO_RE = re.compile(r"(?i)(?<![a-z0-9+.-])(?=[a-z0-9+.-]*://[^/@\s]+@)([a-z0-9+.-]*?\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 # "X-Api-Key: value", "api_key=value" (also in URLs), "password: value", ...
 NAMED_SECRET_RE = re.compile(r"(?i)(?<![\w-])(?=[\w-]+\s*[:=]\s*[^\s&,;\"']{6})([\w-]*?(?:token|key|secret|passw|credential)[\w-]*)(\s*[:=]\s*)([^\s&,;\"']{6,})")
+
+NO_URL_CREDENTIALS = "Put credentials in a git account on the machine, not in the URL."
+# A clone URL's scheme and authority. Every slash after "scheme:" is skipped, because git and curl read
+# "https:///u:pw@host/x" as user u at host: the authority is what follows the slashes.
+URL_AUTHORITY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):/*([^/?#]*)")
+
+
+def url_has_userinfo(url: str) -> bool:
+    """True when a clone URL carries a user name or password: https://user@host, https://user:pw@host,
+    ssh://user:pw@host. A bare ssh user (ssh://git@host/...) and git@host:path carry no password. The '@' is
+    looked for in everything up to the first '/' after the slashes, so a password holding a raw ? or # counts."""
+    m = URL_AUTHORITY_RE.match(url or "")
+    if not m:
+        return False
+    authority = url[m.start(2):].partition("/")[0]
+    if "@" not in authority:
+        return False
+    userinfo = authority.rsplit("@", 1)[0]
+    return m.group(1).lower() != "ssh" or ":" in userinfo
 
 MASK = "***"
 # JSON keys whose string values are secrets as a whole (hub only: the runner masks text, not JSON).

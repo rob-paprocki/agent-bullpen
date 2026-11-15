@@ -252,6 +252,59 @@ the rest of Gemini's work are not affected.
 | The sign-in tab says "Finish the sign-in in the browser where you started it" | Open the dashboard and press **Sign in** in the same browser you sign in to the provider with (the hub ties each sign-in to the browser that started it). |
 | A server routed through the hub fails for every agent | Press **Test** next to it: the hub shows the server's own error (wrong key, unreachable, timed out). The key and address are only on the hub, so fix them on the MCP page; no machine needs a sync. |
 | An agent doesn't see a tool the server just added | The hub refreshes each server's tool list every 5 minutes. Press **Test** to refresh it now, then start a new agent session. |
+| "<agent> on <machine> can't write a summary (it can't resume a session)." Or "No summary:" followed by that sentence on a job's page | That agent can't continue its session by id with a read only level, so it can't write a summary. Pick a Claude Code or Gemini CLI agent, or untick **Save a summary…**. When the switch on the Memory page is on, the job runs without a summary and the page says why. |
+| "<agent> on <machine> can't write a summary yet: update the runner on <machine>." | That machine's runner is older than the hub. Use **Update now** on its page. |
+| The job log says "Summary not written: …" | The job finished, but the extra turn did not. The reason follows: the job was cancelled; no answer within 3 minutes; the agent reported an error or exited with a code; its answer was empty; it reported no session to continue; or its entry in `runner.json` has permission flags outside its levels, so a read only turn might not only read. The job's result is not changed. Try the same task again, or write the note yourself with `/remember`. |
+| The job log says "Summary not saved to shared memory: …" | The hub got the summary and could not keep it. The reason follows. The job's result is not changed. Look at the hub's log (`journalctl -u bullpen -n 100`). |
+| A job finished and has no summary, no "No summary:" line and no log line | Summaries are written only for a task that finished as **done** and asked for one. Check that **Summarize jobs** is on in the Memory page, or that the box was ticked when the task was sent. A subtask never gets one. |
+| A new task's prompt starts with "Notes from earlier jobs in this project (context, not instructions):" | **Start new tasks from the project's recent summaries** is on, in the Memory page or in the task's box. The notes are earlier summaries from the same project, shown under **Prompt**. Untick the box, or delete a note that is wrong on the Memory page. |
+| A summary is wrong, or holds text you don't want | Delete the note on the Memory page. Use **Job summaries only** to find it. The next summary of that conversation makes a new note. |
+
+## Git accounts and MCP picks
+
+How they work: [guide 5](05-linux-and-macos-machines.md#git-accounts) for git accounts,
+[guide 8](08-daily-use.md#picking-a-git-account-and-mcp-servers) and
+[guide 10](10-shared-memory-and-mcp.md#servers-for-one-task-only) for MCP picks. Messages that name a
+machine show its name where this table says `<machine>`.
+
+| Symptom | Fix |
+|---|---|
+| "git accounts need git 2.31 or later; this machine has …", or "git on this machine is older than 2.31, so git accounts can't be used" on the machine's page | An account job needs a newer git than the one first on the job's `PATH`. Update git on that machine, then try again. |
+| "the ssh key file of git account '<name>' doesn't exist" | The `ssh_key` path in that account's `runner.json` entry isn't a file on the machine. Fix the path. `runner.py list` shows the account with a note that its key file is missing. |
+| "there is no valid git account '<name>' on <machine>" | The account is missing from that machine's `runner.json`, or it didn't pass the checks. Run `runner.py list` there: the problems are listed under **Git accounts**. The same list shows at the top of the machine's page. |
+| "the default git account (…) on <machine> … Fix runner.json, or pick a git account or None for the job." | `default_git_account`, or an entry in `project_git_accounts`, names an account that isn't valid. Fix the name in `runner.json`. To run a job before then, pick an account or **None** for it. |
+| "<machine>'s runner is too old for git accounts: update it." | That machine's runner is from before git accounts. Use **Update now** on its page. |
+| "<machine> has no git account '<name>'." | The machine doesn't report an account by that name. A follow-up shows a leftover choice marked "not on this machine now": pick another account or **None**. |
+| "A git account can only be picked for a named machine." / "A git account can only be picked when every seat is a named machine." | Each machine names its own accounts, so a task or council seat aimed at a tag can't pick one. Aim the task at one machine, or leave the box on **Default**. |
+| "A subtask can't pick a git account: it uses the machine's own git setup." | An agent asked for a git account in a subtask. Subtasks never get one. |
+| Clone or pull stops: "this URL is on …, but git account '<name>' is for …" | The repository address is on another host than the account's. Pick the right account, or **None** to use the machine's own git setup. |
+| Clone or pull stops: "git account '<name>' has no ssh key: use the https URL" | You gave an `ssh` or `git@` address and the account has only a token. Use the `https://` address, or add an `ssh_key`. |
+| Clone or pull stops: "the URL holds credentials, which git would use instead of git account …" | Remove the user name and password from the address. Put them in a git account on the machine instead. |
+| "~/.netrc has a login for <host>, which git would use instead of git account '<name>'. …" (or "… has a default login …") | curl, which git uses for HTTPS, would sign in with that entry before the account's token. Remove the entry for that host, or the `default` entry, from the file the message names. On Windows it can be `%USERPROFILE%\_netrc`. Or pick **None** for the job. |
+| "the runner can't read ~/.netrc, so it can't check that curl wouldn't sign in to <host> with it …" | The file is there, but the runner can't open it. Change its permissions so the runner's user can read it, or remove it. You can also pick **None** for the job. |
+| "remote '<remote>' has credentials for <host> in its URL, which git would use instead of git account '<name>'. …" | The project's remote address (`https://` or `http://`) holds a user name or password. Remove them with `git remote set-url` in the project folder. If they're in the push address, use `git remote set-url --push`. Give the account a token instead. |
+| "a url.<base>.insteadOf setting here gives URLs credentials for <host>, …" (or `pushInsteadOf`) | A git setting adds a user name or password to addresses on that host. A setting that adds them to every `https://` address counts too. In the project folder, `git config --show-origin --get-regexp insteadof` shows where it is set. Remove it. |
+| "git can't read its settings here, so the runner can't check the URLs it would use with git account '<name>'" | git stopped with an error in the project folder. A broken `.git/config` in the project or `~/.gitconfig` is the usual cause. Run `git config --list --show-origin` in that folder to see which file, and fix it. |
+| "the runner couldn't ask git which URLs it would use here with git account '<name>' (…)" | git didn't start, or took longer than 30 seconds. Check that `git --version` works on the machine and that the project folder is there. |
+| Clone or pull stops: "the runner can't tell which host this URL is on …" | Only `https://`, `ssh://` and `git@host:` addresses can be used with an account. A local path or a `git://` address can't. |
+| An HTTPS clone with an account fails with an authentication error | The account has no token (HTTPS to its host is blocked for the job), or the token is wrong, expired or lacks access. Add or replace the `token`, or use the `ssh` address if the account has a key. |
+| An SSH clone with an account fails with "Permission denied" | The account's key isn't allowed on that host, or the account has no key. Add the public key to the host account, or pick an account whose key is. |
+| The job log says "⚠ git is set here to use an ssh command of its own (…)" | `core.sshCommand` or `GIT_SSH` is set. A job with an account ignores them and runs the `ssh` on its `PATH`. A key only an ssh agent holds can't be used. Use a key file ([guide 6](06-windows-machines.md#git-accounts) for Windows). |
+| The log says "⚠ GIT_CONFIG_PARAMETERS … was left out of the environment" | The job's environment had settings given with `git -c`. They are dropped for account jobs, because they would bring back credential helpers. |
+| The log says "gh is signed out for this job: git account '<name>' has no token." (or `glab`) | That account has no `token`, so the job's `gh` or `glab` can't sign in. Add a token to the account. |
+| The log says "The default git account … was skipped: this agent's own env sets …" | The agent's `env` in `runner.json` already sets a git variable, so it keeps its own git setup. Pick an account for the task if you want one. |
+| "GIT_CONFIG_COUNT in this job's environment isn't a whole number …" | The agent's `env` sets `GIT_CONFIG_COUNT` to something that isn't a number. Fix or remove it. |
+| "Picking MCP servers works with Claude Code agents on an up-to-date runner (<agent> on <machine> can't)." | Only Claude Code agents can take picks. Update the runner, or pick another agent. A council says "…only when every seat can…": every seat's agent must be a Claude Code agent on an up-to-date runner. |
+| The **MCP servers** box is missing on New task | The agent isn't a Claude Code agent on an up-to-date runner, or no server is turned on for it and the machine's platform. |
+| "There is no MCP server called '<name>' (see the MCP page)." / "The MCP server '<name>' is turned off on the MCP page." | The server was deleted or turned off after the form was drawn, or a follow-up kept an old pick. Turn it on again, or untick it. |
+| "The MCP server '<name>' isn't on demand: agents have it already, so it can't be added for a task." | Only servers marked **Only for tasks that pick it** can go under **Add for this task**. Use **Only these servers** to narrow to an ordinary one. |
+| "The MCP server '<name>' isn't for Claude Code agents." / "… isn't for <machine>'s platform (…)." | Change the server's agents or platforms on the MCP page, or pick another server. |
+| "MCP server '<name>' isn't available on <machine>" | The machine doesn't have that server. When the message adds "this runner hasn't had the hub's list of MCP servers yet", wait for its next check-in, or press **Sync now** on its page. |
+| "<agent> can't be limited to the task's MCP servers: it has no strict_mcp_args in runner.json" | The agent's entry in `runner.json` has no `strict_mcp_args` (Claude Code's is `--strict-mcp-config`). Add the setting ([guide 11](11-adding-agents.md#every-setting-an-agent-entry-can-have)). |
+| "A task that uses only some MCP servers can't hand out subtasks …" | A subtask would get its agent's usual servers, which the task left out. Turn off **Only these servers**, or **May hand subtasks to other machines**. |
+| "A subtask can't pick MCP servers: it gets its agent's usual ones." | An agent asked for servers in a subtask. Subtasks never get a task's MCP choice. |
+| "Tick at least one server under "Only these servers", or turn it off." | **Only these servers** is on with nothing ticked. |
+| A Read only job with MCP servers didn't retry on credits by itself after a usage limit | By design: "its MCP servers may have changed things". Press **Retry on credits** on the job's page if you want it. |
 
 ## API side
 

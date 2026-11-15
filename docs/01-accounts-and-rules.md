@@ -217,6 +217,23 @@ automation rules before you rely on a subscription:
   ([Cursor CLI authentication](https://cursor.com/docs/cli/reference/authentication.md))
 - **OpenCode:** don't use it with a Claude subscription. Anthropic prohibits plugins that do.
 
+## Git hosts: GitHub, GitLab and others
+
+Git accounts ([guide 5](05-linux-and-macos-machines.md#git-accounts)) are separate from the AI accounts
+above. They choose which GitHub, GitLab or other git login a job uses on one machine. The machine, agent and
+AI account that run a job stay as they were, and the hub doesn't route work by git account.
+
+Your git host has rules about accounts too, and they differ from host to host. GitHub's Terms of Service say
+"One person or legal entity may maintain no more than one free Account". They also say "You may maintain no
+more than one free machine account in addition to your free Personal Account", and that such an account
+"can only be used for running a machine"
+([GitHub Terms of Service, section B.3](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service),
+last checked 2026-11-08).
+
+So the examples in this project use one personal account, one machine account and a self-hosted GitLab,
+and never two free personal accounts on one host. Read your own host's terms before you set up a second
+account there. Agent Bullpen can't check them for you.
+
 ## At a glance: what can the hub use?
 
 | Surface | Paid by | In the hub? | How you reach it otherwise |

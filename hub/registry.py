@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     oauth_client_id     TEXT NOT NULL DEFAULT '',
     oauth_client_secret TEXT NOT NULL DEFAULT '',
     oauth_scopes        TEXT NOT NULL DEFAULT '',
-    oauth_auth_method   TEXT NOT NULL DEFAULT 'basic'  -- your own OAuth app: secret via HTTP Basic | post (body)
+    oauth_auth_method   TEXT NOT NULL DEFAULT 'basic',  -- your own OAuth app: secret via HTTP Basic | post (body)
+    on_demand  INTEGER NOT NULL DEFAULT 0          -- 1: a job gets this server only when it asks for it
 );
 """
 ADDED_COLUMNS = {  # for databases created by an earlier version
@@ -60,6 +61,7 @@ ADDED_COLUMNS = {  # for databases created by an earlier version
     "oauth_scopes": "TEXT NOT NULL DEFAULT ''",
     # A table made without this column keeps sending the secret in the body ('post').
     "oauth_auth_method": "TEXT NOT NULL DEFAULT 'post'",
+    "on_demand": "INTEGER NOT NULL DEFAULT 0",
 }
 
 # No underscores: Gemini CLI names tools mcp_<server>_<tool> and splits on the first underscore.
@@ -100,6 +102,7 @@ class Registry:
             except ValueError:
                 out[key] = {} if key in ("headers", "env") else []
         out["enabled"] = bool(out["enabled"])
+        out["on_demand"] = bool(out["on_demand"])
         return out
 
     def list(self) -> list[dict]:
@@ -155,6 +158,9 @@ class Registry:
             if not ENV_RE.match(k):
                 raise ValueError(f"'{k}' isn't a valid environment variable name.")
         args = [_no_newlines(str(a), "Arguments") for a in (data.get("args") or []) if str(a) != ""]
+        on_demand = data.get("on_demand", False)
+        if not isinstance(on_demand, bool):
+            raise ValueError("On demand must be true or false.")
         targets = [t for t in (TARGETS if data.get("targets") is None else data["targets"]) if t in TARGETS]
         platforms = [p for p in (PLATFORMS if data.get("platforms") is None else data["platforms"]) if p in PLATFORMS]
         if not targets:
@@ -169,13 +175,14 @@ class Registry:
                 "oauth_client_id": client_id if auth == "oauth" else "",
                 "oauth_client_secret": client_secret if auth == "oauth" else "",
                 "oauth_scopes": scopes if auth == "oauth" else "",
-                "oauth_auth_method": auth_method if auth == "oauth" else "basic"}
+                "oauth_auth_method": auth_method if auth == "oauth" else "basic", "on_demand": on_demand}
 
     def save(self, data: dict[str, Any], server_id: int | None = None) -> dict:
         v = self.validate(data)
         cols = {**v, "headers": json.dumps(v["headers"]), "args": json.dumps(v["args"]),
                 "env": json.dumps(v["env"]), "targets": json.dumps(v["targets"]),
-                "platforms": json.dumps(v["platforms"]), "enabled": int(v["enabled"]), "updated_at": time.time()}
+                "platforms": json.dumps(v["platforms"]), "enabled": int(v["enabled"]),
+                "on_demand": int(v["on_demand"]), "updated_at": time.time()}
         clash = self.db.query_one("SELECT id FROM mcp_servers WHERE name=?", (v["name"],))
         if clash and clash["id"] != server_id:
             raise ValueError(f"There is already a server called '{v['name']}'.")
@@ -207,10 +214,11 @@ class Registry:
                 continue
             if s["route"] == "hub":
                 out.append({"name": s["name"], "transport": "http", "route": "hub", "url": "", "headers": {},
-                            "command": "", "args": [], "env": {}, "targets": s["targets"], "platforms": s["platforms"]})
+                            "command": "", "args": [], "env": {}, "targets": s["targets"], "platforms": s["platforms"],
+                            "on_demand": s["on_demand"]})
             else:
                 out.append({**{k: s[k] for k in ("name", "transport", "url", "headers", "command", "args", "env",
-                                                 "targets", "platforms")}, "route": "direct"})
+                                                 "targets", "platforms", "on_demand")}, "route": "direct"})
         return out
 
     def by_name(self, name: str) -> dict | None:

@@ -189,7 +189,7 @@ def commit_all(repo: Path, message: str = "change") -> None:
 
 
 WORD = "zebra" + "finch"  # a made-up private word (in two pieces so this file, copied into the throwaway repo, does not match it)
-WORD_ENV = {**os.environ, "BULLPEN_DENYLIST": WORD}
+WORD_ENV = {**os.environ, "PRIVATE_WORDLIST": WORD}
 
 
 class PrivateFolder(unittest.TestCase):
@@ -231,7 +231,7 @@ class PrivateFolder(unittest.TestCase):
         (repo / "docs" / "x.md").write_text("A note.\nSee " + WORD + ".\n")
         (repo / "docs" / (WORD + "-notes.md")).write_text(WORD + "\n")
         commit_all(repo)
-        env = {**WORD_ENV, "BULLPEN_DENYLIST": WORD + "\n(?P<1" + WORD + ">x)\n"}
+        env = {**WORD_ENV, "PRIVATE_WORDLIST": WORD + "\n(?P<1" + WORD + ">x)\n"}
         checked = run([sys.executable, "-I", "tests/check_repo.py"], repo, env=env, check=False)
         self.assertEqual(checked.returncode, 1, checked.stdout)
         hint = "use a neutral word (it matches a word on your private list)"

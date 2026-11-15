@@ -5,7 +5,7 @@ All notable changes to Agent Bullpen are listed here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The hub and the runner always share one
 version number, because the hub hands its own copy of the runner to every machine.
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-11-15
 
 **Upgrading:** nothing to do. This is the first release.
 
@@ -86,6 +86,28 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
 - **Tokens per job** and an API-equivalent estimate, with a 30-day table per agent on the Usage page, API
   spend per Console organization (`HUB_ANTHROPIC_ADMIN_KEYS`), and `HUB_USAGE_PROVIDERS` to choose which
   providers' links it shows. A job that hits a usage or quota limit says which one and when it resets.
+- **Git accounts.** Name your GitHub, GitLab or other git logins in a machine's `runner.json` (an SSH key, an
+  HTTPS token, a commit name and email), or with `runner.py init`. Then pick one per task, follow-up, council,
+  clone or pull with the **Git account** box, or set a default for the machine or for one project. A job uses
+  only that account for its host. For a `github` or `gitlab` account, `gh` and `glab` get its token, or are
+  signed out when it has none, so they don't fall back to your own login. The kind comes from the host for
+  `github.com` and `gitlab.com`; set `kind` for a GitHub or GitLab server of your own. Switching accounts in
+  a follow-up doesn't change which machine, agent or AI account runs the job. Tasks for a tag and subtasks
+  can't pick one. Every git account needs git 2.31 or later on the machine. `runner.py list` and the
+  machine's page show the accounts and what is wrong with them, an older git included, never a key or token.
+  [Guide 5](docs/05-linux-and-macos-machines.md#git-accounts) has the settings and what they don't cover.
+- **MCP servers per task.** Mark a server **Only for tasks that pick it** on the MCP page, and no agent has it
+  until a task adds it. New task, follow-up and council get an **MCP servers** box for Claude Code agents:
+  **Add for this task**, and **Only these servers** to limit the agent to the ones you tick. The tools of
+  picked servers are allowed even in Read only, and Claude Code, not the hub, enforces the limit. Subtasks
+  never get a task's picks. [Guide 10](docs/10-shared-memory-and-mcp.md#servers-for-one-task-only) explains it.
+- **Job summaries in shared memory.** Two switches on the Memory page, both off at first. **Summarize jobs**
+  has the agent write a short summary when a task is done, as one extra short turn on the same AI account,
+  and the hub keeps it as an unpinned note tagged `job-summary`. **Start new tasks from the project's recent
+  summaries** puts the newest three in front of a new task's prompt, as context. New task and council get a
+  box for each. A follow-up gets only the summary box, because it continues its session. Subtasks never
+  summarize, and a summary is never pinned automatically.
+  [Guide 10](docs/10-shared-memory-and-mcp.md#job-summaries) explains it.
 - **Notifications** when a task finishes or fails, or a job needs your approval (`HUB_NOTIFY_URL`, ntfy or a
   JSON webhook). They carry the job number, a title you typed (if any), the status and a link, never prompts
   or answers.
@@ -108,6 +130,19 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
 
 ### Security
 
+- A clone URL with a user name or password in it is refused; put credentials in a git account instead.
+  GitLab tokens are masked in logs.
+- A job, clone or pull with a git account is refused when something else would sign in to the account's host
+  first. That covers a `~/.netrc` entry for the host or a `default` entry (on Windows `_netrc` too). For a
+  task it also covers a remote, or a `url.<base>.insteadOf` setting, with a user name or password for the
+  host (over HTTPS or HTTP), and a setting that adds them to every address. In such a job git has no terminal or other program to ask for a password, so an account without a
+  token fails over HTTPS.
+- A job with a git account hides that account's token in the job's live log, answer and diff (SECURITY.md
+  lists what this doesn't cover). The secrets in the settings file of a job with picked MCP servers are masked the same way: every
+  value of 6 characters or more, and a shorter one when its name or place marks it as a secret, such as a
+  header value or `API_KEY=12345`. A short secret under an ordinary name (such as `CODE=1234`) isn't masked,
+  so give it a name with `key`, `token` or `pin`, or use a longer one.
+  [Guide 10](docs/10-shared-memory-and-mcp.md#secrets-in-the-jobs-file) has the rules.
 - The dashboard needs `HUB_UI_PASSWORD`, refuses writes from another origin, and can't be shown inside
   another site's frame. Cloudflare Access tokens are checked against the team's keys, and an Access login
   reaches the shared memory only, not the relayed servers.
@@ -135,3 +170,5 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
 - Only the dashboard can pin notes, pinned notes can't import files, and read-only jobs can look notes up
   but not save them.
 - The installers download a release and check it against its `SHA256SUMS` before installing it.
+
+[1.0.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.0

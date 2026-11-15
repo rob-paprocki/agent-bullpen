@@ -168,7 +168,21 @@ FEATURE_WORDS = {
     "live": "a session kept open for messages",
     "job_mcp": "the hub's job tools",
     "levels": "autonomy levels the hub can check",
+    "mcp_pick": "picking MCP servers",
+    "summary": "writing a summary",
 }
+# Why an agent writes no summary of its job (job summaries, hub/memory.py): the refusal of a ticked box, and the
+# options.summary_skipped of a job the Memory page's switch would have summarized (see summary_refusal).
+SUMMARY_REFUSAL = "{agent} on {machine} can't write a summary (it can't resume a session)."
+SUMMARY_UPDATE = "{agent} on {machine} can't write a summary yet: update the runner on {machine}."
+
+
+def summary_refusal(agent: str, machine: str, version: Any, hub_version: str) -> str:
+    """SUMMARY_REFUSAL, or SUMMARY_UPDATE for a runner older than the hub (`version`, from its check-in): that one
+    may only be from before job summaries, so its agent may well resume a session once it is updated."""
+    if vtuple(version if isinstance(version, str) else None) < vtuple(hub_version):
+        return SUMMARY_UPDATE.format(agent=agent, machine=machine)
+    return SUMMARY_REFUSAL.format(agent=agent, machine=machine)
 
 
 class TargetError(ValueError):

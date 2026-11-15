@@ -6,6 +6,9 @@ It reads the prompt from stdin and prints events in the same format as
 hub -> runner -> agent -> back) can be checked in a minute. It never calls
 any AI service. The only network it may use is the hub's job tools
 (/mcp/job), from the config file the runner hands it with --mcp-config.
+That file may also hold a task's picked MCP servers, which it leaves alone,
+and it takes --strict-mcp-config (a task narrowed to those servers) as
+Claude Code does: it has no MCP servers of its own to leave out.
 
 Like Claude Code, every answer reports its tokens and cost (made-up figures: each turn is
 1000 input, 200 output, 300 cache read and 100 cache write tokens, $0.01), a usage-limit event
@@ -35,6 +38,9 @@ Environment knobs (for testing):
                      for a server that shows its address
   SELFTEST_GEMINI_DEFAULTS  set to "trusted" to read the --gemini settings file whoever owns it (for
                      tests that pretend the runner runs as root)
+  SELFTEST_SUMMARY   the answer to the runner's summary prompt (SUMMARY_PROMPT): unset for SUMMARY_ANSWER,
+                     "fail" to make that turn fail (Claude format), "empty" for an empty answer, any other
+                     text to answer with that text
 
 Directives: lines in the prompt that start with "SELFTEST:" make it do something
 more. Their answer lines come first in the answer, before the usual text.
@@ -57,6 +63,11 @@ more. Their answer lines come first in the answer, before the usual text.
   SELFTEST: credits-low     with ANTHROPIC_API_KEY set, fail the way Claude Code does when the Console
                             organization has no credit left; without one it answers as usual
   SELFTEST: gemini-429      (with --gemini) fail the way Gemini CLI does at a quota limit
+  SELFTEST: git-env         name the git, gh, glab and ssh variables it sees (GIT_ENV_PREFIXES), as
+                            "git-env: GIT_AUTHOR_NAME,GIT_SSH_COMMAND,..." or "git-env: none"; never a value
+  SELFTEST: mcp-flags       say which of --mcp-config and --strict-mcp-config it got, and the names of the
+                            servers in the --mcp-config file: "mcp-flags: --mcp-config servers=bullpen,x" or
+                            "mcp-flags: none"; never an address or a header
 """
 
 from __future__ import annotations
@@ -107,6 +118,17 @@ DELEGATE_WAIT = 60      # seconds "SELFTEST: delegate" waits for its subtask, un
 STATUS_WAIT_MAX = 60    # the longest task_status waits in one call (the hub's limit)
 MANY_MAX = 20           # "SELFTEST: delegate-many" hands over at most this many
 DELEGATE_KEYS = ("machine", "tag", "agent", "project", "autonomy", "account", "model", "title", "timeout_min")
+# "SELFTEST: git-env" names the variables that start with these: git's, gh's, glab's, ssh's, and the runner's
+# own for a git account's token.
+GIT_ENV_PREFIXES = ("GIT_", "GH_", "GITHUB_", "GITLAB_", "GLAB_", "BULLPEN_GIT_", "SSH_")
+MCP_FLAGS = ("--mcp-config", "--strict-mcp-config")  # what "SELFTEST: mcp-flags" looks for
+# The runner's summary prompt (runner.SUMMARY_PROMPT, word for word), and the fake's fixed answer to it.
+SUMMARY_PROMPT = ("Summarize this conversation for a shared notes file other AI agents will read. At most 8 short "
+                  "lines: what was asked; what you did or found; files you changed; anything left open. Plain text, "
+                  "no preamble.")
+SUMMARY_ANSWER = ("Self-test summary: a pretend agent answered a test job.\n"
+                  "No AI service was called.\n"
+                  "Nothing is left open.")
 _ids = itertools.count(1)
 _asks = itertools.count(1)
 
@@ -126,12 +148,10 @@ def flag(args: list, name: str, default=None):
 
 
 # ------------------------------------------------------------ MCP client
-def mcp_entry(config) -> dict | None:
-    """The job tools' server entry from a --mcp-config value (a file path or JSON text)."""
-    if isinstance(config, dict):
-        return config
+def mcp_servers(config) -> dict:
+    """The servers in a --mcp-config value (a file path or JSON text), by name; {} when it can't be read."""
     if not config:
-        return None
+        return {}
     try:
         if config.lstrip().startswith("{"):
             data = json.loads(config)
@@ -139,8 +159,16 @@ def mcp_entry(config) -> dict | None:
             with open(config, encoding="utf-8") as fh:
                 data = json.load(fh)
     except (OSError, ValueError):
-        return None
-    entry = (data.get("mcpServers") or {}).get(JOB_SERVER) if isinstance(data, dict) else None
+        return {}
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    return servers if isinstance(servers, dict) else {}
+
+
+def mcp_entry(config) -> dict | None:
+    """The job tools' server entry from a --mcp-config value (a file path or JSON text)."""
+    if isinstance(config, dict):
+        return config
+    entry = mcp_servers(config).get(JOB_SERVER)
     return entry if isinstance(entry, dict) and entry.get("url") else None
 
 
@@ -394,8 +422,26 @@ def subtask_status(config, ident: str) -> str:
     return f"status: {got.get('status')}"
 
 
-def run_directives(prompt: str, config, prompt_tool=None) -> list:
-    """Answer lines for the SELFTEST: lines in the prompt, in order."""
+def git_env() -> str:
+    """SELFTEST: git-env: the names of the variables this agent sees that start with GIT_ENV_PREFIXES, sorted.
+    Names only: a value could be a git account's token."""
+    names = sorted(name for name in os.environ if name.upper().startswith(GIT_ENV_PREFIXES))
+    return "git-env: " + (",".join(names) or "none")
+
+
+def mcp_flags(args, config) -> str:
+    """SELFTEST: mcp-flags: which of MCP_FLAGS are in `args`, and with --mcp-config the names of the servers in
+    `config` (its value). Names only: an entry's address and headers can hold secrets."""
+    got = [f for f in MCP_FLAGS if any(arg == f or arg.startswith(f + "=") for arg in args)]
+    if not got:
+        return "mcp-flags: none"
+    servers = f" servers={','.join(sorted(mcp_servers(config))) or 'none'}" if "--mcp-config" in got else ""
+    return f"mcp-flags: {' '.join(got)}{servers}"
+
+
+def run_directives(prompt: str, config, prompt_tool=None, args=()) -> list:
+    """Answer lines for the SELFTEST: lines in the prompt, in order. `args` is the agent's command line, for
+    mcp-flags."""
     lines = []
     for text in directive_texts(prompt):
         words = text.split() or [""]
@@ -430,6 +476,10 @@ def run_directives(prompt: str, config, prompt_tool=None) -> list:
             lines.extend(delegate_many(config, text[len(what):]))
         elif what == "status":
             lines.append(subtask_status(config, words[1] if len(words) > 1 else ""))
+        elif what == "git-env":
+            lines.append(git_env())
+        elif what == "mcp-flags":
+            lines.append(mcp_flags(args, config))
     return lines
 
 
@@ -604,7 +654,14 @@ def credit_refused(session: str, totals: dict, model: str) -> int:
     return 1
 
 
+def is_summary_prompt(prompt: str) -> bool:
+    return prompt.strip() == SUMMARY_PROMPT
+
+
 def answer_for(prompt: str, edit_note: str, directive_lines: list) -> str:
+    if is_summary_prompt(prompt):  # SUMMARY_ANSWER, or what SELFTEST_SUMMARY says
+        what = os.environ.get("SELFTEST_SUMMARY", "")
+        return "" if what == "empty" else what or SUMMARY_ANSWER
     first = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "(empty prompt)")
     if "pong" in prompt.lower():
         answer = "pong"
@@ -673,7 +730,7 @@ def gemini_main(args: list, prompt: str) -> int:
         return 1
     # Gemini CLI gets the job tools through its system-defaults settings layer (see the runner).
     answer = answer_for(prompt, "I did not change any files.",
-                        run_directives(prompt, gemini_defaults(os.environ.get(GEMINI_DEFAULTS_VAR))))
+                        run_directives(prompt, gemini_defaults(os.environ.get(GEMINI_DEFAULTS_VAR)), args=args))
     emit({"type": "message", "timestamp": stamp, "role": "assistant", "content": answer, "delta": False})
     emit({"type": "result", "timestamp": stamp, "status": "success", "stats": gemini_stats(model)})
     return 0
@@ -702,7 +759,8 @@ def take_turn(prompt: str, ctx: dict, reply_no=None) -> int:
         emit(limit_event(session))  # Claude Code sends it after the first assistant message
     time.sleep(delay())
 
-    if os.environ.get("SELFTEST_FAIL") == "1":
+    if os.environ.get("SELFTEST_FAIL") == "1" or (is_summary_prompt(prompt)
+                                                  and os.environ.get("SELFTEST_SUMMARY") == "fail"):
         zero = {model: {k: 0 for k in USAGE_KEYS}}  # a crash's last result may carry all-zero figures
         emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
               "result": "Self-test failure requested.", "session_id": session, "num_turns": 1,
@@ -712,7 +770,7 @@ def take_turn(prompt: str, ctx: dict, reply_no=None) -> int:
               "model_usage_since_last_result": model_usage(zero)})
         return 1
 
-    directive_lines = run_directives(prompt, ctx["mcp_config"], ctx["prompt_tool"])
+    directive_lines = run_directives(prompt, ctx["mcp_config"], ctx["prompt_tool"], ctx["args"])
 
     if ctx["mode"] in ("acceptEdits", "auto", "bypassPermissions"):
         with open("selftest-output.txt", "a", encoding="utf-8") as fh:
@@ -750,7 +808,7 @@ def claude_main(args: list, prompt) -> int:
     session = resumed or str(uuid.uuid4())
     model = flag(args, "--model", "selftest-1")
     mcp_config = flag(args, "--mcp-config")
-    ctx = {"session": session, "model": model, "mcp_config": mcp_config,
+    ctx = {"session": session, "model": model, "mcp_config": mcp_config, "args": args,
            "mode": flag(args, "--permission-mode", "default"),
            "prompt_tool": flag(args, "--permission-prompt-tool"),
            "totals": load_totals(session) if resumed else {}}

@@ -213,6 +213,55 @@ your plan's monthly API credits, `runner.py init` asks whether it is the PC's cr
 in `runner.json`). It works as on Linux and macOS:
 [guide 5, A credits agent](05-linux-and-macos-machines.md#a-credits-agent).
 
+## Git accounts
+
+A **git account** is a named git login on the PC: a commit name and email, an SSH key, an HTTPS token, or a
+mix. You pick one per task, follow-up, clone or pull
+([guide 8](08-daily-use.md#picking-a-git-account-and-mcp-servers)). The settings, the fields and what a job
+gets are the same as on Linux and macOS: [guide 5, Git accounts](05-linux-and-macos-machines.md#git-accounts).
+Read that section first. What differs on Windows:
+
+1. Run the setup questions and answer the **Git accounts** step, or edit
+   `%USERPROFILE%\.bullpen\runner.json`:
+
+   ```powershell
+   py -3 $HOME\.bullpen\runner\runner.py init
+   ```
+
+2. In `runner.json`, write a key path with forward slashes, or start it with `~`. A backslash has to be
+   doubled in JSON.
+
+   ```json
+   "git_accounts": {
+     "personal": {"host": "github.com", "name": "Your Name", "email": "you@example.com",
+                  "ssh_key": "C:/Users/you/.ssh/id_ed25519"}
+   }
+   ```
+
+3. Check what the runner understood:
+
+   ```powershell
+   py -3 $HOME\.bullpen\runner\runner.py list
+   ```
+
+Things to know on Windows:
+
+- **Every git account needs git 2.31 or later.** A job with an account on an older git stops before it
+  starts, and the PC's page on the dashboard says git is too old.
+- **`.netrc` and `_netrc`.** curl, which git uses for HTTPS, reads both from your user folder. A login there
+  for the account's host, or a `default` login, stops jobs with that account. Remove that entry, or pick
+  **None**.
+- **Keys held by an ssh agent.** Some Windows setups point git at Windows' own OpenSSH, or at Pageant's
+  `plink`, with `core.sshCommand` or `GIT_SSH`. A job with an account ignores both and runs the `ssh` found
+  on the `PATH`. A key that only the Windows ssh-agent or Pageant holds can't be used then, because the job
+  has no terminal for a passphrase. Give the account a key file without a passphrase, or a token. The job's
+  log warns when either setting is present.
+- **Git Credential Manager.** For the account's host, the job switches off the credential helpers, Git
+  Credential Manager included, so the account's token is the only HTTPS login used.
+- **The Windows ssh tests.** The tests for the SSH settings run on Windows in this project's continuous
+  checks. They haven't been run on a real PC by hand yet. If a clone with an account fails on your PC,
+  [open an issue](https://github.com/rob-paprocki/agent-bullpen/issues) with the job's log, tokens removed.
+
 ## Managing the runner
 
 | Task | How |

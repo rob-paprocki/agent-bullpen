@@ -1,4 +1,4 @@
-/* Agent Bullpen — dashboard front end. Plain JavaScript, no build step.
+/* Agent Bullpen, dashboard front end. Plain JavaScript, no build step.
  *
  * Routes (the part after # in the address bar):
  *   #/             overview: machines and recent jobs, "Add a machine"
@@ -33,7 +33,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 function ago(ts) {
-  if (!ts) return '—';
+  if (!ts) return '-';
   const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
@@ -1043,10 +1043,13 @@ async function renderTask() {
       <label style="margin-top:0">Where and who <span class="muted">a blank model means the agent's default</span></label>
       ${machineFinder()}
       ${seatHtml('seat-task', null)}
+      <div id="task-git-box"></div>
       <label>What the agent may do</label>
       <div id="task-autonomy"></div>
       <div id="task-live-box"></div>
       <div id="task-delegate-box"></div>
+      <div id="task-mcp-box"></div>
+      <div id="task-summary-box"></div>
       <label class="check"><input type="checkbox" id="capture-diff"> Show me a diff of what changed afterwards (git projects)</label>
       <label for="task-title">Title <span class="muted">optional; lists and notifications show it instead of the prompt's first line</span></label>
       <input type="text" id="task-title" maxlength="120" autocomplete="off">
@@ -1062,12 +1065,14 @@ async function renderTask() {
   wireMachineFinder(form);
   const seat = document.getElementById('seat-task');
   wireSeat(seat, prefill || { ...suggestSeats(1)[0], project: 'chat' });
-  if (prefill) document.getElementById('prompt').value = prefill.prompt || '';
-  // The choices that depend on the agent: 'ask', keeping the session open and handing out
-  // subtasks. What you picked is kept while you try other agents, and comes back when you pick
-  // one that can do it again.
+  // Run again brings back the owner's own prompt, not the handoff the job started with (the hub cuts it too).
+  if (prefill) document.getElementById('prompt').value = withoutHandoff(prefill.prompt);
+  // The choices that depend on the machine and agent: 'ask', keeping the session open, handing out
+  // subtasks, the git account, MCP servers and the summary boxes. What you picked is kept while you try
+  // other agents, and comes back when you pick one that can do it again.
   const want = { autonomy: (prefill && prefill.autonomy) || 'readonly', live: !!(prefill && prefill.live), idle: (prefill && prefill.idle_min) || 15,
-    delegate: delegateWant(prefill || {}) };
+    delegate: delegateWant(prefill || {}), git: prefill && typeof prefill.git_account === 'string' ? prefill.git_account : '',
+    mcp: mcpWant(prefill || {}), summary: summaryWant(prefill && prefill.summary) };
   const delegateCtx = () => {
     const s = readSeat(seat);
     return { agent: seatAgent(s), runner: s.runner, ownKey: seatOwnKey(s), project: s.project || 'chat' };
@@ -1082,13 +1087,20 @@ async function renderTask() {
     document.getElementById('task-live-box').innerHTML = hasFeature(agent, 'live')
       ? liveOptionHtml('task-live', want.live, want.idle, 'The time limit below still applies.') : '';
     redrawDelegate();
+    // A git account only for a machine by name (each machine names its own accounts).
+    document.getElementById('task-git-box').innerHTML = s.tag ? '' : gitChoiceHtml('task-git', state.runners.find((r) => r.name === s.runner), want.git);
+    document.getElementById('task-mcp-box').innerHTML = mcpPickHtml(want.mcp, { able: hasFeature(agent, 'mcp_pick'), machines: seatMachines(s) });
+    document.getElementById('task-summary-box').innerHTML = summaryPickHtml(want.summary, { able: hasFeature(agent, 'summary') });
   };
   drawChoices();
+  wireMcpPick(document.getElementById('task-mcp-box'), want.mcp);
+  wireSummaryPick(document.getElementById('task-summary-box'), want.summary);
   // Any change of machine (or tag), agent, project or account; the model doesn't matter here.
   seat.addEventListener('change', (ev) => { if (ev.target.dataset.part && ev.target.dataset.part !== 'model') drawChoices(); });
   form.addEventListener('change', (ev) => {
     if (ev.target.name === 'autonomy') want.autonomy = ev.target.value;
     if (ev.target.id === 'task-live') want.live = ev.target.checked;
+    if (ev.target.id === 'task-git') want.git = ev.target.value;
     syncChoiceHints(form, 'autonomy');
   });
   form.addEventListener('submit', async (ev) => {
@@ -1097,6 +1109,7 @@ async function renderTask() {
     const s = readSeat(seat);
     const autonomy = form.querySelector('input[name=autonomy]:checked')?.value || 'readonly';
     const title = document.getElementById('task-title').value.trim();
+    const git = s.tag ? null : gitValue('task-git');  // '' (Default) is the same as leaving it out
     try {
       const res = await api('/api/tasks', { method: 'POST', body: {
         ...(s.tag ? { target_tag: s.tag, ...(s.account ? { account: s.account } : {}) } : { runner: s.runner }),
@@ -1106,6 +1119,9 @@ async function renderTask() {
         timeout_min: Number(document.getElementById('timeout').value) || 60,
         ...liveChoice('task-live'),
         ...delegateChoice(document.getElementById('task-delegate-box')),
+        ...(git ? { git_account: git } : {}),
+        ...mcpChoice(document.getElementById('task-mcp-box')),
+        ...summaryChoice(document.getElementById('task-summary-box')),
         ...(title ? { title } : {}),
       } });
       location.hash = `#/job/${res.id}`;
@@ -1175,6 +1191,9 @@ async function renderCouncil() {
         <label class="check"><input type="checkbox" id="fix" checked> Let the builder check each finding and fix the valid ones</label>
       </div>
 
+      <div id="c-git-box"></div>
+      <div id="c-mcp-box"></div>
+      <div id="c-summary-box"></div>
       <label for="c-title">Title <span class="muted">optional; lists and notifications show it instead of the request's first line</span></label>
       <input type="text" id="c-title" maxlength="120" autocomplete="off">
       <label for="c-prompt">The request</label>
@@ -1234,6 +1253,29 @@ async function renderCouncil() {
   view.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', modeSwitch));
   modeSwitch();
 
+  // One git account and one MCP choice for every step: offered only when every seat of the mode can take them,
+  // so they are drawn again when a seat or the mode changes, keeping what you picked.
+  const picks = { git: '', mcp: mcpWant(), summary: summaryWant() };
+  const councilSeats = () => (view.querySelector('input[name=mode]:checked').value === 'debate'
+    ? [...participants.seats(), judgeEl] : [builderEl, ...reviewers.seats()]).map(readSeat);
+  const drawPicks = () => {
+    const seats = councilSeats();
+    document.getElementById('c-git-box').innerHTML = councilGitHtml(seats, picks.git);
+    document.getElementById('c-mcp-box').innerHTML = councilMcpHtml(seats, picks.mcp);
+    // The summary is written by one seat: the judge of a debate, the builder of a build + review.
+    const debate = view.querySelector('input[name=mode]:checked').value === 'debate';
+    document.getElementById('c-summary-box').innerHTML = councilSummaryHtml(seats[debate ? seats.length - 1 : 0], picks.summary);
+  };
+  drawPicks();
+  wireMcpPick(document.getElementById('c-mcp-box'), picks.mcp);
+  wireSummaryPick(document.getElementById('c-summary-box'), picks.summary);
+  form.addEventListener('change', (ev) => {
+    if (ev.target.id === 'c-git') picks.git = ev.target.value;
+    else if ((ev.target.dataset.part && ev.target.dataset.part !== 'model') || ev.target.name === 'mode') drawPicks();
+  });
+  // Adding or removing a seat changes no field (its own handler has run by the time the click gets here).
+  form.addEventListener('click', (ev) => { if (ev.target.closest('[data-remove], #add-participant, #add-reviewer')) drawPicks(); });
+
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const err = document.getElementById('c-error'); err.hidden = true;
@@ -1251,7 +1293,10 @@ async function renderCouncil() {
     }
     const title = document.getElementById('c-title').value.trim();
     if (title) body.title = title;
+    const git = gitValue('c-git');  // a council takes no '' (Default): it is left out instead
+    if (git) body.git_account = git;
     try {
+      Object.assign(body, mcpChoice(document.getElementById('c-mcp-box')), summaryChoice(document.getElementById('c-summary-box')));
       const res = await api('/api/councils', { method: 'POST', body });
       location.hash = `#/job/${res.id}`;
     } catch (e) { err.textContent = e.message; err.hidden = false; }
@@ -1494,6 +1539,303 @@ function delegateChoice(box) {
     delegate_accounts: listOrAny('account'), delegate_agents: listOrAny('agent') };
 }
 
+// ------------------------------------------------------------ git accounts
+// Named git accounts in a machine's runner.json. The machine reports their names, hosts and kinds (never a key
+// or token), its defaults by name and what is wrong. A task, follow-up, council, clone or pull may pick one:
+// "Default" is the project's account, else the machine's, if set; "None" is the machine user's own git setup. A name
+// only picks credentials on that machine: it never changes which machine, agent or AI account runs the job.
+const GIT_NONE = '-';
+const GIT_HINT = "Default: the project's account, else the machine's, if set · None: the machine user's own git setup";
+
+// The accounts a machine reports, or null for a runner from before git accounts (it can't pick one).
+function gitAccountsOf(r) {
+  const list = r && r.info && typeof r.info === 'object' ? r.info.git_accounts : undefined;
+  if (!Array.isArray(list)) return null;
+  return list.filter((a) => a && typeof a === 'object' && typeof a.name === 'string')
+    .map((a) => ({ name: a.name, host: typeof a.host === 'string' ? a.host : '', kind: typeof a.kind === 'string' ? a.kind : '' }));
+}
+const gitProblemsOf = (r) => {
+  const list = r && r.info && typeof r.info === 'object' ? r.info.git_account_problems : undefined;
+  return Array.isArray(list) ? list.filter((p) => typeof p === 'string') : [];
+};
+const isGitName = (v) => typeof v === 'string' && v !== '' && v !== GIT_NONE;
+
+// The select: "Default" (value ''), each account as "name (host)", "None" ('-'). `accounts` is [{name, hosts}].
+// A picked name that isn't in the list (a follow-up's, after the machine dropped it) stays picked and marked,
+// so it is never dropped unseen: the hub refuses it with a sentence that says why.
+function gitSelectHtml(id, label, accounts, selected) {
+  const opt = (value, text) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(text)}</option>`;
+  const gone = isGitName(selected) && !accounts.some((a) => a.name === selected) ? [opt(selected, `${selected} (not on this machine now)`)] : [];
+  return `<label for="${esc(id)}">${esc(label)} <span class="muted">${esc(GIT_HINT)}</span></label>
+    <select id="${esc(id)}">${[opt('', 'Default'), ...accounts.map((a) => opt(a.name, `${a.name} (${a.hosts.join(', ')})`)), ...gone,
+    opt(GIT_NONE, 'None')].join('')}</select>`;
+}
+
+// The "Git account" select for a job, clone or pull on machine r, or '' when there is nothing to pick: a runner
+// from before git accounts, or one with no account and nothing wrong (and no name picked before). With a broken
+// default, "None" is the way past it.
+function gitChoiceHtml(id, r, selected, label = 'Git account') {
+  const accounts = gitAccountsOf(r);
+  if (!accounts || !(accounts.length || gitProblemsOf(r).length || isGitName(selected))) return '';
+  return gitSelectHtml(id, label, accounts.map((a) => ({ name: a.name, hosts: [a.host] })), selected);
+}
+
+// One select for a whole council: only when every seat is a machine by name that knows git accounts, offering
+// the names every one of them reports (the hub refuses any other).
+function councilGitHtml(seats, selected) {
+  if (!seats.length || seats.some((s) => s.tag)) return '';
+  const machines = [...new Set(seats.map((s) => s.runner))].map((n) => state.runners.find((r) => r.name === n));
+  const lists = machines.map(gitAccountsOf);
+  if (lists.some((l) => !l)) return '';
+  const names = lists[0].map((a) => a.name).filter((n) => lists.every((l) => l.some((a) => a.name === n)));
+  if (!names.length && !machines.some((r) => gitProblemsOf(r).length) && !isGitName(selected)) return '';
+  const accounts = names.map((n) => ({ name: n, hosts: [...new Set(lists.map((l) => l.find((a) => a.name === n).host))] }));
+  return gitSelectHtml('c-git', 'Git account for every step', accounts, selected);
+}
+
+// The select's value ('' Default, '-' None, else a name), or null when the form has no select.
+function gitValue(id) {
+  const sel = document.getElementById(id);
+  return sel ? sel.value : null;
+}
+
+// The machine page's "Git accounts" card: each account with its host and kind, and what it is the default for.
+function gitAccountsHtml(r) {
+  const accounts = gitAccountsOf(r);
+  if (!accounts) return '';
+  const info = r.info;
+  const machineDefault = typeof info.default_git_account === 'string' ? info.default_git_account : '';
+  const map = info.project_git_accounts && typeof info.project_git_accounts === 'object' && !Array.isArray(info.project_git_accounts)
+    ? Object.entries(info.project_git_accounts).filter(([, v]) => typeof v === 'string') : [];
+  if (!accounts.length && !machineDefault && !map.length) return '';
+  const rows = accounts.map((a) => {
+    const uses = (a.name === machineDefault ? ['<span class="chip ok">machine default</span>'] : [])
+      .concat(map.filter(([, v]) => v === a.name).map(([p]) => `<span class="chip tag">${esc(p)}</span>`));
+    return `<tr><td><strong>${esc(a.name)}</strong></td><td><span class="phone-only muted small">host </span><code>${esc(a.host)}</code></td>
+      <td class="small"><span class="phone-only muted">kind </span>${esc(a.kind)}</td>
+      <td class="small">${uses.length ? `<span class="phone-only muted">default for </span>${uses.join(' ')}` : ''}</td></tr>`;
+  }).join('');
+  return `<h2>Git accounts</h2>
+    <div class="card table-wrap"><table class="stack"><thead><tr><th>Name</th><th>Host</th><th>Kind</th><th>Default for</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4" class="muted">none</td></tr>'}</tbody></table>
+      <p class="muted small">Git accounts are set on the machine itself, with <code>runner.py init</code> or in <code>runner.json</code>.
+        A task, follow-up, clone or pull can pick one. Default means the project's account (the project chips above), else the machine default.</p></div>`;
+}
+
+// What is wrong with the git accounts in the machine's runner.json, at the top of its page.
+function gitProblemsHtml(r) {
+  const problems = gitProblemsOf(r);
+  if (!problems.length) return '';
+  return `<div class="notice"><strong>Git accounts:</strong> fix these in this machine's runner.json (or with <code>runner.py init</code>).
+    A job, clone or pull that would use a broken default doesn't start until it is fixed.
+    <ul class="small">${problems.map((p) => `<li>${esc(p)}</li>`).join('')}</ul></div>`;
+}
+
+// What a job's page says about its git account: the one picked, none, the default (on a machine with git
+// accounts), or none because a subtask never gets one; '' when there is nothing to say.
+function jobGitHtml(j, opts) {
+  const pick = j.kind === 'admin' ? ((opts.params && typeof opts.params === 'object' ? opts.params : {}).git_account) : opts.git_account;
+  if (isGitName(pick)) return ` · git account: ${esc(pick)}`;
+  if (pick === GIT_NONE) return ' · git account: none';
+  if (j.kind !== 'task') return '';
+  const accounts = gitAccountsOf(state.runners.find((r) => r.name === j.runner));
+  if (!accounts || !accounts.length) return '';
+  return j.delegated_by || opts.delegated ? ' · git account: none (subtask)' : ' · git account: default';
+}
+
+// -------------------------------------------------------------- MCP picks
+// MCP servers for one task (Claude Code agents: they report mcp_pick). "Add for this task" adds servers marked
+// "Only for tasks that pick it" on the MCP page; "Only these servers" narrows the agent to the ticked ones (the
+// hub's own memory server and the job tools always stay). The tools of picked servers are allowed at every
+// level, read only included, so the forms and the job page say so.
+const MCP_READ_ONLY_WARNING = 'Tools of the picked servers are allowed even in Read only.';
+const MCP_NARROW_WARNING = "This agent's own Claude Code servers are left out.";
+const MCP_NARROW_EMPTY = 'Tick at least one server under “Only these servers”, or turn it off.';
+
+// The servers a Claude Code job on these machines can pick: turned on, for Claude Code, and for the platform
+// of every one of them.
+function mcpServersFor(machines) {
+  const platforms = machines.map((r) => (r && r.info && typeof r.info.platform === 'string' ? r.info.platform : ''));
+  return (Array.isArray(state.mcp_servers) ? state.mcp_servers : [])
+    .filter((s) => s && typeof s.name === 'string' && s.enabled === true && Array.isArray(s.targets) && s.targets.includes('claude')
+      && Array.isArray(s.platforms) && platforms.every((p) => s.platforms.includes(p)))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// The picks, kept while you try other machines and agents: names to add, names to narrow to, and the switch.
+function mcpWant(o = {}) {
+  const names = (list) => new Set(Array.isArray(list) ? list.filter((n) => typeof n === 'string') : []);
+  return { add: names(o.mcp_add), only: names(o.mcp_only), narrow: names(o.mcp_only).size > 0 };
+}
+const mcpPicked = (opts) => [opts.mcp_add, opts.mcp_only].some((l) => Array.isArray(l) && l.length > 0);
+
+// The "MCP servers" box, or '' when the agent can't pick (ctx.able false) or there is nothing to pick.
+// ctx: {able, machines (where the job may run), keep (a follow-up: the last turn's picks stay in the box even
+// where they are no longer offered, ticked and marked, so they are never dropped unseen)}.
+function mcpPickHtml(want, ctx) {
+  const keep = !!ctx.keep && (want.add.size > 0 || want.only.size > 0);
+  if (!ctx.able && !keep) return '';
+  const servers = mcpServersFor(ctx.machines || []);
+  const offerAdd = servers.filter((s) => s.on_demand === true).map((s) => s.name);
+  const offerOnly = servers.map((s) => s.name);
+  const gone = (set, offered) => (ctx.keep ? [...set].filter((n) => !offered.includes(n)).sort() : []);
+  const goneAdd = gone(want.add, offerAdd); const goneOnly = gone(want.only, offerOnly);
+  if (!offerOnly.length && !goneAdd.length && !goneOnly.length) return '';
+  const box = (kind, name, on, isGone) => `<label class="check"><input type="checkbox" data-mp="${kind}" value="${esc(name)}"${on ? ' checked' : ''}> <span>${esc(name)}${isGone ? ' <span class="muted">(not available now)</span>' : ''}</span></label>`;
+  const boxes = (kind, offered, goneNames) => offered.map((n) => box(kind, n, want[kind].has(n), false))
+    .concat(goneNames.map((n) => box(kind, n, true, true))).join('');
+  const add = boxes('add', offerAdd, goneAdd);
+  return `<div class="dg-opt mcp-pick" data-mcp-pick><div class="dg-head">MCP servers</div>
+    <div class="dg-part"><div class="small">Add for this task</div>
+      ${add ? `<div class="dg-checks">${add}</div>` : '<div class="small muted">No server is marked “Only for tasks that pick it” on the MCP page.</div>'}</div>
+    <div class="dg-part"><label class="check"><input type="checkbox" data-mp="narrow"${want.narrow ? ' checked' : ''}> Only these servers</label>
+      <div class="dg-scope" data-mp-scope${want.narrow ? '' : ' hidden'}><div class="dg-checks">${boxes('only', offerOnly, goneOnly)}</div>
+        <p class="dg-warn small">${esc(MCP_NARROW_WARNING)}</p></div></div>
+    <p class="dg-warn small">${esc(MCP_READ_ONLY_WARNING)}</p></div>`;
+}
+
+// The machines a seat's job may run on: its machine, or those with its tag, agent and project.
+const seatMachines = (s) => (s.tag ? tagSeatMachines(s.tag, s.agent, s.project || 'chat', s.account)
+  : state.runners.filter((r) => r.name === s.runner));
+
+// A council's box: only when every seat's agent can pick, offering what every seat's machines can use.
+function councilMcpHtml(seats, want) {
+  if (!seats.length || !seats.every((s) => hasFeature(seatAgent(s), 'mcp_pick'))) return '';
+  return mcpPickHtml(want, { able: true, machines: seats.flatMap(seatMachines) });
+}
+
+// Keep `want` up to date as you tick, and show the servers to narrow to only while the switch is on.
+function wireMcpPick(box, want) {
+  box.addEventListener('change', (ev) => {
+    const t = ev.target; const kind = t.dataset ? t.dataset.mp : undefined;
+    if (kind === 'narrow') {
+      want.narrow = t.checked;
+      const scope = box.querySelector('[data-mp-scope]');
+      if (scope) scope.hidden = !t.checked;
+    } else if (kind === 'add' || kind === 'only') {
+      if (t.checked) want[kind].add(t.value); else want[kind].delete(t.value);
+    }
+  });
+}
+
+// The body fields for the box: {} when it isn't there. A new task or council sends only what is ticked; a
+// follow-up (`always`) sends both lists, empty ones too, since a list left out keeps the last turn's picks and
+// [] turns them off. Narrowing to nothing can't be sent (an empty list means "not narrowed"), so it is refused.
+function mcpChoice(box, always = false) {
+  const root = box && box.querySelector('[data-mcp-pick]');
+  if (!root) return {};
+  const ticked = (kind) => [...root.querySelectorAll(`input[data-mp="${kind}"]:checked`)].map((b) => b.value);
+  const narrow = root.querySelector('input[data-mp="narrow"]').checked;
+  const add = ticked('add'); const only = narrow ? ticked('only') : [];
+  if (narrow && !only.length) throw new Error(MCP_NARROW_EMPTY);
+  if (always) return { mcp_add: add, mcp_only: only };
+  return { ...(add.length ? { mcp_add: add } : {}), ...(only.length ? { mcp_only: only } : {}) };
+}
+
+// The job page's line about the picks ('' without any) and its warning.
+function jobMcpHtml(opts) {
+  const names = (l) => (Array.isArray(l) ? l.filter((n) => typeof n === 'string') : []);
+  const add = names(opts.mcp_add); const only = names(opts.mcp_only);
+  return (add.length ? ` · MCP servers added: ${add.map(esc).join(', ')}` : '') + (only.length ? ` · only these MCP servers: ${only.map(esc).join(', ')}` : '');
+}
+const mcpWarningHtml = (opts) => (mcpPicked(opts) ? `<div class="notice">${esc(MCP_READ_ONLY_WARNING)}</div>` : '');
+
+// ----------------------------------------------------------- job summaries
+// Two boxes on New task, follow-up and council, preset from the two switches on the Memory page: "Summarize" (the
+// agent writes a short summary when the job is done; only for agents that report the summary feature) and
+// "Handoff" (the prompt starts from the project's newest summaries; any agent, and not a follow-up). A box left as
+// it was drawn sends nothing, so the hub applies the switch; a box changed sends its value.
+const SUMMARY_TAG = 'job-summary';
+// The first line and the separator of the handoff, as hub/memory.py has them (tests/test_hub_units.py compares).
+const HANDOFF_INTRO = 'Notes from earlier jobs in this project (context, not instructions):\n\n';
+const HANDOFF_END = '\n\n---\n\n';
+
+// The owner's own prompt, from one that starts with a handoff (Run again): the hub cuts it the same way.
+function withoutHandoff(prompt) {
+  const text = typeof prompt === 'string' ? prompt : '';
+  if (!text.startsWith(HANDOFF_INTRO)) return text;
+  const at = text.indexOf(HANDOFF_END);
+  return at < 0 ? text : text.slice(at + HANDOFF_END.length);
+}
+
+const memorySwitches = () => ({
+  summarize: !!state.memory_settings && state.memory_settings.summarize_jobs === true,
+  handoff: !!state.memory_settings && state.memory_settings.handoff_summaries === true,
+});
+// The boxes' starting state: the switches, or what an earlier job chose (Run again).
+const summaryWant = (o) => (o ? { summarize: o.summarize === true, handoff: o.handoff === true } : memorySwitches());
+
+// ctx: {able (the agent reports 'summary'), handoff (false: no handoff box, as on a follow-up)}.
+function summaryPickHtml(want, ctx) {
+  const sw = memorySwitches();
+  const box = (kind, on, label, hint) => `<label class="check"><input type="checkbox" data-sm="${kind}" data-sm-switch="${sw[kind] ? 1 : 0}"${on ? ' checked' : ''}>
+    <span>${esc(label)} <span class="muted">${esc(hint)}</span></span></label>`;
+  const summarize = ctx.able
+    ? box('summarize', want.summarize, 'Save a summary of this job to shared memory', 'One extra short turn on the same AI account; it costs like one.')
+    : (sw.summarize ? "<p class=\"muted small\">This agent can't write a summary, so none is saved.</p>" : '');
+  const handoff = ctx.handoff === false ? ''
+    : box('handoff', want.handoff, "Start from the project's recent summaries", 'The newest three are put in front of the prompt.');
+  return summarize || handoff ? `<div class="dg-opt summary-pick" data-summary-pick>${summarize}${handoff}</div>` : '';
+}
+
+// A council's box: the summary is written by one seat (the judge, or the builder), so that seat's agent decides.
+function councilSummaryHtml(writer, want) {
+  return summaryPickHtml(want, { able: hasFeature(seatAgent(writer), 'summary') });
+}
+
+// The body fields for the boxes: only a box changed from its switch, so absent still means "the switch".
+function summaryChoice(box) {
+  const root = box && box.querySelector('[data-summary-pick]');
+  if (!root) return {};
+  const out = {};
+  for (const kind of ['summarize', 'handoff']) {
+    const el = root.querySelector(`input[data-sm="${kind}"]`);
+    if (el && el.checked !== (el.dataset.smSwitch === '1')) out[kind] = el.checked;
+  }
+  return out;
+}
+
+// Keep `want` up to date as you tick.
+function wireSummaryPick(box, want) {
+  box.addEventListener('change', (ev) => {
+    const kind = ev.target.dataset ? ev.target.dataset.sm : undefined;
+    if (kind === 'summarize' || kind === 'handoff') want[kind] = ev.target.checked;
+  });
+}
+
+// The job page's line about its summary: where it went, or why there is none; '' when nothing was asked.
+function jobSummaryHtml(j) {
+  const opts = j.options && typeof j.options === 'object' ? j.options : {};
+  if (j.kind !== 'task') return '';
+  if (j.summary_note) return `<div class="small muted">Summary saved to shared memory (<a href="#/memory">note #${Number(j.summary_note)}</a>).</div>`;
+  if (typeof opts.summary_skipped === 'string' && opts.summary_skipped) return `<div class="small muted">No summary: ${esc(opts.summary_skipped)}</div>`;
+  if (opts.summarize !== true || j.delegated_by) return '';
+  if (jobIsLive(j)) return '<div class="small muted">A summary is written when the job is done.</div>';
+  if (j.status === 'done') return '<div class="small muted">No summary was saved. The live log usually says why: look for "Summary not written" or "Summary not saved".</div>';
+  return '';
+}
+// The hub stores handoff:true even when the project had no summaries yet, so a task shows the line only when
+// its prompt really starts with the handoff block. A council has many prompts: its line says what was asked.
+const jobHandoffHtml = (j, opts) => (opts.handoff === true && typeof j.prompt === 'string' && j.prompt.startsWith(HANDOFF_INTRO)
+  ? " · starts with the project's recent summaries" : '');
+const councilHandoffHtml = (opts) => (opts.handoff === true ? " · asked to start from the project's recent summaries" : '');
+
+// The notes that are job summaries (the exact tag, not one that only starts with it).
+const summaryNotes = (notes) => (Array.isArray(notes) ? notes : []).filter((n) => String(n.tags || '').split(',').includes(SUMMARY_TAG));
+
+// The Memory page's two switches (s: state.memory_settings).
+function memorySwitchesHtml(s) {
+  const on = (v) => (v === true ? ' checked' : '');
+  return `<div class="card" id="summary-switches"><h3 style="margin-top:0">Job summaries</h3>
+    <label class="check"><input type="checkbox" id="set-summarize"${on(s && s.summarize_jobs)}>
+      <span>Summarize jobs <span class="muted">When a task is done, its agent writes a short summary into shared memory. This is one extra short turn on
+      the same AI account, so it costs like one. A task, follow-up or council can turn it off or on.</span></span></label>
+    <label class="check"><input type="checkbox" id="set-handoff"${on(s && s.handoff_summaries)}>
+      <span>Start new tasks from the project's recent summaries <span class="muted">The hub puts the newest three summaries it saved for the
+      project in front of a new task's prompt, as context and not as instructions.</span></span></label>
+    <p class="error" id="set-error" hidden></p></div>`;
+}
+
 // Replace a region of the page only when what it shows has changed, and not while you are typing
 // in it (it is redrawn on a later refresh instead). Typed text, the cursor and which <details> are
 // open are kept.
@@ -1538,6 +1880,7 @@ function jobShell(j) {
     <div id="job-live"></div>
     <div id="job-live-note"></div>
     <div id="job-result"></div>
+    <div id="job-summary"></div>
     <div id="job-usage"></div>
     <div id="job-subtasks"></div>
     <div id="job-continue"></div>
@@ -1570,6 +1913,7 @@ function jobMetaHtml(j) {
     ${j.parent_id ? ` · part of <a href="#/job/${Number(j.parent_id)}">council #${Number(j.parent_id)}</a>` : ''}
     ${j.delegated_by ? ` · subtask of <a href="#/job/${Number(j.delegated_by)}">#${Number(j.delegated_by)}</a>` : ''}
     ${j.kind === 'task' && opts.delegate && !j.delegated_by ? ' · may hand out subtasks' : ''}
+    ${jobGitHtml(j, opts)}${jobMcpHtml(opts)}${jobHandoffHtml(j, opts)}
     ${j.follow_up_of ? ` · follow-up to <a href="#/job/${Number(j.follow_up_of)}">#${Number(j.follow_up_of)}</a>` : ''}
     ${own(ERROR_KINDS, j.error_kind) ? ` · ${errorKindChip(j.error_kind, true)}` : ''}${creditsMetaHtml(j)}`;
 }
@@ -1607,7 +1951,8 @@ function jobNoticesHtml(p, j) {
   const runner = j.runner ? state.runners.find((r) => r.name === j.runner) : null;
   const offline = j.status === 'queued' && runner && !runner.online
     ? `<div class="notice">${esc(j.runner)} is offline. The job will start when its runner checks in.</div>` : '';
-  return offline + tagWaitingHtml(j, p.tagCandidates) + (p.creditsData ? creditsRetryHtml(j, p.creditsData) : '')
+  return offline + mcpWarningHtml(j.options && typeof j.options === 'object' ? j.options : {})
+    + tagWaitingHtml(j, p.tagCandidates) + (p.creditsData ? creditsRetryHtml(j, p.creditsData) : '')
     + (p.actionError ? `<p class="error">${esc(p.actionError)}</p>` : '');
 }
 
@@ -1968,13 +2313,20 @@ function followHtml(j) {
   const agent = agentInfo(j.runner, j.agent);
   const models = ((agent || {}).models || []).map((m) => `<option value="${esc(m)}">`).join('');
   const keep = j.model || (agent || {}).default_model || '';
+  // Preset from this turn: its git account (none picked: Default; a subtask ran with none) and its MCP picks.
+  const opts = j.options || {};
+  const runner = state.runners.find((r) => r.name === j.runner);
+  const git = typeof opts.git_account === 'string' ? opts.git_account : (j.delegated_by || opts.delegated ? GIT_NONE : '');
   return `<form class="card follow" id="follow">
     <label for="follow-text" style="margin-top:0">Follow up <span class="muted">continues the same conversation on ${esc(j.runner)}</span></label>
     <textarea id="follow-text" required></textarea>
+    ${gitChoiceHtml('follow-git', runner, git)}
     <label>What the agent may do</label>
     ${autonomyRadios('follow-autonomy', j.autonomy, agent)}
     ${hasFeature(agent, 'live') ? liveOptionHtml('follow-live', isLiveSession(j), (j.options || {}).idle_min || 15, 'The time limit of an hour still applies.') : ''}
     <div id="follow-delegate-box"></div>
+    <div id="follow-mcp-box">${mcpPickHtml(mcpWant(opts), { able: hasFeature(agent, 'mcp_pick'), machines: runner ? [runner] : [], keep: true })}</div>
+    <div id="follow-summary-box">${summaryPickHtml(summaryWant(), { able: hasFeature(agent, 'summary'), handoff: false })}</div>
     <label for="follow-model">Model <span class="muted">${j.model ? `blank keeps ${esc(j.model)}` : "blank means the agent's default"}</span></label>
     <input type="text" id="follow-model" list="follow-models" placeholder="${esc(keep || 'default')}" autocomplete="off">
     <datalist id="follow-models">${models}</datalist>
@@ -1991,10 +2343,14 @@ function wireFollow(p, j) {
   const runner = state.runners.find((r) => r.name === j.runner);
   wireDelegate(document.getElementById('follow-delegate-box'), 'follow-delegate', delegateWant(j.delegated_by ? {} : opts), () => ({
     agent: agentInfo(j.runner, j.agent), runner: j.runner, ownKey: runner ? accountOf(runner, j.agent) : null, project: j.project || 'chat' }));
+  wireMcpPick(document.getElementById('follow-mcp-box'), mcpWant(opts));
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const err = document.getElementById('follow-error'); err.hidden = true;
     const btn = form.querySelector('button[type=submit]'); btn.disabled = true;
+    // The git account and MCP picks are always sent when the form shows them ('' takes the git account back
+    // to Default, [] turns picks off); without the controls, the hub keeps the last turn's.
+    const git = gitValue('follow-git');
     try {
       const res = await api('/api/tasks', { method: 'POST', body: {
         follow_up_of: j.id, runner: j.runner, agent: j.agent, project: j.project || 'chat',
@@ -2004,6 +2360,9 @@ function wireFollow(p, j) {
         prompt: document.getElementById('follow-text').value,
         ...liveChoice('follow-live'),
         ...delegateChoice(document.getElementById('follow-delegate-box')),
+        ...(git !== null ? { git_account: git } : {}),
+        ...mcpChoice(document.getElementById('follow-mcp-box'), true),
+        ...summaryChoice(document.getElementById('follow-summary-box')),
       } });
       location.hash = `#/job/${res.id}`;
     } catch (e) { err.textContent = e.message; err.hidden = false; } finally { btn.disabled = false; }
@@ -2013,7 +2372,9 @@ function wireFollow(p, j) {
 // ------------------------------------------------------------------ councils
 function councilBodyHtml(j, data) {
   const m = j.meta || {};
-  let html = `<div class="muted">${m.mode === 'debate' ? 'Debate' : 'Build + review'} · ${statusChip(j.status)} · started ${ago(j.started_at)} · ${duration(j)}</div>`;
+  const opts = j.options && typeof j.options === 'object' ? j.options : {};
+  let html = `<div class="muted">${m.mode === 'debate' ? 'Debate' : 'Build + review'} · ${statusChip(j.status)} · started ${ago(j.started_at)} · ${duration(j)}${jobGitHtml(j, opts)}${jobMcpHtml(opts)}${councilHandoffHtml(opts)}</div>`;
+  html += mcpWarningHtml(opts);
   html += stageBar(m, j.status);
   if (j.status === 'done') html += `<div class="card"><h2 style="margin-top:0">Result</h2><div class="md">${md(j.result)}</div></div>`;
   if (j.error) html += `<p class="error">${esc(j.error)}</p>`;
@@ -2092,6 +2453,7 @@ async function drawJob(p) {
   if (liveForm) liveForm.hidden = !sessionOpen(j);
   setRegion(document.getElementById('job-live-note'), liveNoteHtml(p, j));
   setRegion(document.getElementById('job-result'), jobResultHtml(j, p));
+  setRegion(document.getElementById('job-summary'), jobSummaryHtml(j));
   setRegion(document.getElementById('job-usage'), jobUsageHtml(j));
   const subtasks = Array.isArray(data.subtasks) ? data.subtasks : [];
   setRegion(document.getElementById('job-subtasks'), subtasksHtml(j, subtasks));
@@ -2146,7 +2508,10 @@ function wireJobPage(p) {
       const scope = opts.delegate && !j.delegated_by ? { delegate: true, delegate_to: opts.delegate_to, delegate_projects: opts.delegate_projects,
         delegate_accounts: opts.delegate_accounts, delegate_agents: opts.delegate_agents } : {};
       sessionStorage.setItem('prefill', JSON.stringify({ ...where, agent: j.agent, project: j.project, model: j.model, prompt: j.prompt,
-        autonomy: j.autonomy, live: !!opts.live, idle_min: opts.idle_min, ...scope }));
+        autonomy: j.autonomy, live: !!opts.live, idle_min: opts.idle_min, ...scope,
+        git_account: opts.git_account, mcp_add: opts.mcp_add, mcp_only: opts.mcp_only,
+        // Summarize counts as chosen when the switch asked for it and the agent couldn't (summary_skipped).
+        summary: { summarize: opts.summarize === true || !!opts.summary_skipped, handoff: opts.handoff === true } }));
       location.hash = '#/task';
     } else if (b.dataset.copyContinue !== undefined) {
       copyText(p.continueCommand, b);
@@ -2244,7 +2609,7 @@ function rcEntries(r) {
   return Array.isArray(list) ? list.filter((e) => e && typeof e === 'object') : [];
 }
 const rcKey = (runner, agent, project) => `${runner}\n${agent}\n${project}`;
-const rcTime = (ts) => (Number(ts) ? whenLocal(Number(ts)) : '—');
+const rcTime = (ts) => (Number(ts) ? whenLocal(Number(ts)) : '-');
 const CLAUDE_URL_RE = /^https:\/\/claude\.ai\//;
 
 // Queue Start or Stop Remote Control on a machine; the admin job's id.
@@ -2290,7 +2655,7 @@ function rcTableHtml(r) {
     return `<tr><td><strong>${esc(e.agent)}</strong></td><td><span class="phone-only muted small">in </span>${esc(e.project)}</td>
       <td><span class="status ${esc(state)}">${esc(state)}</span>${detail}</td>
       <td class="small"><span class="phone-only muted">since </span><span title="${esc(fullDate(e.since))}">${ago(e.since)}</span></td>
-      <td class="small${on ? '' : ' rc-none'}"><span class="phone-only muted">stops at </span>${on ? esc(rcTime(e.stops_at)) : '—'}</td>
+      <td class="small${on ? '' : ' rc-none'}"><span class="phone-only muted">stops at </span>${on ? esc(rcTime(e.stops_at)) : '-'}</td>
       <td><div class="row rc-act">${open}${stop}</div></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
@@ -2509,6 +2874,7 @@ async function renderMachine(name) {
       This page shows whichever checked in last, and each can pick up jobs meant for the other.
       Give one of them another name: click Add a machine, type a new name, and run the command it shows on that
       computer. (Editing the name in its runner.json only works for a computer on the shared token.)</div>` : ''}
+    ${gitProblemsHtml(r)}
 
     <h2>Runner</h2>
     <div class="card">
@@ -2534,9 +2900,11 @@ async function renderMachine(name) {
     <div class="row spread"><h2>Agents</h2>${canCheck ? `<button class="ghost small" id="check-limits" ${r.online ? 'title="Run Claude Code\'s /usage for each Claude agent here that can read its plan limits"' : 'disabled title="The machine is offline"'}>Check limits</button>` : ''}</div>
     <div class="card table-wrap"><table class="stack agents"><thead><tr><th>Agent</th><th>Status</th><th>Account</th><th>Limits</th><th>Models</th></tr></thead><tbody>${agentRows || '<tr><td colspan="5" class="muted">none</td></tr>'}</tbody></table>
       <p class="muted small">Agents, logins, account labels and model suggestions are set on the machine itself (<code>runner.py init</code> or <code>runner.json</code>).${anyLimits ? ' Limits shows how much of each Claude plan window is used, from the last job or Check limits; the <a href="#/usage">Usage page</a> shows them per account.' : ''}</p></div>
+    ${gitAccountsHtml(r)}
 
     <h2>Projects</h2>
     <div class="card table-wrap"><table class="stack"><thead><tr><th>Name</th><th>Folder</th><th></th></tr></thead><tbody>${projectRows}</tbody></table>
+      ${remote && (r.projects || []).some((p) => p !== 'chat') ? gitChoiceHtml('pull-git', r, '', 'Git account for Pull') : ''}
       ${remote ? `<p class="muted small">New projects go in <code>${esc(info.projects_root || '')}</code>. Removing a project only stops offering it; its files stay on the machine.</p>`
         : '<p class="muted small">Managing projects from the dashboard is off for this machine (<code>allow_remote_projects</code> in its runner.json).</p>'}
     </div>
@@ -2544,6 +2912,7 @@ async function renderMachine(name) {
       <form class="card" id="clone-form"><h3>Clone a git repository</h3>
         <label>Repository address</label><input type="text" id="clone-url" required placeholder="https://github.com/you/repo.git">
         <label>Project name</label><input type="text" id="clone-name" required placeholder="repo">
+        ${gitChoiceHtml('clone-git', r, '')}
         <p class="muted small">Private repositories need git credentials on that machine (see the troubleshooting guide).</p>
         <button type="submit">Clone</button></form>
       <form class="card" id="create-form"><h3>New empty project</h3>
@@ -2578,9 +2947,11 @@ async function renderMachine(name) {
   document.getElementById('forget').addEventListener('click', async () => {
     try { if (await forgetMachine(r.name)) location.hash = '#/'; } catch (e) { const err = document.getElementById('m-error'); err.textContent = e.message; err.hidden = false; }
   });
+  // Clone and Pull send the git account picked for them; Default ('') is left out, as before git accounts.
+  const withGit = (params, id) => { const git = gitValue(id); return git ? { ...params, git_account: git } : params; };
   view.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
     if (b.dataset.act === 'project.remove' && !confirm(`Stop offering ${b.dataset.name}? Its files stay on the machine.`)) return;
-    act(b.dataset.act, { name: b.dataset.name });
+    act(b.dataset.act, b.dataset.act === 'project.pull' ? withGit({ name: b.dataset.name }, 'pull-git') : { name: b.dataset.name });
   }));
   const urlIn = document.getElementById('clone-url'); const nameIn = document.getElementById('clone-name');
   urlIn?.addEventListener('input', () => {
@@ -2588,7 +2959,7 @@ async function renderMachine(name) {
     if (!nameIn.dataset.touched) nameIn.value = guess.replace(/[^A-Za-z0-9._-]/g, '-');
   });
   nameIn?.addEventListener('input', () => { nameIn.dataset.touched = '1'; });
-  document.getElementById('clone-form')?.addEventListener('submit', (ev) => { ev.preventDefault(); act('project.clone', { url: urlIn.value, name: nameIn.value }); });
+  document.getElementById('clone-form')?.addEventListener('submit', (ev) => { ev.preventDefault(); act('project.clone', withGit({ url: urlIn.value, name: nameIn.value }, 'clone-git')); });
   document.getElementById('create-form')?.addEventListener('submit', (ev) => {
     ev.preventDefault();
     act('project.create', { name: document.getElementById('create-name').value, git: document.getElementById('create-git').checked ? 'yes' : 'no' });
@@ -2725,6 +3096,7 @@ async function renderMemory() {
     <p class="muted">Notes shared by every agent and account on every machine. <strong>Pinned</strong> global and agent notes are
       loaded into every session's context automatically (keep them short; only you can pin). The rest are found when an
       agent uses <code>recall</code>, or here. Agents add notes with <code>/remember</code> and can ask you to pin one.</p>
+    ${memorySwitchesHtml(state.memory_settings)}
     <form class="card" id="note-form">
       <label for="note-text" style="margin-top:0">New note</label>
       <textarea id="note-text" style="min-height:90px" required placeholder="e.g. build-box has the CUDA toolkit; its projects live in D:\\src. Prefer PowerShell 7 there."></textarea>
@@ -2739,17 +3111,23 @@ async function renderMemory() {
     <div class="row" style="margin:14px 0 6px">
       <input type="text" id="note-q" placeholder="Search notes…" style="flex:1;min-width:180px">
       <select id="note-filter" style="width:auto"><option value="">All scopes</option>${scopeOptions('')}</select>
+      <label class="check" style="margin:0"><input type="checkbox" id="note-summaries"> Job summaries only</label>
     </div>
     <div id="pinned-meter" class="muted small"></div>
     <div id="notes"></div>
     <details id="ctx-preview"><summary>What agents see (the pinned-notes files)</summary><div id="ctx-files" class="muted">Loading…</div></details>`;
 
   const load = async () => {
-    const q = document.getElementById('note-q').value; const scope = document.getElementById('note-filter').value;
-    const data = await api(`/api/notes?q=${encodeURIComponent(q)}&scope=${encodeURIComponent(scope)}`);
+    const summariesOnly = document.getElementById('note-summaries').checked;
+    // The search finds the tag in a note's tags; the exact tag is checked here.
+    const q = `${document.getElementById('note-q').value} ${summariesOnly ? SUMMARY_TAG : ''}`.trim();
+    const scope = document.getElementById('note-filter').value;
+    const data = await api(`/api/notes?q=${encodeURIComponent(q)}&scope=${encodeURIComponent(scope)}${summariesOnly ? '&limit=200' : ''}`);
+    if (summariesOnly) data.notes = summaryNotes(data.notes);
     const over = data.pinned_chars > data.pinned_warn;
     document.getElementById('pinned-meter').innerHTML = `Pinned notes: ${data.pinned_chars.toLocaleString()} characters${over ? ` <span class="chip warn">over ${data.pinned_warn.toLocaleString()}: every session pays for these, consider unpinning some</span>` : ''}`;
-    document.getElementById('notes').innerHTML = data.notes.length ? data.notes.map(noteCard).join('') : '<div class="card empty">No notes yet.</div>';
+    document.getElementById('notes').innerHTML = data.notes.length ? data.notes.map(noteCard).join('')
+      : `<div class="card empty">${summariesOnly ? 'No job summaries found.' : 'No notes yet.'}</div>`;
     document.querySelectorAll('.note').forEach((card) => {
       const id = card.dataset.id;
       const report = (e) => { const err = document.getElementById('note-error'); err.textContent = e.message; err.hidden = false; window.scrollTo(0, 0); };
@@ -2779,6 +3157,16 @@ async function renderMemory() {
   let t = null;
   document.getElementById('note-q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 250); });
   document.getElementById('note-filter').addEventListener('change', load);
+  document.getElementById('note-summaries').addEventListener('change', load);
+  // The two switches save as soon as they are ticked; the boxes on New task read them from the state.
+  document.getElementById('summary-switches').addEventListener('change', async (ev) => {
+    const key = { 'set-summarize': 'summarize_jobs', 'set-handoff': 'handoff_summaries' }[ev.target.id];
+    if (!key) return;
+    const err = document.getElementById('set-error'); err.hidden = true;
+    try {
+      state.memory_settings = await api('/api/notes/settings', { method: 'POST', body: { [key]: ev.target.checked } });
+    } catch (e) { ev.target.checked = !ev.target.checked; err.textContent = e.message; err.hidden = false; }
+  });
   document.getElementById('note-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const err = document.getElementById('note-error'); err.hidden = true;
@@ -2808,7 +3196,7 @@ function textToKv(text, sep) {
 }
 
 function mcpForm(srv, publicUrl) {
-  const s = srv || { transport: 'http', route: 'hub', auth: 'headers', targets: ['claude', 'gemini', 'antigravity'], platforms: ['linux', 'macos', 'windows'], enabled: true, headers: {}, env: {}, args: [] };
+  const s = srv || { transport: 'http', route: 'hub', auth: 'headers', targets: ['claude', 'gemini', 'antigravity'], platforms: ['linux', 'macos', 'windows'], enabled: true, on_demand: false, headers: {}, env: {}, args: [] };
   const chk = (list, v) => (list || []).includes(v) ? 'checked' : '';
   return `<form class="card" id="mcp-form">
     <h3>${srv ? `Edit ${esc(s.name)}` : 'Add an MCP server'}</h3>
@@ -2867,6 +3255,9 @@ function mcpForm(srv, publicUrl) {
       <label class="check"><input type="checkbox" class="m-platform" value="macos" ${chk(s.platforms, 'macos')}> macOS</label>
       <label class="check"><input type="checkbox" class="m-platform" value="windows" ${chk(s.platforms, 'windows')}> Windows</label>
     </div>
+    <label class="check"><input type="checkbox" id="m-on-demand"${s.on_demand ? ' checked' : ''}> Only for tasks that pick it</label>
+    <p class="muted small">Agents don't get it in their usual setup. To give it to one task, tick it under MCP servers on New task
+      (Claude Code agents only). Its tools are then allowed even in Read only.</p>
     <label>Note <span class="muted">for you</span></label><input type="text" id="m-note" value="${esc(s.note || '')}">
     <p class="error" id="m-error" hidden></p>
     <div class="row" style="margin-top:10px"><button type="submit">${srv ? 'Save' : 'Add'}</button>
@@ -2901,7 +3292,7 @@ function mcpRow(s) {
     `<button class="ghost small" data-edit="${s.id}">Edit</button>`,
     `<button class="danger small" data-del="${s.id}">Delete</button>`,
   ].join('');
-  return `<tr data-row="${s.id}"><td><strong>${esc(s.name)}</strong>${s.enabled ? '' : ' <span class="chip warn">off</span>'}<div class="muted small">${esc(s.note || '')}</div></td>
+  return `<tr data-row="${s.id}"><td><strong>${esc(s.name)}</strong>${s.enabled ? '' : ' <span class="chip warn">off</span>'}${s.on_demand ? ' <span class="chip" title="Only for tasks that pick it">on demand</span>' : ''}<div class="muted small">${esc(s.note || '')}</div></td>
     <td class="small">${s.transport === 'http' ? `<code>${esc(s.url)}</code>${Object.keys(s.headers).length ? `<div class="muted">headers: ${Object.keys(s.headers).map(esc).join(', ')}</div>` : ''}` : `<code>${esc([s.command, ...s.args].join(' '))}</code>`}
       <div data-status="${s.id}" style="margin-top:4px">${mcpStatus(s)}</div><div class="small" data-result="${s.id}" hidden></div></td>
     <td class="small">${s.targets.map(esc).join(', ')}<div class="muted">${s.platforms.map(esc).join(', ')}</div></td>
@@ -3098,6 +3489,7 @@ async function renderMcp(editId) {
     const err = document.getElementById('m-error'); err.hidden = true;
     const body = {
       name: document.getElementById('m-name').value.trim(), transport: tSel.value, enabled: document.getElementById('m-enabled').checked,
+      on_demand: document.getElementById('m-on-demand').checked,
       url: document.getElementById('m-url').value.trim(), headers: textToKv(document.getElementById('m-headers').value, ':'),
       route: tSel.value === 'http' ? radio('m-route') : 'direct', auth: tSel.value === 'http' ? radio('m-auth') : 'headers',
       oauth_client_id: document.getElementById('m-client-id').value.trim(), oauth_client_secret: document.getElementById('m-client-secret').value,
@@ -3208,7 +3600,7 @@ function agentUseHtml(data) {
       <td class="num">${label('Jobs')}${Number(r.jobs) || 0}</td>
       <td class="num" title="${esc(tokensInTitle(r))}">${label('In')}${count(tokensIn(r))}</td>
       <td class="num">${label('Out')}${count(r.output_tokens)}</td>
-      <td class="num"${r.cost_usd !== null && r.cost_usd !== undefined ? ` title="${esc(COST_TITLE)}">${estimate(r.cost_usd)}` : '><span class="muted">—</span>'}</td></tr>`).join('')}
+      <td class="num"${r.cost_usd !== null && r.cost_usd !== undefined ? ` title="${esc(COST_TITLE)}">${estimate(r.cost_usd)}` : '><span class="muted">-</span>'}</td></tr>`).join('')}
     </tbody></table>
     <p class="muted small">API-equivalent is Claude Code's own estimate at list prices; Gemini CLI reports tokens only.</p></div>`;
 }

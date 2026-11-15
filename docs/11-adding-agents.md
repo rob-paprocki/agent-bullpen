@@ -92,7 +92,8 @@ support adds. The [roadmap](../ROADMAP.md) lists the agents planned next.
 | `parser` | how the output is read: `text` (the default for this preset), or `claude-stream` / `gemini-stream` for programs whose JSON lines look exactly like Claude Code's or Gemini CLI's |
 | `terminal` | the command that continues a session in your own terminal, with `{session_id}`, for **Continue in a terminal** on the job's page. `""` shows none. The built-in presets work it out for you. |
 | `job_mcp` | how the agent is handed the hub's [job tools](02-architecture.md#job-tools-what-a-running-agent-can-ask-the-hub), for jobs that get them. `mcp-config`: a file of MCP settings for that job, passed with `mcp_config_args`; it gives the job tools a timeout a minute longer than an approval may wait, and has them loaded at start. `gemini-settings` (the `gemini` preset): a copy of the machine's Gemini CLI `system-defaults.json` for that job only, with the job tools added, passed in the environment variable `GEMINI_CLI_SYSTEM_DEFAULTS_PATH`; the command line stays the same, and your own, the project's and an administrator's Gemini settings still win over it. Gemini CLI 0.60 and later read that file only when root owns it and every folder above it (on Windows, an administrator or SYSTEM), so this works only for a runner that runs as root; elsewhere the runner doesn't report `job_mcp` for the agent, and Gemini agents can take subtasks but not hand them out ([guide 9](09-troubleshooting.md#gemini-cli)). Leave it out and the agent never gets them. |
-| `mcp_config_args` | the flags that pass that file, with `{job_mcp_config}` where its path goes, for example `["--mcp-config", "{job_mcp_config}"]` |
+| `mcp_config_args` | the flags that pass that file, with `{job_mcp_config}` where its path goes, for example `["--mcp-config", "{job_mcp_config}"]`. The same file holds the MCP servers a task picked ([guide 10](10-shared-memory-and-mcp.md#servers-for-one-task-only)). |
+| `strict_mcp_args` | the flags that limit the agent to the servers in that file, for a task that uses **Only these servers**: `["--strict-mcp-config"]` for Claude Code. Leave it out and such a task fails on this agent. |
 | `allow_tools_flag` | the flag that allows tools by name, for example `--allowedTools`. For a job that gets the job tools, the runner adds their names right after this flag in the level's flags, or adds the flag and the names after the level's flags when the flag isn't there. |
 | `live` | the flags that keep the program's input open for more messages, one JSON line each in Claude Code's stream-json format, for "Keep the session open for messages": `["--input-format", "stream-json"]` for Claude Code. Only for `claude-stream` programs that take the prompt on `stdin`. Leave it out and the agent answers once per job. |
 | `remote_control` | the arguments (after `command`) that start the program's Remote Control server in a project, with `{rc_name}` and `{rc_spawn}`: `["remote-control", "--name", "{rc_name}", "--spawn", "{rc_spawn}"]` for Claude Code. Used only for agents with a full claude.ai login, on machines with `allow_remote_control` ([guide 5](05-linux-and-macos-machines.md#remote-control)). |
@@ -116,21 +117,23 @@ some programs read the folder from there.
 
 1. `command`, then `args`;
 2. `live` (only for a task with "Keep the session open for messages");
-3. the level's `autonomy` flags (with the job tools' names after `allow_tools_flag`, for a job that gets them);
-4. `mcp_config_args` (only for a job that gets the job tools);
+3. the level's `autonomy` flags, with the names of the job tools and of the picked servers' tools after
+   `allow_tools_flag`, for a job that gets them;
+4. `mcp_config_args` (only for a job that gets the job tools or picked MCP servers), then `strict_mcp_args`
+   (only for a task that uses **Only these servers**);
 5. `model` (when a model is chosen);
 6. `resume` (on a follow-up) or `new_session` (otherwise);
 7. `extra_args`;
 8. the prompt, when `prompt_via` is `arg` and no argument holds `{prompt}`.
 
 So flags in `extra_args` come after the `resume` ones; for programs where that matters, such as
-`mycli resume <id> --flag`, put the flag in `args` instead. A job without job tools has the same command line
-as in earlier versions.
+`mycli resume <id> --flag`, put the flag in `args` instead. A job without job tools or picked servers has the
+same command line as in earlier versions.
 
 **Your own levels and permission flags.** If you give an agent its own `autonomy` or `autonomy_env`, the
 runner no longer tells the hub that its level names mean what they say (the `levels` feature below). The
 same goes for a flag that changes permissions anywhere else in the command line: in `args`, `extra_args`,
-`live`, `model`, `resume`, `new_session` or `mcp_config_args`, or a different `allow_tools_flag`
+`live`, `model`, `resume`, `new_session`, `mcp_config_args` or `strict_mcp_args`, or a different `allow_tools_flag`
 (`--allowed-tools` is the same flag as the preset's `--allowedTools`, so it doesn't count). A later
 `--permission-mode` wins over the level's, so `"extra_args": ["--permission-mode", "auto"]` would run a
 read-only job in auto mode. For Claude Code these flags are `--permission-mode`,
@@ -204,6 +207,7 @@ Full support for a new agent is code in the runner and the hub. Today it touches
    |---|---|---|
    | `job_mcp` | the agent can be handed the hub's job tools, so it can hand out subtasks in tasks where you allow it | a `job_mcp` way to pass them: `mcp-config` with `mcp_config_args`, or `gemini-settings` for Gemini CLI on a runner that runs as root |
    | `approvals` | it can ask the owner on the dashboard before commands (the **Edit files, ask me before commands** level) | `job_mcp`, an `ask` level whose flags make the program ask through the `approve` job tool, and no flag that changes permissions elsewhere in its command line |
+   | `mcp_pick` | a task can add MCP servers for it, or limit it to some (the **MCP servers** box) | Claude Code's JSON lines (`claude-stream` parser) and `mcp_config_args`; for **Only these servers**, `strict_mcp_args` too |
    | `live` | it can keep a session open for messages typed on the job's page | Claude Code's JSON lines (`claude-stream` parser), the prompt on `stdin`, and `live` flags |
    | `levels` | its `readonly`, `edits` and `full` flags are the runner's own, so the names mean what they say. Only such agents take subtasks | a built-in preset whose levels weren't replaced in `runner.json`, with no flag that changes permissions elsewhere in its command line |
    | `limits` | its jobs report the account's plan limits, which the Usage page shows | Claude Code's JSON lines (`claude-stream` parser) and a claude.ai sign-in: a login or a `claude setup-token` token, not an API key |

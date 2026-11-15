@@ -28,6 +28,7 @@ import argparse
 import atexit
 import base64
 import datetime
+import getpass
 import hashlib
 import json
 import logging
@@ -93,6 +94,10 @@ log = logging.getLogger("runner")
 #                  "{job_mcp_config}" becomes its path), or "gemini-settings" (a per-job copy of the
 #                  machine's Gemini CLI system-defaults file with the job tools added, passed in
 #                  GEMINI_CLI_SYSTEM_DEFAULTS_PATH). Absent: the agent gets no job tools.
+#                  The MCP servers a task picked go in the same mcp-config file (see prepare_job_mcp).
+#   strict_mcp_args   arguments that limit the agent to the servers in that file, for a task narrowed to
+#                  the MCP servers it lists ("--strict-mcp-config" for Claude Code). Absent: such a task
+#                  fails on this agent.
 #   allow_tools_flag  the flag that pre-approves tools by name ("--allowedTools" for Claude Code); the
 #                  job tools' names are added after it in the level's flags, or with it when it's absent
 #   terminal       the command that continues a session in a terminal, with "{session_id}"
@@ -134,6 +139,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "unset_env": ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"],
         "job_mcp": "mcp-config",
         "mcp_config_args": ["--mcp-config", "{job_mcp_config}"],
+        "strict_mcp_args": ["--strict-mcp-config"],
         "allow_tools_flag": "--allowedTools",
         # /usage in print mode answers locally (no model call); --max-turns 1 bounds the cost if an
         # older Claude Code sends it to the model as an ordinary prompt.
@@ -177,6 +183,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "parser": "claude-stream",
         "job_mcp": "mcp-config",
         "mcp_config_args": ["--mcp-config", "{job_mcp_config}"],
+        "strict_mcp_args": ["--strict-mcp-config"],
         "allow_tools_flag": "--allowedTools",
         "terminal": "selftest --resume {session_id}",  # a pretend command, for the tests
         # The fake needs its script first (the CLI flags are Claude's).
@@ -271,7 +278,8 @@ PERMISSION_FLAGS = {
                "--include-directories"),
 }
 PERMISSION_SHORT_FLAGS = {"gemini": "y"}
-PERMISSION_FLAG_LISTS = ("args", "live", "model", "resume", "new_session", "extra_args", "mcp_config_args")
+PERMISSION_FLAG_LISTS = ("args", "live", "model", "resume", "new_session", "extra_args", "mcp_config_args",
+                         "strict_mcp_args")
 
 
 def flag_spelling(flag: str) -> str:
@@ -316,6 +324,17 @@ def build_env(spec: dict) -> dict[str, str]:
     return env
 
 
+def fill_args(args: list, values: dict[str, str]) -> list[str]:
+    """An argument list with its templates filled in: `values` maps "{model}", "{session_id}", ... to text."""
+    out = []
+    for a in args:
+        a = str(a)
+        for key, value in values.items():
+            a = a.replace(key, value)
+        out.append(a)
+    return out
+
+
 def resolve_command(spec: dict) -> str | None:
     command = spec.get("command") or ""
     if not command:
@@ -337,6 +356,11 @@ SECRET_VALUE_RES = [
     re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"),                         # Google API keys
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),  # GitHub tokens
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),                   # Slack tokens
+    # GitLab tokens. Prefixes from GitLab's "Token prefixes" table
+    # (https://docs.gitlab.com/security/tokens/, last checked 2026-11-08): glpat personal/project/group access,
+    # gldt deploy, glrt/glrtr runner (glrtr: made from a registration token), glptt trigger, glft feed, glimt incoming email, glagent Kubernetes agent,
+    # gloas OAuth application secret, glcbt CI job, glsoat SCIM, glffct feature flags client, glwt workspace.
+    re.compile(r"\bgl(?:pat|dt|rtr?|ptt|ft|imt|agent|oas|cbt|soat|ffct|wt)-[A-Za-z0-9_-]{20,}"),
     # Agent Bullpen machine and job tokens: "bp_" or "bpj_" and secrets.token_urlsafe(32), which is always
     # 43 URL-safe characters. Only that exact shape, so names like bp_admin_routes are left alone.
     re.compile(r"\bbpj?_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
@@ -353,6 +377,9 @@ URL_USERINFO_RE = re.compile(r"(?i)(?<![a-z0-9+.-])(?=[a-z0-9+.-]*://[^/@\s]+@)(
 NAMED_SECRET_RE = re.compile(r"(?i)(?<![\w-])(?=[\w-]+\s*[:=]\s*[^\s&,;\"']{6})([\w-]*?(?:token|key|secret|passw|credential)[\w-]*)(\s*[:=]\s*)([^\s&,;\"']{6,})")
 
 
+KNOWN_SECRET_MIN = 6  # known_secrets leaves out shorter values: masking them would hide ordinary words
+
+
 def known_secrets(cfg: dict, spec: dict | None = None, extra: list[str] | tuple = ()) -> list[str]:
     """Secret values this runner knows: its hub token, any key-looking env values, and `extra`
     (a job's token)."""
@@ -360,7 +387,7 @@ def known_secrets(cfg: dict, spec: dict | None = None, extra: list[str] | tuple 
     for key, value in ((spec or {}).get("env") or {}).items():
         if SECRET_NAME_RE.search(key):
             found.append(str(value))
-    return [s for s in found if len(s) >= 6]
+    return [s for s in found if len(s) >= KNOWN_SECRET_MIN]
 
 
 JOB_TOKEN_RE = re.compile(r"\bbpj_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")  # the shape the hub makes
@@ -371,6 +398,26 @@ def mask_job_token(text: str, token: str) -> str:
     if token:
         text = text.replace(token, "***")
     return JOB_TOKEN_RE.sub("***", text)
+
+
+NO_URL_CREDENTIALS = "Put credentials in a git account on the machine, not in the URL."
+# A clone URL's scheme and authority. Every slash after "scheme:" is skipped, because git and curl read
+# "https:///u:pw@host/x" as user u at host: the authority is what follows the slashes.
+URL_AUTHORITY_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):/*([^/?#]*)")
+
+
+def url_has_userinfo(url: str) -> bool:
+    """True when a clone URL carries a user name or password: https://user@host, https://user:pw@host,
+    ssh://user:pw@host. A bare ssh user (ssh://git@host/...) and git@host:path carry no password. The '@' is
+    looked for in everything up to the first '/' after the slashes, so a password holding a raw ? or # counts."""
+    m = URL_AUTHORITY_RE.match(url or "")
+    if not m:
+        return False
+    authority = url[m.start(2):].partition("/")[0]
+    if "@" not in authority:
+        return False
+    userinfo = authority.rsplit("@", 1)[0]
+    return m.group(1).lower() != "ssh" or ":" in userinfo
 
 
 def redact(text: str, secrets_: list[str] | tuple = ()) -> str:
@@ -522,6 +569,29 @@ MAX_OWN_TAGS = MAX_TAGS - 1    # the owner's own words
 PLATFORM_TAGS = ("linux", "macos", "windows")
 # An agent's account label ("account" in runner.json): shown on the dashboard, sent only when set.
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,39}$")
+# Git accounts (runner.json "git_accounts"): named git identities on this machine, picked per task, follow-up,
+# clone or pull, with a default for the machine ("default_git_account") and per project
+# ("project_git_accounts"). A name only picks credentials here: it never changes which machine, agent or AI
+# account runs a job. The hub learns names, hosts and kinds only, never a token, a key path, a commit name or
+# an email. Names and hosts are matched whole (fullmatch), so a trailing newline doesn't pass.
+GIT_ACCOUNT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# A host name and maybe a port: no scheme, path or user@.
+GIT_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?$")
+GIT_KINDS = ("github", "gitlab", "other")
+GIT_ACCOUNT_FIELDS = ("host", "kind", "name", "email", "ssh_key", "token", "user")
+# Control characters (C0, DEL, C1). The key path goes into a job's ssh config file in quotes, and user and token
+# into a credential helper's output, one line each: such a character there could end the line and add another.
+GIT_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Not in user or token either, and no double quote or backslash there: the helper prints them as they are
+# (printf '%s'), but neither belongs in a user name or a token.
+GIT_HELPER_UNSAFE_RE = re.compile(r'["\\\x00-\x1f\x7f-\x9f]')
+# A shorter token is refused: no real one is that short, and the job's log masks every exact copy of it, which
+# for a value that short would hide ordinary words too.
+GIT_TOKEN_MIN = 8
+# An agent whose own env sets any of these keeps its own git setup: a default account is skipped for its jobs
+# (an account picked for the task still applies).
+GIT_ENV_VARS = ("GIT_SSH_COMMAND", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL", "GIT_CONFIG_COUNT", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITLAB_TOKEN")
 # Presets whose readonly/edits/full flags the runner knows mean what the names say.
 LEVEL_PRESETS = {"claude", "gemini", "selftest"}
 # How an agent can be handed the hub's job tools ("job_mcp"): a --mcp-config file (Claude Code), or
@@ -585,15 +655,30 @@ def usage_check_settings(spec: dict) -> dict | None:
             "prompt": prompt if isinstance(prompt, str) and prompt else "/usage"}
 
 
+def can_summarize(spec: dict) -> bool:
+    """Can the runner write a summary of this agent's jobs (see Job._summarize): its resume arguments continue a
+    session by its id ("{session_id}": one without it, such as --continue, could continue another job's session in
+    the same folder), it has a readonly level with no permission flags outside it (they would win over it, so the turn
+    might not only read: see permission_flags), and the runner learns the session's id (the Claude and Gemini stream
+    parsers read it from the CLI; with new_session the runner makes it)."""
+    resume = spec.get("resume")
+    if not isinstance(resume, list) or not any("{session_id}" in str(a) for a in resume):
+        return False
+    if not isinstance((spec.get("autonomy") or {}).get("readonly"), list) or spec.get("permission_flags"):
+        return False
+    return spec.get("parser") in ("claude-stream", "gemini-stream") or bool(spec.get("new_session"))
+
+
 def agent_features(spec: dict, env: dict) -> list[str]:
     """What this agent can do that older runners couldn't, for the hub to check before it sends
     a job that needs it. job_mcp: it can be handed the job tools at /mcp/job. approvals: it has an
-    'ask' level and takes the job tools, so it can ask the owner before commands. live: it can
+    'ask' level and takes the job tools, so it can ask the owner before commands. mcp_pick: it can be
+    handed the MCP servers a task picked (Claude Code's way, see prepare_job_mcp). live: it can
     keep a session open for more messages. levels: its readonly/edits/full flags are the runner's
-    own, so the names mean what they say. limits: its jobs report the account's plan limits (a
-    claude.ai login or a setup-token token). usage_check: "Check limits" can ask it for them, and
-    remote_control: it can run Remote Control (a full login only: a setup-token token can do
-    neither)."""
+    own, so the names mean what they say. summary: it can continue a job's session for a summary
+    (can_summarize). limits: its jobs report the account's plan limits (a claude.ai login or a
+    setup-token token). usage_check: "Check limits" can ask it for them, and remote_control: it
+    can run Remote Control (a full login only: a setup-token token can do neither)."""
     features = []
     claude_like = spec.get("parser") == "claude-stream"
     auth = claude_auth(env) if claude_like else ""
@@ -607,11 +692,15 @@ def agent_features(spec: dict, env: dict) -> list[str]:
     if mcp_config and isinstance((spec.get("autonomy") or {}).get("ask"), list) \
             and not spec.get("permission_flags"):
         features.append("approvals")
+    if takes_mcp_picks(spec):
+        features.append("mcp_pick")
     if spec.get("live") and claude_like and (spec.get("prompt_via") or "stdin") == "stdin":
         features.append("live")
     if spec.get("preset") in LEVEL_PRESETS and not spec.get("autonomy_overridden") \
             and not spec.get("permission_flags"):
         features.append("levels")
+    if can_summarize(spec):
+        features.append("summary")
     if claude_like and auth in ("login", "token"):
         features.append("limits")
     if claude_like and auth == "login" and usage_check_settings(spec):
@@ -686,6 +775,192 @@ def heartbeat_tags(cfg: dict) -> list[str]:
     its platform tag, at most MAX_TAGS in all."""
     own = [t for t in clean_tags(cfg.get("tags", []))[0] if t not in PLATFORM_TAGS]
     return sorted(set(own[:MAX_OWN_TAGS] + [PLATFORM]))
+
+
+def _shown(value: Any, limit: int = 40) -> str:
+    """A runner.json key or name for a message: short, printable, with anything token-shaped masked."""
+    if not isinstance(value, str):
+        return "(not a name)"
+    text = redact(value)
+    if not text.isprintable():
+        text = text.encode("unicode_escape").decode("ascii")
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def git_kind_of(host: str) -> str:
+    """The kind of a git account whose entry gives none, from its host name (a port in the host is for ssh):
+    github for github.com, gitlab for gitlab.com, other for any other host, a self-hosted one included."""
+    return {"github.com": "github", "gitlab.com": "gitlab"}.get(host.partition(":")[0].lower(), "other")
+
+
+def check_git_account(name: str, entry: Any) -> tuple[dict | None, str]:
+    """One runner.json git account as (account, ""), normalised to {"host" (lowercase), "kind", and any of
+    "name", "email", "ssh_key" (expanded), "token", "user" that are set}; (None, why) when it can't be used.
+    The reason never holds a value from the entry: no host, path or token."""
+    if not isinstance(name, str) or not GIT_ACCOUNT_RE.fullmatch(name):
+        return None, "bad name: use 1 to 32 lowercase letters, digits or dashes, starting with a letter or digit"
+    if not isinstance(entry, dict):
+        return None, "not an account: give it a host, and an ssh_key, a token, or a commit name and email"
+    unknown = [key for key in entry if key not in GIT_ACCOUNT_FIELDS]
+    if unknown:
+        return None, f"unknown field '{_shown(unknown[0])}' (the fields are {', '.join(GIT_ACCOUNT_FIELDS)})"
+    host = entry.get("host")
+    if not isinstance(host, str) or not GIT_HOST_RE.fullmatch(host.strip()):
+        return None, "bad host: give a host name such as github.com, without https://, a path or user@"
+    host = host.strip().lower()
+    kind = entry.get("kind")
+    if kind is None:
+        kind = git_kind_of(host)
+    elif kind not in GIT_KINDS:
+        return None, f"unknown kind: use {', '.join(GIT_KINDS[:-1])} or {GIT_KINDS[-1]}"
+    account = {"host": host, "kind": kind}
+    for field in ("name", "email", "ssh_key", "token", "user"):
+        value = entry.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return None, f"{field} must be text"
+        value = value.strip()
+        if not value:
+            continue
+        if field == "ssh_key":
+            value = expand_path(value)
+            if '"' in value or GIT_CONTROL_RE.search(value):
+                return None, "ssh_key can't hold a double quote, a line break or another control character"
+        elif field in ("user", "token") and GIT_HELPER_UNSAFE_RE.search(value):
+            return None, f"{field} can't hold a double quote, a backslash, a line break or another control character"
+        if field == "token" and len(value) < GIT_TOKEN_MIN:
+            return None, f"token is too short: a git token has at least {GIT_TOKEN_MIN} characters"
+        account[field] = value
+    if not any(field in account for field in ("ssh_key", "token", "name", "email")):
+        return None, "nothing to use: give it an ssh_key, a token, or a commit name and email"
+    return account, ""
+
+
+def git_accounts(cfg: dict) -> tuple[dict[str, dict], list[str]]:
+    """runner.json "git_accounts" as (the valid accounts by name, problems as "<name>: <reason>"). An
+    account with a problem is left out: a job can't pick it, and no default can name it. A key file that isn't
+    there is only reported: the account stays, and a job that uses it is refused when it starts
+    (git_account_env checks the file again then)."""
+    raw = cfg.get("git_accounts")
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, ["git_accounts: must be an object with one entry per account name"]
+    accounts: dict[str, dict] = {}
+    problems: list[str] = []
+    for name, entry in raw.items():
+        account, why = check_git_account(name, entry)
+        if account is None:
+            problems.append(f"{_shown(name)}: {why}")
+            continue
+        accounts[name] = account
+        if "ssh_key" in account and not os.path.isfile(account["ssh_key"]):
+            problems.append(f"{_shown(name)}: its ssh key file is missing")
+    return accounts, problems
+
+
+def _git_default_problem(value: Any, accounts: dict) -> str:
+    """Why a default (default_git_account, or a value in project_git_accounts) can't be applied; "" if it can."""
+    if isinstance(value, str) and value in accounts:
+        return ""
+    if isinstance(value, str) and GIT_ACCOUNT_RE.fullmatch(value):
+        return f"names '{value}', which is not a valid git account"
+    return "is not the name of a git account"
+
+
+def git_default_problems(cfg: dict, accounts: dict) -> list[str]:
+    """The defaults in runner.json that name no valid git account (each refuses the jobs it would apply to).
+    A project_git_accounts entry for a project this machine doesn't have yet is no problem: it applies when that
+    project is cloned ('runner.py list' says so)."""
+    problems = []
+    machine = cfg.get("default_git_account")
+    if machine not in (None, ""):
+        why = _git_default_problem(machine, accounts)
+        if why:
+            problems.append(f"default_git_account: {why}")
+    projects = cfg.get("project_git_accounts")
+    if projects is not None and not isinstance(projects, dict):
+        problems.append("project_git_accounts: must be an object of project names and git account names")
+    elif projects:
+        for project, value in projects.items():
+            why = _git_default_problem(value, accounts)
+            if why:
+                problems.append(f"project_git_accounts ({_shown(project)}): {why}")
+    return problems
+
+
+def choose_git_account(cfg: dict, spec: dict | None, project: str, choice: str | None,
+                       subtask: bool = False) -> tuple[str | None, str, str]:
+    """The git account a job, clone or pull uses, as (name or None, error, note):
+    - a subtask: none, always, default included (it uses the machine user's own git setup);
+    - choice "-": none; a name: that account, which must be valid here;
+    - choice None: the project's default (project_git_accounts), else the machine's (default_git_account),
+      else none. A default is skipped, with a note for the job log, when the agent's own env (spec) sets any
+      of GIT_ENV_VARS: that agent keeps its own git setup, so a default it never uses can't refuse its jobs.
+      Otherwise a default that names no valid account is an error: the job doesn't start. spec is None for a
+      clone or pull."""
+    if subtask or choice == "-":
+        return None, "", ""
+    accounts = git_accounts(cfg)[0]
+    machine = cfg.get("name") or socket.gethostname()
+    if choice is not None:
+        if isinstance(choice, str) and choice in accounts:
+            return choice, "", ""
+        return None, f"there is no valid git account '{_shown(str(choice))}' on {machine}", ""
+    projects = cfg.get("project_git_accounts")
+    unknown = projects is not None and not isinstance(projects, dict)
+    if unknown:
+        where, default = "project_git_accounts", None
+    elif projects and project in projects:
+        where, default = f"project_git_accounts for '{_shown(project)}'", projects[project]
+    else:
+        where, default = "default_git_account", cfg.get("default_git_account")
+        if default in (None, ""):
+            return None, "", ""
+    own = [var for var in GIT_ENV_VARS if var in ((spec or {}).get("env") or {})]
+    if own:
+        named = f" '{_shown(default)}'" if isinstance(default, str) and default else ""
+        return None, "", (f"The default git account{named} ({where}) was skipped: this agent's own env sets "
+                          f"{', '.join(own)}, so it keeps its own git setup.")
+    if unknown:
+        return None, (f"project_git_accounts in runner.json on {machine} isn't an object of project and git "
+                      "account names, so the default git account isn't known. Fix runner.json, or pick a git "
+                      "account or None for the job."), ""
+    why = _git_default_problem(default, accounts)
+    if why:
+        return None, (f"the default git account ({where}) on {machine} {why}. Fix runner.json, or pick a git "
+                      "account or None for the job."), ""
+    return default, "", ""
+
+
+def git_account_info(cfg: dict) -> dict:
+    """What the heartbeat says about git accounts: names, hosts and kinds; the defaults as set (names only);
+    and the problems, broken defaults included, and a git too old for any account (the version git_version
+    keeps, from the runner's PATH). The keys are always there, so the hub can tell an older runner from one
+    without accounts."""
+    accounts, problems = git_accounts(cfg)
+    machine = cfg.get("default_git_account")
+    projects = cfg.get("project_git_accounts")
+
+    def named(value: Any) -> bool:
+        return isinstance(value, str) and GIT_ACCOUNT_RE.fullmatch(value) is not None
+
+    version = git_version() if accounts else None
+    old = ["git on this machine is older than 2.31, so git accounts can't be used"] \
+        if version is not None and version < GIT_MIN_VERSION else []
+    return {
+        "git_accounts": [{"name": n, "host": a["host"], "kind": a["kind"]} for n, a in sorted(accounts.items())],
+        "default_git_account": machine if named(machine) else None,
+        "project_git_accounts": {p: v for p, v in projects.items() if named(v)} if isinstance(projects, dict) else {},
+        "git_account_problems": problems + git_default_problems(cfg, accounts) + old,
+    }
+
+
+def git_credentials(account: dict) -> str:
+    """Which credentials a git account has, in words ("ssh key", "token"), never their values."""
+    return ", ".join(word for field, word in (("ssh_key", "ssh key"), ("token", "token"))
+                     if account.get(field)) or "no ssh key or token"
 
 
 def agent_status(cfg: dict, name: str) -> dict:
@@ -1120,6 +1395,22 @@ def _gemini_counts(d: dict) -> dict:
             "cache_read_tokens": cached, "cache_write_tokens": 0}
 
 
+# From this Claude Code version on, modelUsage includes the totals of the session a run resumes (hub/limits.py has
+# the same value and rule, and tests/test_runner_units.py checks that the two match).
+CUMULATIVE_FROM = (2, 1, 277)
+
+
+def cumulative_cli(version: str | None) -> bool:
+    """Does this Claude Code version count resumed totals in modelUsage? Unknown counts as yes, as on the hub."""
+    if not isinstance(version, str) or not version:
+        return True
+    try:
+        parsed = tuple(int(x) for x in version.split(".")[:3])
+    except ValueError:
+        parsed = (0,)
+    return parsed == (0,) or parsed >= CUMULATIVE_FROM
+
+
 class UsageTracker:
     """Tokens and cost a job used, from the agent's result events.
 
@@ -1172,6 +1463,31 @@ class UsageTracker:
         record.update(cost_usd=None, models=models)
         self.reported = self.own = record
         self.turns += 1
+
+    def add_run(self, other: "UsageTracker") -> None:
+        """Another run of the same conversation (the summary turn, which resumes the job's session), counted as if
+        its results had come in this run: Claude Code's newest total for the conversation and the shares added up;
+        Gemini CLI reports per run, so its figures are added up. So are Claude Code's when they cover only the run
+        they came from (a version before CUMULATIVE_FROM, or one without modelUsage: scope "run", which stays)."""
+        if not other.turns:
+            return
+        self.turns += other.turns
+        if self.source == "gemini":
+            if other.own is not None:
+                self.reported = self.own = add_usage(self.own, other.own)
+            return
+        scopes = [r.get("scope") for r in (self.reported, other.reported) if r is not None]
+        if other.reported is not None and self.reported is not None \
+                and ("run" in scopes or not cumulative_cli(other.cli_version or self.cli_version)):
+            self.reported = add_usage(self.reported, other.reported)
+            if "run" in scopes:
+                self.reported["scope"] = "run"
+        elif other.reported is not None:
+            self.reported = other.reported
+        if other.own is not None:
+            self.own = add_usage(self.own, other.own)
+        self.every_result_had_since = self.every_result_had_since and other.every_result_had_since
+        self.cli_version = other.cli_version or self.cli_version
 
     def total(self) -> dict | None:
         if not self.turns or self.reported is None:
@@ -1914,12 +2230,16 @@ class Wiring:
                    **cf_access_headers(self.cfg)}
         return url, headers
 
-    def servers_for(self, target: str, who: str = "") -> list[dict]:
+    def servers_for(self, target: str, who: str = "", with_on_demand: bool = False) -> list[dict]:
         """The central servers for one kind of agent on this platform. Servers routed through the
-        hub become plain HTTP servers at the hub's /mcp/s/<name>, with the hub's token."""
+        hub become plain HTTP servers at the hub's /mcp/s/<name>, with the hub's token. On-demand
+        servers are only for the jobs that pick them, so they're left out unless `with_on_demand`
+        (an older hub sends no on_demand key: none are)."""
         out = []
         for s in self.ctx.get("servers") or []:
             if target not in s.get("targets", []) or self.platform not in s.get("platforms", []):
+                continue
+            if s.get("on_demand") and not with_on_demand:
                 continue
             if s.get("route") == "hub":
                 if not self.ctx.get("mcp_enabled"):
@@ -1928,6 +2248,28 @@ class Wiring:
                 s = {**s, "transport": "http", "url": url.rstrip("/") + "/s/" + s["name"], "headers": headers}
             out.append(s)
         return out
+
+    def claude_entries(self, names: list[str], who: str) -> dict[str, dict]:
+        """The mcpServers entries Claude Code gets for `names`, in the hub's order: `bullpen` (the
+        hub's own server) and the central servers, on-demand ones included. A name it can't give
+        (unknown, not for Claude Code or this platform, or relayed while the hub's MCP support is
+        off) is left out."""
+        wanted = set(names)
+        entries: dict[str, dict] = {}
+        if "bullpen" in wanted and self.ctx.get("mcp_enabled"):
+            url, headers = self.hub_server(who)
+            entries["bullpen"] = {"type": "http", "url": url, "headers": headers}
+        for srv in self.servers_for("claude", who, with_on_demand=True):
+            if srv["name"] not in wanted:
+                continue
+            if srv["transport"] == "http":
+                entries[srv["name"]] = {"type": "http", "url": srv["url"], "headers": srv["headers"]}
+            else:
+                cmd, args = srv["command"], list(srv["args"])
+                if IS_WINDOWS and cmd.lower() in NODE_LAUNCHERS:
+                    cmd, args = "cmd", ["/c", srv["command"], *args]  # Claude Code needs this for npx on Windows
+                entries[srv["name"]] = {"type": "stdio", "command": cmd, "args": args, "env": srv["env"]}
+        return entries
 
     def kit_files(self, prefix: str) -> dict[str, str]:
         return {k[len(prefix):]: v for k, v in (self.ctx.get("kit") or {}).items() if k.startswith(prefix)}
@@ -2015,18 +2357,8 @@ class Wiring:
             except ValueError:
                 self.notes.append(f"{label}: couldn't read {claude_json}; MCP servers not changed")
                 continue
-            desired: dict[str, dict] = {}
-            if self.ctx.get("mcp_enabled"):
-                url, headers = self.hub_server(f"{agent}@{self.machine}")
-                desired["bullpen"] = {"type": "http", "url": url, "headers": headers}
-            for srv in self.servers_for("claude", f"{agent}@{self.machine}"):
-                if srv["transport"] == "http":
-                    desired[srv["name"]] = {"type": "http", "url": srv["url"], "headers": srv["headers"]}
-                else:
-                    cmd, args = srv["command"], list(srv["args"])
-                    if IS_WINDOWS and cmd.lower() in NODE_LAUNCHERS:
-                        cmd, args = "cmd", ["/c", srv["command"], *args]  # Claude Code needs this for npx on Windows
-                    desired[srv["name"]] = {"type": "stdio", "command": cmd, "args": args, "env": srv["env"]}
+            who = f"{agent}@{self.machine}"
+            desired = self.claude_entries(["bullpen"] + [s["name"] for s in self.servers_for("claude", who)], who)
             run_env = dict(env)
             run_env.pop("CLAUDECODE", None)
 
@@ -2203,6 +2535,12 @@ def wire_agents(cfg: dict, context: dict, emit: Callable[..., None], cfg_path: P
     return Wiring(cfg, context, emit).run(cfg_path)
 
 
+def claude_server_entries(cfg: dict, context: dict, names: list[str], who: str) -> dict[str, dict]:
+    """The mcpServers entries Claude Code gets for `names`, from a context the hub sent: the same
+    entries Wiring.claude writes, on-demand servers included (see Wiring.claude_entries)."""
+    return Wiring(cfg, context, lambda *a: None).claude_entries(names, who)
+
+
 # ================================================================== running
 def kill_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
@@ -2255,18 +2593,20 @@ def run_capture(argv: list[str], cwd: str, env: dict, stdin_text: str, timeout: 
     return proc.returncode, out or "", (err or "").splitlines(), (stopped[0] if stopped else "")
 
 
-def git(path: str, *args: str) -> str | None:
+def git(path: str, *args: str, env: dict[str, str] | None = None) -> str | None:
     try:
         res = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=60,
+                             encoding="utf-8", errors="replace", timeout=60, env=env,
                              creationflags=0x08000000 if IS_WINDOWS else 0)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return res.stdout if res.returncode == 0 else None
 
 
-def capture_diff(path: str, start_sha: str | None, limit: int = 200_000) -> str:
-    """Everything that changed in the project since the job started, as one diff."""
+def capture_diff(path: str, start_sha: str | None, limit: int = 200_000,
+                 mask: Callable[[str], str] | None = None) -> str:
+    """Everything that changed in the project since the job started, as one diff; `mask` (a job's secrets out)
+    applies before it is cut to `limit`, so a secret at the cut can't stay half there."""
     if git(path, "rev-parse", "--is-inside-work-tree") is None:
         return "(this project is not a git repository, so no diff is available)"
     base = start_sha or "HEAD"
@@ -2285,9 +2625,400 @@ def capture_diff(path: str, start_sha: str | None, limit: int = 200_000) -> str:
     if len(untracked) > 40:
         parts.append(f"\n... and {len(untracked) - 40} more new files\n")
     diff = "".join(parts).strip()
+    if mask is not None:
+        diff = mask(diff)
     if len(diff) > limit:
         diff = diff[:limit] + f"\n\n[... diff truncated, {len(diff) - limit} more characters ...]"
     return diff or "(no file changes)"
+
+
+# ------------------------------------------------------------- git accounts in a job
+# A job, clone or pull with a git account gets that account alone for its host:
+# - ssh to that host gets the account's key only, or, for an account without a key, no way to sign in at all,
+#   so it fails rather than use the machine user's own key (a per-job ssh config; the machine user's own
+#   ~/.ssh/config and the system's /etc/ssh/ssh_config still apply to every other host). git runs the ssh on
+#   its PATH with it, as git does when nothing names another: an ssh command the machine's git names
+#   (core.sshCommand, GIT_SSH) isn't used, and the log says so (git_ssh_program_note);
+# - the credential helpers set before for that host (https:// and http://) are cleared, then the account's token
+#   helper added for https://; extra HTTP headers set for the host (an Authorization header in a repository's
+#   config, say) are cleared too. GIT_CONFIG_PARAMETERS (git -c settings) is left out of the environment, with
+#   a note in the log: git reads it after these entries, so its credential helpers would come back;
+# - git gets an askpass program that answers nothing (GIT_ASKPASS, with GIT_TERMINAL_PROMPT=0), and
+#   SSH_ASKPASS and SSH_ASKPASS_REQUIRE are left out, so an account without a token fails over https://
+#   instead of asking the machine's own program or a terminal for a password;
+# - refused before anything is written: a netrc file curl would read for the host (git's https:// goes through
+#   curl, which signs in with it before any helper is asked: git_netrc_problem); and, for a job, a remote URL
+#   or a url.<base>.insteadOf target with credentials for the host (check_git_credential_urls);
+# - gh or glab get a config folder of their own and the account's token. Without a token they get a stand-in
+#   that the host refuses, and the log says they are signed out: with no token at all, gh would take the
+#   machine user's own login from the system keychain (macOS, Windows, a Linux desktop), which no config folder
+#   hides.
+# The account's host is a host name and maybe a port, which is the port for ssh: https:// goes to the host name
+# (on port 443). Other hosts are not touched. A program that reads the machine user's keychain on purpose (gh
+# auth token --secure-storage, say) still can: the job runs as that user. The token travels in the environment
+# only (BULLPEN_GIT_TOKEN, which the helper reads), never in a command line or a file, and the job's log is
+# masked with it.
+GIT_MIN_VERSION = (2, 31)  # GIT_CONFIG_COUNT and its entries
+# printf '%s', not echo: some shells' echo (dash, macOS's /bin/sh) reads a backslash in a value as an escape.
+GIT_CREDENTIAL_HELPER = ("!f() { printf '%s\\n' \"username=${BULLPEN_GIT_USER}\" \"password=${BULLPEN_GIT_TOKEN}\"; "
+                         "}; f")
+# Left out of the environment of a job, clone or pull with a git account (see above).
+GIT_ACCOUNT_UNSET = ("GIT_CONFIG_PARAMETERS", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE")
+# The ssh settings that sign in, all off for the host of an account without a key (with IdentitiesOnly yes, no
+# identity file and no ssh agent).
+SSH_SIGN_IN_OPTIONS = ("PubkeyAuthentication", "PasswordAuthentication", "KbdInteractiveAuthentication",
+                       "GSSAPIAuthentication", "HostbasedAuthentication")
+# The system-wide ssh settings, which ssh -F doesn't read: included for every host but the account's.
+SYSTEM_SSH_CONFIG = Path("/etc/ssh/ssh_config")
+# The variables gh and glab take a token from, by the hosts they apply to, first one first
+# (https://cli.github.com/manual/gh_help_environment and https://docs.gitlab.com/cli/configuration/, last
+# checked 2026-11-08). One already in the environment would stand in for an account that has no token.
+GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")                                   # github.com, *.ghe.com
+GH_ENTERPRISE_TOKEN_VARS = ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")  # GitHub Enterprise Server
+GLAB_TOKEN_VARS = ("GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "OAUTH_TOKEN")
+# gh's or glab's token for the host of a github or gitlab account without one: not a secret, not shaped like a
+# token, and refused by the host (HTTP 401), so they fail there instead of signing in as the machine user.
+GH_NO_TOKEN = "no-token-in-this-git-account"
+_GIT_VERSION: dict[str, tuple[int, int]] = {}  # by the git program's full path: what its --version said
+
+
+class GitAccountProblem(Exception):
+    """A git account can't be given to a job, clone or pull; the message says why, without a value from it."""
+
+
+def git_version(search_path: str | None = None) -> tuple[int, int] | None:
+    """(major, minor) of the git found first on `search_path` (a PATH value: the one a job's environment has, as
+    the agent finds git there; None: the runner's own PATH); None when there is none there. Kept per program
+    once it answers."""
+    exe = shutil.which("git", path=search_path)
+    if exe is None:
+        return None
+    exe = os.path.abspath(exe)
+    if exe in _GIT_VERSION:
+        return _GIT_VERSION[exe]
+    try:
+        done = subprocess.run([exe, "--version"], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=30, creationflags=0x08000000 if IS_WINDOWS else 0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.match(r"git version (\d+)\.(\d+)", (done.stdout or "").strip())
+    if done.returncode != 0 or not m:
+        return None
+    _GIT_VERSION[exe] = (int(m.group(1)), int(m.group(2)))
+    return _GIT_VERSION[exe]
+
+
+def _ssh_path(path: Any, what: str, shell: bool = False) -> str:
+    """A full path as an ssh config file (in double quotes) or GIT_SSH_COMMAND (in double quotes, read by a
+    shell) holds it: forward slashes on Windows, where ssh and git's shell read a backslash as an escape.
+    GitAccountProblem when a character in it would end the quotes or the line."""
+    text = os.path.abspath(str(path))
+    if IS_WINDOWS:
+        text = text.replace("\\", "/")
+    if re.search(r'["$`\\]' if shell else r'"', text) or GIT_CONTROL_RE.search(text):
+        raise GitAccountProblem(f"{what} has a character that can't go into an ssh setting")
+    return text
+
+
+def git_netrc_problem(env: dict[str, str], hostname: str, name: str) -> str:
+    """Why git account `name` can't be used for `hostname` (no port) with the netrc file curl would read for a job,
+    clone or pull with environment `env`: $HOME/.netrc (HOME from `env`, else the runner's home), and on Windows
+    also _netrc, with HOME falling back to USERPROFILE. git's https:// goes through curl, which signs in with a
+    'machine <host>' or 'default' entry there before git asks any credential helper, so the machine user's login
+    would be used instead of the account's. A plain scan of the words (keywords and host compared in lower case),
+    not a netrc parser, so a file one would refuse can't let the job through. "" when there is no such entry.
+    Never holds anything from the file."""
+    home = env.get("HOME") or (env.get("USERPROFILE") if IS_WINDOWS else "") or str(HOME)
+    files = [(".netrc", "~/.netrc")] + ([("_netrc", "%USERPROFILE%\\_netrc")] if IS_WINDOWS else [])
+    for file_name, shown in files:
+        path = Path(home) / file_name
+        if not path.is_file():
+            continue
+        try:
+            words = path.read_text(encoding="utf-8", errors="replace").split()
+        except OSError:
+            return (f"the runner can't read {shown}, so it can't check that curl wouldn't sign in to {hostname} "
+                    f"with it instead of git account '{name}'")
+        words = [w.strip('"').lower() for w in words]
+        for i, word in enumerate(words):
+            if word == "machine" and words[i + 1:i + 2] == [hostname.lower()]:
+                return (f"{shown} has a login for {hostname}, which git would use instead of git account '{name}'. "
+                        f"Remove that entry from {shown}, or pick None for the job.")
+            if word == "default":
+                return (f"{shown} has a default login, which git would use for {hostname} instead of git account "
+                        f"'{name}'. Remove that entry from {shown}, or pick None for the job.")
+    return ""
+
+
+def git_account_env(account: dict, folder: Path, base_env: dict[str, str],
+                    name: str = "") -> tuple[dict[str, str], list[str]]:
+    """What a job, clone or pull with a git account (as git_accounts gives it) gets: (the environment
+    additions, the secrets to mask in what it prints). Its files go in `folder`, the job's private folder: an
+    ssh config and an askpass program for every account (see above), and gh's or glab's folder. `base_env` is
+    the environment the additions go into: its GIT_CONFIG_COUNT entries are kept and appended to, its PATH
+    says which git is checked, and its HOME where curl's netrc file is. The caller also removes
+    GIT_ACCOUNT_UNSET from the environment. `name` is the account's name, for
+    messages. GitAccountProblem when the account can't be applied (git older than 2.31, a key file that isn't
+    there, a netrc entry curl would sign in with: git_netrc_problem); nothing is written then."""
+    version = git_version(base_env.get("PATH", os.defpath))
+    if version is None or version < GIT_MIN_VERSION:
+        have = f"{version[0]}.{version[1]}" if version else "no git"
+        raise GitAccountProblem(f"git accounts need git 2.31 or later; this machine has {have}")
+    key = account.get("ssh_key")
+    if key and not os.path.isfile(key):
+        raise GitAccountProblem(f"the ssh key file of git account '{name}' doesn't exist")
+    count = base_env.get("GIT_CONFIG_COUNT") or ""
+    if count and not re.fullmatch(r"[0-9]{1,9}", count):
+        raise GitAccountProblem("GIT_CONFIG_COUNT in this job's environment isn't a whole number, so git would "
+                                "refuse every command")
+    host = account["host"]
+    hostname, _, port = host.partition(":")
+    netrc = git_netrc_problem(base_env, hostname, name)
+    if netrc:
+        raise GitAccountProblem(netrc)
+    ssh_lines = [f"Host {hostname}", f"  HostName {hostname}", *([f"  Port {port}"] if port else [])]
+    if key:
+        # ssh reads %x in an IdentityFile as a token: %% is a percent sign.
+        key_text = _ssh_path(key, f"the ssh key path of git account '{name}'").replace("%", "%%")
+        ssh_lines += [f'  IdentityFile "{key_text}"', "  IdentitiesOnly yes"]
+    else:
+        # No key: no way to sign in to this host over ssh, so an ssh remote fails rather than use the machine
+        # user's own key, ssh agent or password.
+        ssh_lines += ["  IdentitiesOnly yes", "  IdentityFile none", "  IdentityAgent none",
+                      *(f"  {option} no" for option in SSH_SIGN_IN_OPTIONS)]
+    # The machine user's own settings, then the system's, for every other host. Not for this one: an IdentityFile
+    # there (a "Host *" block often has one) would add a key ssh tries when the account's is refused. Named from
+    # ~, as ssh finds it (from its own HOME), and written even when there is no such file, which ssh skips: Git
+    # for Windows' ssh reads a full path such as C:/Users/... as one under ~/.ssh.
+    ssh_lines += [f"Host * !{hostname}", '  Include "~/.ssh/config"']
+    if not IS_WINDOWS and SYSTEM_SSH_CONFIG.is_file():
+        ssh_lines.append(f'  Include "{_ssh_path(SYSTEM_SSH_CONFIG, "the system ssh config")}"')
+    ssh_config = folder / "ssh_config"
+    ssh_command = f'ssh -F "{_ssh_path(ssh_config, "the job folder", shell=True)}"'
+
+    env: dict[str, str] = {}
+    secrets: list[str] = []
+    for field, variables in (("name", ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME")),
+                             ("email", ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"))):
+        if account.get(field):
+            env.update(dict.fromkeys(variables, account[field]))
+    # The empty value clears the helpers set before it for this host (the machine's, a repository's own). The host
+    # name only: the account's port is for ssh, and this entry also matches https://<host>:443.
+    helper = f"credential.https://{hostname}.helper"
+    entries = [(helper, "")]
+    token = account.get("token")
+    if token:
+        user = account.get("user") or "x-access-token"
+        entries.append((helper, GIT_CREDENTIAL_HELPER))
+        env.update(BULLPEN_GIT_USER=user, BULLPEN_GIT_TOKEN=token)
+        # git sends the two as HTTP Basic auth, which its trace shows when told not to hide it.
+        secrets += [token, base64.b64encode(f"{user}:{token}".encode()).decode()]
+    # http:// gets no helper at all, and neither scheme an extra header set before (an Authorization header in a
+    # repository's config, say): for http.<url>.extraHeader, an empty value clears the list.
+    entries += [(f"credential.http://{hostname}.helper", ""), (f"http.https://{hostname}/.extraHeader", ""),
+                (f"http.http://{hostname}/.extraHeader", "")]
+    first = int(count or 0)
+    for i, (key_name, value) in enumerate(entries, first):
+        env[f"GIT_CONFIG_KEY_{i}"] = key_name
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    env["GIT_CONFIG_COUNT"] = str(first + len(entries))
+
+    write_private(ssh_config, "\n".join(ssh_lines) + "\n")
+    env["GIT_SSH_COMMAND"] = ssh_command
+    # An askpass program that answers nothing, before core.askPass and SSH_ASKPASS (and with no terminal to ask):
+    # a password git can't get from the account's helper is an empty one, so the host refuses it.
+    askpass = folder / ("askpass.cmd" if IS_WINDOWS else "askpass")
+    write_private(askpass, "@exit /b 0\r\n" if IS_WINDOWS else "#!/bin/sh\nexit 0\n")
+    if not IS_WINDOWS:
+        os.chmod(askpass, 0o700)
+    env.update(GIT_ASKPASS=str(askpass), GIT_TERMINAL_PROMPT="0")
+    kind = account.get("kind")
+    if kind not in ("github", "gitlab"):
+        return env, secrets
+    tool_dir = folder / ("gh" if kind == "github" else "glab")
+    tool_dir.mkdir(mode=0o700, exist_ok=True)
+    if not IS_WINDOWS:
+        os.chmod(tool_dir, 0o700)
+    # Without a token, the stand-in: gh and glab skip an empty variable, and gh would then read the keychain.
+    if kind == "github":
+        env["GH_CONFIG_DIR"] = str(tool_dir)
+        token_vars = GH_TOKEN_VARS if hostname == "github.com" or hostname.endswith(".ghe.com") \
+            else GH_ENTERPRISE_TOKEN_VARS
+        env[token_vars[0]] = token or GH_NO_TOKEN
+        if hostname != "github.com":
+            env["GH_HOST"] = hostname
+    else:
+        # glab reads the first config.yml it finds, this folder's first: without one it would read the
+        # machine user's own.
+        write_private(tool_dir / "config.yml", "")
+        env["GLAB_CONFIG_DIR"] = str(tool_dir)
+        token_vars = GLAB_TOKEN_VARS
+        env.update(GITLAB_TOKEN=token or GH_NO_TOKEN, GITLAB_HOST=hostname)
+    if not token:
+        env.update({var: "" for var in token_vars[1:] if base_env.get(var)})
+    return env, secrets
+
+
+def git_account_notes(account: dict, name: str, base_env: dict[str, str], tools: bool = True) -> list[str]:
+    """What the log of a job (`tools`), clone or pull with git account `name` says about it, besides its name:
+    a GIT_CONFIG_PARAMETERS in `base_env` that was left out, and (for a job) gh or glab signed out, for a github
+    or gitlab account without a token. Never a value."""
+    notes = []
+    if "GIT_CONFIG_PARAMETERS" in base_env:
+        notes.append("⚠ GIT_CONFIG_PARAMETERS (settings given with git -c) was left out of the environment. Git "
+                     "reads it after the git account's settings, so its credential helpers would come back.")
+    tool = {"github": "gh", "gitlab": "glab"}.get(account.get("kind") or "")
+    if tools and tool and not account.get("token"):
+        notes.append(f"{tool} is signed out for this job: git account '{name}' has no token.")
+    return notes
+
+
+def url_host(url: str) -> str | None:
+    """The host a clone URL points at, lowercase, and its port when the URL gives one other than the scheme's
+    own (443 for https, 22 for ssh): https://host[:port]/..., ssh://[user@]host[:port]/... and user@host:path.
+    None for any other form (a local path, http://, git://), which a clone or pull with a git account refuses."""
+    text = (url or "").strip()
+    m = re.match(r"(?i)(https|ssh)://([^/?#]+)(?:[/?#]|$)", text)
+    if m:
+        host = m.group(2).rsplit("@", 1)[-1].lower()
+        default = ":443" if m.group(1).lower() == "https" else ":22"
+        if host.endswith(default):
+            host = host[:-len(default)]
+    else:
+        m = re.match(r"[^@/:\s]+@([^/:\s]+):", text)
+        if not m:
+            return None
+        host = m.group(1).lower()
+    return host if GIT_HOST_RE.fullmatch(host) else None
+
+
+def git_account_url_problem(url: str, name: str, account: dict) -> str:
+    """Why a clone or pull from `url` (the URL git uses, after its url.<base>.insteadOf settings) can't use git
+    account `name`; "" when it can. Never holds the URL. The account's port is its ssh port: an https:// URL
+    must be on its host name (port 443), an ssh one on its host and port (22 when it gives none)."""
+    if url_has_userinfo(url):
+        return (f"the URL holds credentials, which git would use instead of git account '{name}'. "
+                + NO_URL_CREDENTIALS)
+    there = url_host(url)
+    if there is None:
+        return (f"the runner can't tell which host this URL is on, so it can't use git account '{name}' (for "
+                f"{account['host']}) with it")
+    want = git_account_url_host(url, account)
+    if there != want:
+        return f"this URL is on {there}, but git account '{name}' is for {want}"
+    if "ssh_key" not in account and re.match(r"(?i)https://", url.strip()) is None:
+        return f"git account '{name}' has no ssh key: use the https URL"
+    return ""
+
+
+def git_account_url_host(url: str, account: dict) -> str:
+    """The host (as url_host gives it) a URL must be on to be the host of `account`: its host name for https://
+    (port 443), its host and port for ssh (none for port 22)."""
+    hostname, _, port = account["host"].partition(":")
+    https = re.match(r"(?i)https://", url.strip()) is not None
+    return hostname if https or port in ("", "22") else account["host"]
+
+
+def check_git_credential_urls(cwd: str, env: dict[str, str], name: str, account: dict) -> None:
+    """Before a job with git account `name` starts: GitAccountProblem when a URL git would use in `cwd` with the
+    job's `env` holds credentials for the account's host (url_host, compared as git_account_url_problem does).
+    git uses those before any credential helper, so they would stand in for the account. Looked at: the targets
+    of url.<base>.insteadOf and pushInsteadOf (the machine's settings, and the repository's when `cwd` is in
+    one), and each remote's URLs as git uses them, after those settings, to fetch and to push. A folder outside
+    a repository has no remotes. The message never holds a URL."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=30, stdin=subprocess.DEVNULL,
+                              creationflags=0x08000000 if IS_WINDOWS else 0)
+
+    def credentials_for(url: str) -> str:
+        """The account's host when `url` holds credentials and is on it, else "". http:// counts like https:// (git
+        would send them there just the same), and a URL with credentials but no host at all counts too: as a
+        url.<base>.insteadOf target (https://user:pw@ for https://) it stands in for the start of URLs on every host,
+        the account's included."""
+        text = url.strip()
+        if not url_has_userinfo(text):
+            return ""
+        m = URL_AUTHORITY_RE.match(text)
+        scheme = m.group(1).lower() if m else ""
+        if scheme not in ("http", "https", "ssh"):
+            there = url_host(text)
+            return there if there and there == git_account_url_host(text, account) else ""
+        authority = text[len(m.group(1)) + 1:].lstrip("/").split("/", 1)[0]
+        host = authority.rpartition("@")[2].lower()
+        if not host:
+            return account["host"]
+        hostname, _, port = host.partition(":")
+        if scheme in ("http", "https"):
+            return account["host"] if hostname == account["host"].partition(":")[0].lower() else ""
+        return account["host"] if (hostname if port in ("", "22") else host) == git_account_url_host(text, account) \
+            else ""
+
+    why = f", which git would use instead of git account '{name}'. " + NO_URL_CREDENTIALS
+    try:
+        done = git("config", "-z", "--get-regexp", r"^url\..*\.(push)?insteadof$")
+        if done.returncode not in (0, 1):  # 1: no such setting
+            raise GitAccountProblem(f"git can't read its settings here, so the runner can't check the URLs it would "
+                                    f"use with git account '{name}'")
+        for item in done.stdout.split("\0"):
+            key = item.split("\n", 1)[0]
+            setting = "pushInsteadOf" if key.endswith(".pushinsteadof") else "insteadOf"
+            there = credentials_for(key[len("url."):-len(setting) - 1]) if key.startswith("url.") else ""
+            if there:
+                raise GitAccountProblem(f"a url.<base>.{setting} setting here gives URLs credentials for {there}" + why)
+        remotes = git("remote")
+        for remote in remotes.stdout.split() if remotes.returncode == 0 else []:
+            for push in ((), ("--push",)):
+                urls = git("remote", "get-url", "--all", *push, remote)
+                for url in urls.stdout.splitlines() if urls.returncode == 0 else []:
+                    there = credentials_for(url.strip())
+                    if there:
+                        raise GitAccountProblem(f"remote '{_shown(remote)}' has credentials for {there} in its URL"
+                                                + why)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise GitAccountProblem(f"the runner couldn't ask git which URLs it would use here with git account "
+                                f"'{name}' ({type(err).__name__})") from None
+
+
+def git_clone_url(url: str, folder: Path) -> str | None:
+    """The URL git clone fetches `url` from: after the machine's url.<base>.insteadOf settings, which can send
+    it to another host or over ssh (git ls-remote --get-url, which doesn't contact it). Asked in `folder`, an
+    empty folder, and no higher: git clone reads no repository's own settings, so the one the runner happens to
+    run in mustn't count. Without GIT_ACCOUNT_UNSET, as the clone runs. None when git can't say."""
+    env = {k: v for k, v in os.environ.items() if k not in GIT_ACCOUNT_UNSET}
+    try:
+        done = subprocess.run(["git", "ls-remote", "--get-url", "--", url], cwd=str(folder), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=60,
+                              env=dict(env, GIT_CEILING_DIRECTORIES=str(folder.parent)),
+                              creationflags=0x08000000 if IS_WINDOWS else 0)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (done.stdout.strip() or None) if done.returncode == 0 else None
+
+
+def git_ssh_program_note(cwd: str | Path, env: dict[str, str], alone: bool = False) -> str:
+    """The note for the log of a job, clone or pull with a git account when git in `cwd` with `env` is set to
+    run an ssh command of its own (core.sshCommand, or GIT_SSH: Windows' own OpenSSH for its ssh agent, plink
+    for Pageant). The account's GIT_SSH_COMMAND comes before both, so git runs the ssh on its PATH instead. It
+    doesn't run theirs: its options could add a key of the machine user's own. `alone`: `cwd` is a clone's
+    empty folder, and no repository above it counts. "" when neither is set. Never holds their values."""
+    names = []
+    try:
+        done = subprocess.run(["git", "config", "--get", "core.sshCommand"], cwd=str(cwd), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=30,
+                              env=dict(env, GIT_CEILING_DIRECTORIES=str(Path(cwd).parent)) if alone else env,
+                              creationflags=0x08000000 if IS_WINDOWS else 0)
+        if done.returncode == 0 and done.stdout.strip():
+            names.append("core.sshCommand")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if env.get("GIT_SSH"):
+        names.append("GIT_SSH")
+    if not names:
+        return ""
+    return (f"⚠ git is set here to use an ssh command of its own ({', '.join(names)}). With a git account, git "
+            "uses the ssh on its PATH with the account's settings instead, so an ssh key that only that "
+            "command's ssh agent holds can't be used.")
 
 
 # ------------------------------------------------------------- job tools
@@ -2297,10 +3028,22 @@ def capture_diff(path: str, start_sha: str | None, limit: int = 200_000) -> str:
 # token goes to the agent in a private per-job file (an MCP config file for Claude Code, a settings
 # file for Gemini CLI), never on a command line, and is masked in the job's log.
 JOB_SERVER = "bullpenjob"         # the MCP server name agents see (no underscore: Gemini splits on it)
-JOBS_DIR = BASE_DIR / "jobs"      # one private folder per job that has job tools, removed afterwards
+JOBS_DIR = BASE_DIR / "jobs"      # one private folder per job that needs one (job_folder), removed afterwards
 JOB_DIR_MAX_AGE = 24 * 3600       # leftovers (from a runner that was killed) are removed at start-up
 JOB_TOOL_RE = re.compile(r"^[a-z][a-z_]{0,39}$")
 MCP_PROTOCOL_VERSION = "2025-11-25"
+
+
+def job_folder(job_id: int) -> Path:
+    """A job's private folder, JOBS_DIR/<id> (0700), made when first needed: for its job tools' settings, its
+    git account's ssh config and gh or glab folder. The job removes it when it ends; clean_job_dirs removes
+    what a runner that was stopped left behind."""
+    folder = JOBS_DIR / str(int(job_id))
+    folder.mkdir(parents=True, exist_ok=True)
+    if not IS_WINDOWS:
+        os.chmod(JOBS_DIR, 0o700)
+        os.chmod(folder, 0o700)
+    return folder
 
 
 def job_server_entry(cfg: dict, token: str, who: str, timeout_ms: int) -> dict:
@@ -2368,6 +3111,20 @@ def write_private(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def read_private(path: Path) -> str:
+    """Read a file write_private writes. Windows refuses to open a file for a moment while another
+    thread or program replaces it or has it open (write_private retries the writer's side of this),
+    so a refused read is tried again there, as often as write_private tries."""
+    for _ in range(19):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if not IS_WINDOWS:
+                raise
+            time.sleep(0.05)
+    return path.read_text(encoding="utf-8")  # the 20th try; its error is raised
 
 
 # Gemini CLI reads its settings in layers: its own defaults, then the system-defaults file, the
@@ -2507,12 +3264,8 @@ def prepare_job_tools(cfg: dict, spec: dict, job: dict, machine: str) -> tuple[l
         problem = gemini_job_tools_problem()
         if problem:
             raise JobToolsUnavailable(f"{GEMINI_SKIPS}, and {problem} (guide 9)")
-    folder = JOBS_DIR / str(int(job["id"]))
-    folder.mkdir(parents=True, exist_ok=True)
-    if not IS_WINDOWS:
-        os.chmod(JOBS_DIR, 0o700)
-        os.chmod(folder, 0o700)
-    who = f"{spec.get('name') or job.get('agent') or 'agent'}@{machine} job {job['id']}"
+    folder = job_folder(int(job["id"]))
+    who = job_who(spec, job, machine)
     if mode == "gemini-settings":
         # Copied from the file this agent would read without the job tools (its own variable, the
         # runner's, or Gemini's place for it), so the machine's defaults still apply.
@@ -2525,16 +3278,202 @@ def prepare_job_tools(cfg: dict, spec: dict, job: dict, machine: str) -> tuple[l
             shutil.rmtree(folder, ignore_errors=True)
             raise JobToolsUnavailable(f"{GEMINI_SKIPS}, and {problem} (guide 9)")
         return [], {GEMINI_DEFAULTS_VAR: str(target)}, folder
+    config = folder / "mcp.json"
+    write_private(config, json.dumps({"mcpServers": {JOB_SERVER: job_tools_server(cfg, job, who)}}, indent=2) + "\n")
+    args = [str(a).replace("{job_mcp_config}", str(config)) for a in template]
+    return args, {}, folder
+
+
+def job_who(spec: dict, job: dict, machine: str) -> str:
+    """Who a job's MCP calls come from (their X-Bullpen-Agent header): "<agent>@<machine> job <id>"."""
+    return f"{spec.get('name') or job.get('agent') or 'agent'}@{machine} job {job['id']}"
+
+
+def job_tools_server(cfg: dict, job: dict, who: str) -> dict:
+    """The job tools' entry in a job's --mcp-config file. One call may take as long as an approval may wait."""
     try:
         wait_s = int(job.get("approval_timeout_s") or 600)
     except (TypeError, ValueError):
         wait_s = 600
-    timeout_ms = (max(wait_s, 0) + 60) * 1000 if "approve" in tools else 120_000
+    timeout_ms = (max(wait_s, 0) + 60) * 1000 if "approve" in job_tool_list(job) else 120_000
+    return job_server_entry(cfg, job["job_token"], who, timeout_ms)
+
+
+# What a job's error adds when a task picks MCP servers before the runner has synced with the hub.
+NO_SERVER_LIST = "this runner hasn't had the hub's list of MCP servers yet"
+
+
+def job_mcp_picks(job: dict) -> tuple[list, list]:
+    """The MCP servers a task picked, as the hub sent them: (options.mcp_add, options.mcp_only). An absent or
+    empty list picks none (an empty one is how a follow-up turns an inherited choice off). A value that isn't
+    a list counts as one name, which prepare_job_mcp refuses unless this machine has a server by that name."""
+    options = job.get("options") if isinstance(job.get("options"), dict) else {}
+
+    def names(value: Any) -> list:
+        return [] if value is None else list(value) if isinstance(value, list) else [value]
+
+    return names(options.get("mcp_add")), names(options.get("mcp_only"))
+
+
+def takes_mcp_picks(spec: dict) -> bool:
+    """Whether a task's picked MCP servers can be handed to this agent: Claude Code's way, in a --mcp-config
+    file (mcp_config_args). Gemini CLI can't add a server for one job unless the runner runs as root."""
+    template = spec.get("mcp_config_args")
+    return spec.get("parser") == "claude-stream" and isinstance(template, list) and bool(template)
+
+
+# Words that name a secret in an MCP server's settings, besides SECRET_NAME_RE's (which known_secrets and the
+# command-line masking share, so it stays as it is).
+MCP_SECRET_WORDS = ("pin", "pwd", "pass", "passphrase", "sig", "signature", "session", "sid", "otp")
+MCP_FLAG_RE = re.compile(r"--?([A-Za-z0-9][A-Za-z0-9_.-]*)(=(.*))?", re.S)  # -x, --name, --name=value
+
+
+def mcp_name_is_secret(name: Any) -> bool:
+    """Whether the name of an MCP server's setting (an environment variable, a query value's name, a flag without
+    its dashes) says its value is a secret: SECRET_NAME_RE finds a secret's word in it, or one of MCP_SECRET_WORDS
+    is a whole word of it (the name split on _ - . and where a lower-case letter meets an upper-case one, compared
+    in lower case), so PIN, DB_PWD and sessionId count and SPIN, OPTIONS and SIGNAL don't."""
+    name = str(name)
+    words = re.split(r"[_.-]|(?<=[a-z])(?=[A-Z])", name)
+    return bool(SECRET_NAME_RE.search(name)) or any(word.lower() in MCP_SECRET_WORDS for word in words)
+
+
+class StandAloneSecret(str):
+    """A short secret that Job.mask hides only where it stands alone (no ASCII letter or digit touching it), so it
+    leaves longer words and numbers be: one that is all digits, one only MCP_SECRET_WORDS calls a secret (PIN=1234),
+    or a header value that is one only because it is a header value (X-Pin: 99). Job.mask hides any other value in
+    mask_values wherever it is."""
+    __slots__ = ()
+
+
+def has_letter_or_digit(value: str) -> bool:
+    """Whether a short `value` can be a secret at all: one with no letter or digit (*, */*, -, .) never is, and
+    masking it would scramble markdown and the *** left by values masked before it (ruling G13c). Callers ask only
+    for values shorter than KNOWN_SECRET_MIN: a longer one is a secret whatever it holds (ruling G13d)."""
+    return any(ch.isalnum() for ch in value)
+
+
+def mcp_entry_secrets(entries: dict, hub_url: str = "") -> list[str]:
+    """The secrets in a job's MCP server entries, for masking its log, its answer and its diff (Job.mask): every
+    header value but the agent's name (a "Bearer <token>" value's token also on its own), every environment value
+    and a URL's query values, a URL's user and password and path segments, and a stdio server's arguments (each
+    whole, and what follows "="). Most of them count from KNOWN_SECRET_MIN characters up, as in known_secrets:
+    shorter ones are mostly settings and words ("1", "info", "true", "s", "-y"). Shorter ones count too for a URL's
+    password and a header value (but true or false), for an environment or query value whose name says it's a
+    secret (mcp_name_is_secret; digits too, but not true or false), and for the argument after a flag named like a
+    secret and what follows "=" in one (--api-key ab12c, --api-key=ab12c; not true or false, and not a next argument
+    that is a flag itself, as in --token -y). Such a short one is a strong secret,
+    masked wherever it is, when it is a URL's password or its name is one SECRET_NAME_RE knows (Authorization,
+    Proxy-Authorization, Cookie, X-Api-Key, API_KEY, --token), unless it is all digits; the rest (all digits, a name
+    only MCP_SECRET_WORDS knows, any other header) come as StandAloneSecret. A value of spaces alone, or a short
+    one with no letter or digit (*, */*, -, .), never counts; a longer one counts whatever else it holds. The URL of the hub's own entries (`bullpen` and the servers it relays, at hub_url's
+    /mcp) has nothing secret in it, and its path ends in the server's name."""
+    found: list[str] = []
+    words: list[str] = []
+
+    def secret(value: str, strong: bool) -> None:
+        found.append(value if strong and not re.fullmatch(r"[0-9]+", value) else StandAloneSecret(value))
+
+    def named(name: Any, value: str) -> None:
+        if value.lower() in ("true", "false") or not mcp_name_is_secret(name):
+            words.append(value)
+        else:
+            secret(value, bool(SECRET_NAME_RE.search(str(name))))
+
+    hub_mcp = hub_url.rstrip("/") + "/mcp" if hub_url else ""
+    for entry in entries.values():
+        for key, value in (entry.get("headers") or {}).items():
+            if str(key).lower() != "x-bullpen-agent":
+                rest = str(value).partition(" ")[2].strip()  # a "Bearer <token>" value's token
+                for part in (str(value), rest):
+                    if part.lower() not in ("true", "false"):
+                        # SECRET_NAME_RE knows Authorization, Proxy-Authorization and Cookie (auth, cookie).
+                        secret(part, bool(SECRET_NAME_RE.search(str(key))))
+        for key, value in (entry.get("env") or {}).items():
+            named(key, str(value))
+        url = str(entry.get("url") or "")
+        if url and not (hub_mcp and (url == hub_mcp or url.startswith(hub_mcp + "/"))):
+            m = URL_AUTHORITY_RE.match(url)
+            # The user and password as url_has_userinfo reads them: up to the first "/" after the slashes, so a
+            # password holding a raw ? or # counts too.
+            userinfo = url[m.start(2):].partition("/")[0].rpartition("@")[0] if m else ""
+            if userinfo:
+                user, _, password = userinfo.partition(":")
+                secret(password, True)
+                words += [userinfo, user]
+            path, _, query = url[m.end() if m else 0:].partition("#")[0].partition("?")
+            for part in query.split("&"):
+                name, eq, value = part.partition("=")
+                if eq:
+                    named(name, value)
+                else:
+                    words.append(name)
+            words += path.split("/")
+        args = [str(arg) for arg in entry.get("args") or []]
+        for i, arg in enumerate(args):
+            words += [arg, arg.partition("=")[2]]
+            flag = MCP_FLAG_RE.fullmatch(arg)
+            if flag and mcp_name_is_secret(flag.group(1)):
+                # The value after "=", else the next argument unless that is a flag itself (--token -y); true and
+                # false are settings, never a secret.
+                after = [a for a in args[i + 1:i + 2] if not MCP_FLAG_RE.fullmatch(a)]
+                for value in [flag.group(3)] if flag.group(2) else after:
+                    if value.lower() not in ("true", "false"):
+                        secret(value, bool(SECRET_NAME_RE.search(flag.group(1))))
+    kept = [s for s in found if s] + [s for s in words if len(s) >= KNOWN_SECRET_MIN]
+    return [s for s in kept if s.strip() and (len(s) >= KNOWN_SECRET_MIN or has_letter_or_digit(s))]
+
+
+def prepare_job_mcp(cfg: dict, spec: dict, job: dict, machine: str,
+                    context: dict | None) -> tuple[list[str], Path | None, list[str], list[str]]:
+    """A job's MCP servers for Claude Code: (arguments to add after the autonomy flags, folder to delete
+    afterwards, the names of the picked servers, the secrets in the file). For a task that picked servers, one
+    mcp.json in the job's folder holds the job tools (when the hub sent a job token, as prepare_job_tools writes
+    them), the servers it added (options.mcp_add) and, for a task narrowed to some servers (options.mcp_only),
+    those plus the hub's own `bullpen`; a narrowed job also gets strict_mcp_args, so the agent uses no other
+    server. The entries are built from `context` (the runner's last sync) by the code the machine-wide setup
+    uses. Without picks it is prepare_job_tools' arguments and folder: the job tools only, as before (their
+    environment additions are always empty for an agent that takes picks, so _task calls prepare_job_tools
+    itself then). JobToolsUnavailable, before anything is written, when a picked server can't be given."""
+    add, only = job_mcp_picks(job)
+    if not add and not only:
+        args, _env, folder = prepare_job_tools(cfg, spec, job, machine)
+        return args, folder, [], []
+    agent = spec.get("name") or job.get("agent") or "this agent"
+    if not takes_mcp_picks(spec):
+        raise JobToolsUnavailable(f"{agent} can't be given a task's MCP servers (only Claude Code agents can)")
+    strict = spec.get("strict_mcp_args")
+    if only and not (isinstance(strict, list) and strict):
+        raise JobToolsUnavailable(f"{agent} can't be limited to the task's MCP servers: it has no strict_mcp_args "
+                                  "in runner.json")
+    picked: list = []
+    for name in add + only:
+        if name not in picked:
+            picked.append(name)
+    who = job_who(spec, job, machine)
+    # The hub's own servers are never a pick: `bullpen` keeps the level's own tools, the job tools their own entry.
+    usable = [n for n in picked if isinstance(n, str) and n not in (*RESERVED_SERVERS, JOB_SERVER)]
+    entries = claude_server_entries(cfg, context, usable + (["bullpen"] if only else []), who) if context else {}
+    for name in picked:
+        if name not in usable or name not in entries:
+            raise JobToolsUnavailable(f"MCP server '{_shown(name)}' isn't available on {machine}"
+                                      + ("" if context else f" ({NO_SERVER_LIST})"))
+    servers: dict[str, dict] = {}
+    token = job.get("job_token")
+    if isinstance(token, str) and token and job_tool_list(job) and spec.get("job_mcp") == "mcp-config":
+        servers[JOB_SERVER] = job_tools_server(cfg, job, who)
+    servers.update(entries)
+    folder = job_folder(int(job["id"]))
     config = folder / "mcp.json"
-    write_private(config, json.dumps({"mcpServers": {JOB_SERVER: job_server_entry(cfg, token, who, timeout_ms)}},
-                                     indent=2) + "\n")
-    args = [str(a).replace("{job_mcp_config}", str(config)) for a in template]
-    return args, {}, folder
+    try:
+        write_private(config, json.dumps({"mcpServers": servers}, indent=2) + "\n")
+    except OSError:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+    args = [str(a).replace("{job_mcp_config}", str(config)) for a in spec["mcp_config_args"]]
+    if only:
+        args += [str(a) for a in strict]
+    return args, folder, picked, mcp_entry_secrets(entries, str(cfg.get("hub_url") or ""))
 
 
 def mcp_post(url: str, headers: dict, message: dict, timeout: float) -> tuple[int, dict]:
@@ -2764,6 +3703,18 @@ class LiveSession:
         self.outbox.put(None)
 
 
+# A summary for the hub's shared memory, after a job whose task asked for one (options.summarize): the job's session
+# is resumed once with this prompt (see Job._summarize), and the answer goes back with the result as "summary".
+SUMMARY_PROMPT = ("Summarize this conversation for a shared notes file other AI agents will read. At most 8 short "
+                  "lines: what was asked; what you did or found; files you changed; anything left open. Plain text, "
+                  "no preamble.")
+SUMMARY_TIMEOUT = 180     # seconds the summary turn may take
+SUMMARY_MAX_CHARS = 2000  # a summary as the hub is sent it, masked first
+# The session ids the summary turn resumes (UUIDs, in practice): never one that starts with "-", which the CLI would
+# read as another flag after its resume flag.
+SUMMARY_SESSION_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:-]{0,127}")
+
+
 class Job:
     """One job: start the CLI, feed it the prompt, follow its output, report back."""
 
@@ -2778,15 +3729,58 @@ class Job:
         # The job token, when the hub sent one: every log line and the answer are masked with it.
         token = data.get("job_token")
         self.token = token if isinstance(token, str) else ""
-        self.job_dir: Path | None = None  # this job's private folder (its job tools' config)
+        # Exact secret values its log lines and answer are masked with too (longest first, see mask): a git
+        # account's token, the secrets of its picked MCP servers, and the machine's other secrets, for a job with
+        # either. Each wherever it is, but a short StandAloneSecret only where it stands alone. Empty for other jobs.
+        self.mask_values: list[str] = []
+        self.job_dir: Path | None = None  # this job's private folder (job_folder), removed when it ends
         self.live: LiveSession | None = None  # a live session's open input
         self.turns_pending: list[dict] = []   # a live session's answers not yet sent to the hub
         self.closed_sent = False              # the hub has been told the live session closed
 
     # -- log shipping ------------------------------------------------------
+    def mask(self, text: str) -> str:
+        """`text` without this job's secrets (ruling G13e). Every match of the job token, of anything shaped like one
+        (JOB_TOKEN_RE, with or without a token) and of each value in mask_values, also as JSON writes it (a stdout
+        line is masked while it is still raw JSON), is found in the text as it came. Overlapping and touching matches
+        are merged and each merged stretch becomes one ***, so no value replaced first can hide another value, or
+        the token, from the mask. A StandAloneSecret shorter than KNOWN_SECRET_MIN counts only where it stands alone
+        (no ASCII letter or digit touching it), so a short PIN leaves longer words and numbers be; any other value
+        counts wherever it is. A value of spaces alone, or a short one with no letter or digit (*, */*, -, .), is
+        never a secret; one of KNOWN_SECRET_MIN characters or more is, whatever else it holds (rulings G13c, G13d)."""
+        spans = [m.span() for m in JOB_TOKEN_RE.finditer(text)]
+        needles = [(self.token, False)] if self.token else []
+        for value in self.mask_values:
+            if not value.strip() or (len(value) < KNOWN_SECRET_MIN and not has_letter_or_digit(value)):
+                continue
+            alone = isinstance(value, StandAloneSecret) and len(value) < KNOWN_SECRET_MIN
+            for form in {str(value), json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}:
+                needles.append((form, alone))
+        for needle, alone in needles:
+            if alone:
+                spans += [m.span() for m in re.finditer(f"(?<![A-Za-z0-9]){re.escape(needle)}(?![A-Za-z0-9])", text)]
+                continue
+            at = text.find(needle)
+            while at != -1:
+                spans.append((at, at + len(needle)))
+                at = text.find(needle, at + 1)
+        if not spans:
+            return text
+        merged: list[list[int]] = []
+        for start, stop in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], stop)
+            else:
+                merged.append([start, stop])
+        pieces, last = [], 0
+        for start, stop in merged:
+            pieces += [text[last:start], "***"]
+            last = stop
+        return "".join(pieces) + text[last:]
+
     def emit(self, *lines: str) -> None:
-        if self.token:
-            lines = tuple(mask_job_token(str(ln), self.token) for ln in lines)
+        if self.token or self.mask_values:
+            lines = tuple(self.mask(str(ln)) for ln in lines)
         with self.lock:
             self.lines.extend(lines)
 
@@ -2847,10 +3841,10 @@ class Job:
         except Exception as err:  # never let one job take the runner down
             log.exception("job %s crashed", self.id)
             outcome = {"status": "error", "error": f"runner error: {err}"}
-        if self.token:
+        if self.token or self.mask_values:
             for key in ("result", "error", "diff"):
                 if isinstance(outcome.get(key), str):
-                    outcome[key] = mask_job_token(outcome[key], self.token)
+                    outcome[key] = self.mask(outcome[key])
         # Check in now when the job changed what the dashboard shows (an admin action, or new plan-limit
         # figures), so it shows the change before the job reads "done" instead of up to 15 s later.
         limits = getattr(self.runner, "limits", None)
@@ -2928,13 +3922,7 @@ class Job:
         values = {"{model}": model, "{session_id}": resume, "{workdir}": workdir, "{new_session_id}": new_session_id}
 
         def fill(args: list) -> list[str]:
-            out = []
-            for a in args:
-                a = str(a)
-                for key, value in values.items():
-                    a = a.replace(key, value)
-                out.append(a)
-            return out
+            return fill_args(args, values)
 
         # A level this agent doesn't have fails the job: running it with other flags (read only, say)
         # would not be what was asked for.
@@ -2975,6 +3963,28 @@ class Job:
         if tool_args:
             level_args = add_allowed_tools(level_args, str(spec.get("allow_tools_flag") or ""),
                                            allowed_job_tool_names(tools))
+        has_job_tools = bool(tool_args)  # in a --mcp-config file (Claude Code's way)
+
+        # The MCP servers the task picked (Claude Code), in one file with the job tools when they were handed
+        # over above. Their tools are allowed at every level, read only included: "always, once picked", as the
+        # owner decided. A subtask picks none. A server that can't be given fails the job before the agent starts.
+        mcp_note = ""
+        if not subtask and any(job_mcp_picks(self.data)):
+            job = self.data if has_job_tools else {**self.data, "job_token": ""}
+            try:
+                tool_args, self.job_dir, picked, mcp_secrets = prepare_job_mcp(
+                    cfg, spec, job, self.machine_name(), getattr(self.runner, "last_context", None))
+            except JobToolsUnavailable as err:
+                return {"status": "error", "error": str(err)}
+            except OSError as err:
+                return {"status": "error", "error": f"Couldn't write the MCP servers' settings for the agent ({err})."}
+            level_args = add_allowed_tools(level_args, str(spec.get("allow_tools_flag") or ""),
+                                           [f"mcp__{name}" for name in picked])
+            mcp_note = f"MCP servers for this job: {', '.join(picked)}. Their tools are allowed even in Read only."
+            # The hub's MCP token and the servers' own secrets, masked like the job token: each exact value that
+            # mcp_entry_secrets counts, short ones too (known_secrets would leave out values under 6 characters;
+            # Job.mask takes a short StandAloneSecret only where it stands alone, a strong one wherever it is).
+            self.mask_values = known_secrets(cfg, spec) + [s for s in mcp_secrets if s]
 
         # A live session keeps the agent's input open for the owner's messages.
         live_note = ""
@@ -3024,6 +4034,35 @@ class Job:
         for key, value in ((spec.get("autonomy_env") or {}).get(autonomy) or {}).items():
             env[str(key)] = str(value)
         env.update(tool_env)
+        # The git account: the one picked for the task, else the project's or the machine's default. A subtask
+        # gets none. One that can't be applied fails the job here, before the agent starts.
+        git_name, git_error, git_note = choose_git_account(cfg, spec, project, options.get("git_account"), subtask)
+        if git_error:
+            return {"status": "error", "error": git_error}
+        git_notes: list[str] = []
+        if git_name:
+            account = git_accounts(cfg)[0][git_name]
+            try:
+                if self.job_dir is None:
+                    self.job_dir = job_folder(int(self.id))
+                git_env, git_secrets = git_account_env(account, self.job_dir, env, git_name)
+            except GitAccountProblem as err:
+                return {"status": "error", "error": str(err)}
+            except OSError as err:
+                return {"status": "error", "error": f"Couldn't write the settings of git account '{git_name}' for "
+                                                    f"the job ({err})."}
+            more = git_account_notes(account, git_name, env)
+            for var in GIT_ACCOUNT_UNSET:
+                env.pop(var, None)
+            git_notes = [f"Git account: {git_name} ({account['host']})", git_ssh_program_note(workdir, env), *more]
+            env.update(git_env)
+            try:
+                check_git_credential_urls(workdir, env, git_name, account)
+            except GitAccountProblem as err:
+                return {"status": "error", "error": str(err)}
+            # Every exact git secret, however short (known_secrets leaves out values under 6 characters), after the
+            # MCP file's secrets when the task picked servers (they include the machine's own).
+            self.mask_values = (self.mask_values or known_secrets(cfg, spec)) + [s for s in git_secrets if s]
         env["PWD"] = workdir  # some CLIs read the folder from PWD rather than asking the OS
 
         timeout = float(options.get("timeout_min", 60)) * 60
@@ -3033,11 +4072,11 @@ class Job:
 
         self.emit(f"▶ {spec.get('label', agent)} in {project} ({workdir}) · autonomy: {autonomy}"
                   + (f" · model: {model}" if model else ""))
-        if tool_note:
-            self.emit(tool_note)
-        if live_note:
-            self.emit(live_note)
-        log.info("job %s: %s", self.id, redact_argv(shown, known_secrets(cfg, spec, [self.token])))
+        for note in (*git_notes, git_note, tool_note, mcp_note, live_note):
+            if note:
+                self.emit(note)
+        log.info("job %s: %s", self.id,
+                 redact_argv(shown, known_secrets(cfg, spec, [self.token, *self.mask_values])))
 
         popen_kw: dict[str, Any] = {}
         if IS_WINDOWS:
@@ -3073,7 +4112,7 @@ class Job:
 
         stderr_tail: list[str] = []
         stop_reason: list[str] = []
-        asks = "approve" in tools and bool(tool_args)  # the agent asks the owner through the job tools
+        asks = "approve" in tools and has_job_tools  # the agent asks the owner through the job tools
         gemini_file = tool_env.get(GEMINI_DEFAULTS_VAR)  # the job's settings file, for Gemini CLI
 
         def tools_lost(reason: str) -> None:
@@ -3083,9 +4122,15 @@ class Job:
                 stop_reason.append("job_tools:" + reason)
                 kill_tree(self.proc)
 
+        # A job with secrets to mask masks each line as it comes, before anything cuts it short: a secret cut in
+        # two (a tool's command shown up to 140 characters, say) would no longer match.
+        masks = bool(self.token or self.mask_values)
+
         def read_stderr() -> None:
             for raw in self.proc.stderr:
                 raw = raw.rstrip("\r\n")
+                if masks:
+                    raw = self.mask(raw)
                 if raw.strip():
                     stderr_tail.append(raw)
                     del stderr_tail[:-40]
@@ -3133,6 +4178,8 @@ class Job:
         checked = False
         for raw in self.proc.stdout:
             raw = raw.rstrip("\r\n")
+            if raw and masks:
+                raw = self.mask(raw)
             if raw:
                 before = len(getattr(parser, "turns", ()))
                 lines = parser.feed(raw)
@@ -3146,9 +4193,9 @@ class Job:
                                    "Claude Code started without them")
                 if self.live is not None and len(getattr(parser, "turns", ())) > before:
                     turn = dict(parser.turns[-1])
+                    if masks:
+                        turn["result"] = self.mask(turn["result"])
                     turn["result"] = turn["result"][:LIVE_TURN_CHARS]
-                    if self.token:
-                        turn["result"] = mask_job_token(turn["result"], self.token)
                     with self.lock:
                         self.turns_pending.append(turn)
                     self.live.on_result()
@@ -3168,7 +4215,7 @@ class Job:
                                    "result": parser.final("")}
         error_kind = None
         if options.get("capture_diff"):
-            outcome["diff"] = capture_diff(workdir, start_sha)
+            outcome["diff"] = capture_diff(workdir, start_sha, mask=self.mask if masks else None)
 
         if stop_reason and stop_reason[0] == "cancelled":
             outcome.update(status="cancelled", error="Cancelled from the dashboard.")
@@ -3192,15 +4239,113 @@ class Job:
             outcome.update(status="error", error="The agent finished but returned no answer. Check the log.")
         else:
             outcome["status"] = "done"
-        # Tokens and cost as the agent reported them (also for a job that was stopped: they were spent),
-        # and what kind of error it was when the hub shows it in its own way (a usage or quota limit).
         tracker = getattr(parser, "usage", None)
+        # A summary for shared memory when the task asked for one (never a subtask's), once a live session has
+        # closed. Nothing about it can change how the job ended: a summary that isn't written is one log line.
+        if outcome["status"] == "done" and options.get("summarize") is True and not subtask:
+            # Gemini CLI: only the id it reported in this run. It reads a hub's "latest" or a number as the folder's
+            # newest session or one by index, which may be another job's.
+            summary_session = (parser.session_id if spec.get("parser") == "gemini-stream"
+                               else outcome["session_id"] or resume)
+            try:
+                summary = self._summarize(spec, exe, model, summary_session, workdir, tracker)
+            except Exception as err:
+                log.exception("job %s: the summary turn failed", self.id)
+                self.emit(f"Summary not written: the runner hit an error ({type(err).__name__}).")
+                summary = None
+            if summary:
+                outcome["summary"] = summary
+        # Tokens and cost as the agent reported them (also for a job that was stopped: they were spent; a summary
+        # turn's too), and what kind of error it was when the hub shows it in its own way (a usage or quota limit).
         usage = tracker.total() if tracker is not None else None
         if usage:
             outcome["usage"] = usage
         if error_kind in ERROR_KINDS:
             outcome["error_kind"] = error_kind
         return outcome
+
+    def _summarize(self, spec: dict, exe: str, model: str, session: str, workdir: str,
+                   tracker: UsageTracker | None) -> str | None:
+        """The summary turn: the job's `session` resumed once with SUMMARY_PROMPT, the agent's readonly level and the
+        job's model, in its folder, with the agent's own arguments and environment and nothing a job adds (no live
+        input, job tools, MCP picks, new session or git account: as for a job with git account "-"), and no MCP servers
+        at all when the agent has strict_mcp_args. Its answer, masked with this job's mask (ruling G13e; the
+        machine's known secrets for a job with no values of its own) before it is cut to SUMMARY_MAX_CHARS; None when
+        there is none, with one log line that says why in the runner's own words. For Gemini CLI, "latest" and a bare
+        number are no session. Its tokens go into `tracker`, the job's."""
+        limit = f"{SUMMARY_TIMEOUT / 60:g} minutes" if SUMMARY_TIMEOUT >= 60 else f"{SUMMARY_TIMEOUT:g} seconds"
+
+        def not_written(reason: str) -> None:
+            self.emit(f"Summary not written: {reason}")
+
+        if not can_summarize(spec):  # its entry changed after the hub last heard from it
+            if spec.get("permission_flags"):
+                return not_written(f"{spec['label']} has permission flags outside its levels in runner.json "
+                                   f"({', '.join(spec['permission_flags'])}), so a readonly turn might not only read.")
+            return not_written(f"{spec['label']} can't resume the job's session by its id with a readonly level here.")
+        if spec.get("parser") == "gemini-stream" and isinstance(session, str) \
+                and (session.lower() == "latest" or session.isdigit()):
+            session = ""  # to Gemini CLI, the newest session in the folder or one by its index: not an id
+        if not session:
+            return not_written("the agent reported no session to continue.")
+        if not isinstance(session, str) or not SUMMARY_SESSION_RE.fullmatch(session):
+            return not_written("the job's session id isn't a plain id (letters, digits, '.', '_', ':' and '-').")
+        values = {"{model}": model, "{session_id}": session, "{workdir}": workdir, "{new_session_id}": ""}
+        argv = [exe, *fill_args(spec.get("args", []), values), *fill_args(spec["autonomy"]["readonly"], values)]
+        # No MCP server at all where the agent can be limited to a --mcp-config file it isn't given (Claude Code's
+        # --strict-mcp-config): a summary needs no tools, and a task narrowed to some servers (mcp_only) must not
+        # reach the machine's others in its summary.
+        if isinstance(spec.get("strict_mcp_args"), list):
+            argv += [str(a) for a in spec["strict_mcp_args"]]
+        if model and spec.get("model"):
+            argv += fill_args(spec["model"], values)
+        argv += fill_args(spec["resume"], values) + fill_args(spec.get("extra_args", []), values)
+        prompt = SUMMARY_PROMPT
+        if (spec.get("prompt_via") or "stdin") == "arg":  # as the job passed its prompt
+            if any("{prompt}" in a for a in argv):
+                argv = [a.replace("{prompt}", prompt) for a in argv]
+            else:
+                argv.append(prompt)
+            prompt = ""
+        env = build_env(spec)
+        for key, value in ((spec.get("autonomy_env") or {}).get("readonly") or {}).items():
+            env[str(key)] = str(value)
+        env["PWD"] = workdir
+        self.emit(f"Writing a summary for shared memory (up to {limit}).")
+        log.info("job %s: summary turn: %s", self.id,
+                 redact_argv(argv, known_secrets(self.runner.cfg, spec, [self.token, *self.mask_values])))
+        try:
+            code, out, _, stopped = run_capture(argv, workdir, env, prompt, SUMMARY_TIMEOUT, self.cancel)
+        except OSError as err:
+            return not_written(f"couldn't start {exe} ({err}).")
+        parser = PARSERS[spec.get("parser", "text")]()
+        for raw in out.splitlines():
+            if raw:
+                parser.feed(raw)
+        used = getattr(parser, "usage", None)
+        if tracker is not None and used is not None:
+            tracker.add_run(used)  # spent whatever came of it
+        if stopped == "cancelled":
+            return not_written("the job was cancelled.")
+        if stopped == "timeout":
+            return not_written(f"no answer within {limit}.")
+        if parser.error:
+            return not_written("the agent reported an error.")
+        if code != 0:
+            return not_written(f"the agent exited with code {code}.")
+        answer = parser.final("")
+        # A job with no exact values of its own (no git account, no MCP picks) masks its summary with the machine's
+        # known secrets too: the summary goes to shared memory and other tasks' prompts. Put back afterwards, for the
+        # job's result, error and diff (masked in run()).
+        saved = self.mask_values
+        self.mask_values = saved or known_secrets(self.runner.cfg, spec)
+        try:
+            summary = self.mask(answer.strip())[:SUMMARY_MAX_CHARS].rstrip() if isinstance(answer, str) else ""
+        finally:
+            self.mask_values = saved
+        if not summary:
+            return not_written("the agent's answer was empty.")
+        return summary
 
     # -- admin actions sent from the dashboard ----------------------------------
     def _admin(self) -> dict:
@@ -3382,12 +4527,20 @@ class Job:
             note += f" Claude Code says it is rate limited until {limited.group(1).strip()[:80]}."
         return {"windows": {}, "note": note}
 
-    def _run_logged(self, argv: list[str], cwd: str | None = None, timeout_s: float = 1200) -> int:
-        """Run a helper command (git), streaming its output into the job log."""
+    def _run_logged(self, argv: list[str], cwd: str | None = None, timeout_s: float = 1200,
+                    env_extra: dict[str, str] | None = None, secrets: list[str] | tuple = ()) -> int:
+        """Run a helper command (git), streaming its output into the job log. env_extra: a git account's
+        environment (GIT_ACCOUNT_UNSET is left out then); secrets: its values to mask in the log, however short,
+        besides the ones the machine knows."""
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+        if env_extra:
+            for var in GIT_ACCOUNT_UNSET:
+                env.pop(var, None)
+            env.update(env_extra)
+        known = known_secrets(self.runner.cfg) + [s for s in secrets if s]
         kw: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000} \
             if IS_WINDOWS else {"start_new_session": True}
-        self.emit("$ " + redact_argv(argv, known_secrets(self.runner.cfg)))  # a clone URL may carry a token
+        self.emit("$ " + redact_argv(argv, known))  # a clone URL may carry a token
         proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", **kw)
         deadline = time.monotonic() + timeout_s
@@ -3403,8 +4556,48 @@ class Job:
         for line in proc.stdout:
             line = line.rstrip("\r\n")
             if line.strip():
-                self.emit(redact(line, known_secrets(self.runner.cfg)))
+                self.emit(redact(line, known))
         return proc.wait()
+
+    def _git_account_run(self, project: str, params: dict, argv: list[str], url: Callable[[Path], str | None],
+                         no_url: str, repo: str | None = None) -> tuple[int, str]:
+        """Run a clone or pull (`argv`) of `project` with its git account: params "git_account", else the
+        project's default, else the machine's; with none, as today. (exit code, "") when it ran, (-1, why)
+        when the account can't be used (the URL git would use, which `url` gives, is on another host, say;
+        `no_url` starts the message for a None from it). The account's settings are in this job's folder (which
+        `url` gets) while git runs, and removed afterwards. `repo`: the repository a pull runs in; None for a
+        clone, which runs in none."""
+        cfg = self.runner.cfg
+        name, error, _ = choose_git_account(cfg, None, project, params.get("git_account"))
+        if error:
+            return -1, error
+        if name is None:
+            return self._run_logged(argv), ""
+        account = git_accounts(cfg)[0][name]
+        base = {k: v for k, v in os.environ.items() if k not in GIT_ACCOUNT_UNSET}  # as _run_logged runs git
+        try:
+            try:
+                folder = job_folder(int(self.id))
+                env, secrets = git_account_env(account, folder, base, name)
+            except GitAccountProblem as err:
+                return -1, str(err)
+            except OSError as err:
+                return -1, f"couldn't write the settings of git account '{name}' ({err})"
+            address = url(folder)
+            if address is None:
+                return -1, (f"{no_url}, so the runner can't check that it is on {account['host']}, the host of git "
+                            f"account '{name}'")
+            problem = git_account_url_problem(address, name, account)
+            if problem:
+                return -1, problem
+            self.emit(f"Git account: {name} ({account['host']})")
+            for note in (git_ssh_program_note(repo or folder, base, alone=repo is None),
+                         *git_account_notes(account, name, dict(os.environ), tools=False)):
+                if note:
+                    self.emit(note)
+            return self._run_logged(argv, env_extra=env, secrets=secrets), ""
+        finally:
+            shutil.rmtree(JOBS_DIR / str(int(self.id)), ignore_errors=True)
 
     def _project(self, action: str, params: dict) -> dict:
         name = (params.get("name") or "").strip()
@@ -3423,7 +4616,18 @@ class Job:
         if action == "project.pull":
             if name not in projects:
                 return {"status": "error", "error": f"no project called '{name}'"}
-            code = self._run_logged(["git", "-C", expand_path(projects[name]), "pull", "--ff-only"])
+            path = expand_path(projects[name])
+
+            def pull_url(_folder: Path) -> str | None:
+                # The remote git pull fetches from: the current branch's (branch.<name>.remote), else the only one,
+                # else origin; after url.<base>.insteadOf, and without GIT_ACCOUNT_UNSET, as the pull runs.
+                env = {k: v for k, v in os.environ.items() if k not in GIT_ACCOUNT_UNSET}
+                return (git(path, "ls-remote", "--get-url", env=env) or "").strip() or None
+
+            code, problem = self._git_account_run(name, params, ["git", "-C", path, "pull", "--ff-only"], pull_url,
+                                                  f"git can't say which remote '{name}' pulls from", repo=path)
+            if problem:
+                return {"status": "error", "error": problem}
             if self.cancel.is_set():
                 return {"status": "cancelled", "error": "Cancelled from the dashboard."}
             return ({"status": "done", "result": f"Pulled the latest changes into **{name}**."} if code == 0 else
@@ -3440,12 +4644,18 @@ class Job:
                 self._run_logged(["git", "init", "-q", str(target)])
         elif action == "project.clone":
             url = (params.get("url") or "").strip()
-            if not re.match(r"^(https://|ssh://|git@)\S+$", url):
+            if not re.match(r"^(?:(?:https|ssh)://|git@)[^/\s]\S*$", url):
                 return {"status": "error", "error": "use an https://, ssh:// or git@ address"}
+            if url_has_userinfo(url):
+                return {"status": "error", "error": NO_URL_CREDENTIALS}
             if target.exists():
                 return {"status": "error", "error": f"{target} already exists"}
             root.mkdir(parents=True, exist_ok=True)
-            code = self._run_logged(["git", "clone", "--progress", "--", url, str(target)])
+            code, problem = self._git_account_run(name, params, ["git", "clone", "--progress", "--", url, str(target)],
+                                                  lambda folder: git_clone_url(url, folder),
+                                                  "git can't say where this URL leads")
+            if problem:
+                return {"status": "error", "error": problem}
             if self.cancel.is_set():
                 return {"status": "cancelled", "error": "Cancelled from the dashboard."}
             if code != 0:
@@ -3980,8 +5190,11 @@ class RemoteControl:
         """At start-up: stop servers a crashed runner left behind, and start again the ones an
         update stopped (if that was under 10 minutes ago and Remote Control is still allowed)."""
         try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            data = json.loads(read_private(self.state_file))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as err:
+            log.warning("remote control: couldn't read %s (%s); nothing is restarted", self.state_file, err)
             return
         if not isinstance(data, dict):
             return
@@ -4034,6 +5247,9 @@ class Runner:
         self.heartbeat_lock = threading.Lock()
         self.sync_lock = threading.Lock()
         self.context_version = None  # what this machine last synced
+        # From the last sync: the server list, the hub's MCP token and its platform names, which a job's
+        # picked servers are built from (claude_server_entries). In memory only: it holds the token.
+        self.last_context: dict | None = None
         self.sync_notes: list[str] = []
         self.stop = threading.Event()
         self.restart_pending = False
@@ -4113,6 +5329,8 @@ class Runner:
                 # The agent the hub may use for background work paid by platform credits (only one that
                 # signs in with an API key; see credits_agent).
                 "credits_agent": credits_agent(cfg)[0],
+                # Git accounts: names, hosts and kinds, the defaults and the problems (see git_account_info).
+                **git_account_info(cfg),
             },
         }
 
@@ -4120,9 +5338,12 @@ class Runner:
         """Bring this machine's shared context up to date: pinned notes now,
         and (see wire_agents) each agent's memory file and MCP servers."""
         with self.sync_lock:
-            status, body = self.hub.call("/api/runner/context", {"features": ["hub-route"]}, timeout=30)
+            # What this runner understands: hub-routed servers, and on-demand ones (left out of the machine-wide
+            # setup, given only to the jobs that pick them).
+            status, body = self.hub.call("/api/runner/context", {"features": ["hub-route", "on-demand"]}, timeout=30)
             if status != 200 or not body:
                 return {"status": "error", "error": f"couldn't fetch shared context from the hub ({status})"}
+            self.last_context = {k: body[k] for k in ("servers", "mcp_enabled", "mcp_token", "platforms") if k in body}
             CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
             wanted = set()
             for fname, text in (body.get("files") or {}).items():
@@ -4644,6 +5865,175 @@ def ask_credits_agent(cfg: dict) -> None:
         cfg["credits_agent"] = answer
 
 
+def ask_secret(question: str) -> str:
+    """ask() for a secret: what is typed isn't shown (getpass), and nothing is offered in [brackets]."""
+    global _input_closed
+    try:
+        return "" if _input_closed else getpass.getpass(f"{question}: ").strip()
+    except EOFError:
+        _input_closed = True
+        print()
+        return ""
+
+
+def ask_git_account(name: str, entry: dict) -> bool:
+    """init's questions for one git account, changing `entry` in place. False when it can't be used then
+    (the reason is printed; it holds no value from the entry)."""
+    def text(key: str) -> str:
+        return entry[key] if isinstance(entry.get(key), str) else ""
+
+    def optional(key: str, question: str, blank: str = "blank for none") -> None:
+        current = text(key)
+        answer = ask(f"{question} (" + ("Enter keeps it, '-' removes it" if current else blank) + ")",
+                     current).strip()
+        if answer and answer != "-":
+            entry[key] = answer
+        else:
+            entry.pop(key, None)
+
+    while True:
+        host = ask("  Host, e.g. github.com or gitlab.example.com (no https://)", text("host")).strip().lower()
+        if GIT_HOST_RE.fullmatch(host):
+            entry["host"] = host
+            break
+        if _input_closed:
+            return False
+        print("  Give the host name only, and its port if it has one: no https://, path or user@.")
+    inferred = git_kind_of(host)
+    while True:
+        current = text("kind")
+        kind = ask("  Kind: github, gitlab or other (" +
+                   (f"'-' to go by the host: {inferred}" if current else f"blank: {inferred}, from the host") + ")",
+                   current).strip()
+        if kind in ("", "-") or kind in GIT_KINDS:
+            break
+        if _input_closed:
+            return False
+        print("  Use github, gitlab or other.")
+    if kind in ("", "-"):
+        entry.pop("kind", None)
+    else:
+        entry["kind"] = kind
+    optional("name", "  Commit name, optional")
+    optional("email", "  Commit email, optional")
+    optional("ssh_key", "  SSH key file, optional, e.g. ~/.ssh/id_ed25519")
+    if text("ssh_key") and not os.path.isfile(expand_path(text("ssh_key"))):
+        print("  That key file doesn't exist on this machine (yet). Jobs that use this account are refused")
+        print("  until it does.")
+    current = text("token")
+    token = ask_secret("  HTTPS token, optional; it isn't shown as you type ("
+                       + ("Enter keeps the current one, '-' removes it)" if current else "blank for none)"))
+    if token == "-" or not (token or current):
+        entry.pop("token", None)
+    elif token:
+        entry["token"] = token
+    if text("token"):
+        optional("user", "  User name sent with the token", "blank: x-access-token")
+    account, why = check_git_account(name, entry)
+    if account is None:
+        print(f"  {why}")
+    return account is not None
+
+
+def ask_git_accounts(cfg: dict) -> None:
+    """init's step for git accounts (runner.json "git_accounts"): keep, change or remove each one, add more,
+    then the default for the machine and the projects' own (project_git_accounts)."""
+    raw = cfg.get("git_accounts", {})
+    if not isinstance(raw, dict):
+        print("\ngit_accounts in runner.json isn't an object of named accounts. Fix it by hand, then run init again.")
+        return
+    print("\n  Git accounts let a task use a named GitHub, GitLab or other git identity here: an SSH key, an HTTPS")
+    print("  token, a commit name and email. They stay in runner.json.")
+    print("  The hub learns their names, hosts and kinds, never a key or token.")
+    accounts = dict(raw)
+    removed = []
+    for name in list(accounts):
+        account, why = check_git_account(name, accounts[name])
+        what = f"{account['host']}, {git_credentials(account)}" if account else f"can't be used: {why}"
+        if not ask_yes(f"Keep git account '{_shown(name)}' ({what})?", True):
+            accounts.pop(name)
+            removed.append(name)
+            print(f"  removed '{_shown(name)}'")
+            continue
+        if GIT_ACCOUNT_RE.fullmatch(name) and isinstance(accounts[name], dict) and ask_yes("  Change it?", False):
+            entry = dict(accounts[name])
+            if ask_git_account(name, entry):
+                accounts[name] = entry
+            else:
+                print("  kept it as it was")
+    while ask_yes("Add a git account?", False):
+        name = ask("  Name for it (up to 32 lowercase letters, digits or dashes), e.g. personal or bot").strip()
+        if not GIT_ACCOUNT_RE.fullmatch(name):
+            print("  Use up to 32 lowercase letters, digits or dashes, starting with a letter or digit.")
+            continue
+        if name in accounts:
+            print(f"  there is already a git account called '{name}'")
+            continue
+        entry: dict[str, Any] = {}
+        if ask_git_account(name, entry):
+            accounts[name] = entry
+            print(f"  added '{name}'")
+        else:
+            print(f"  '{name}' was not added")
+    if accounts:
+        cfg["git_accounts"] = accounts
+    else:
+        cfg.pop("git_accounts", None)
+
+    # A default that named an account removed just now goes with it.
+    if cfg.get("default_git_account") in removed:
+        print(f"  '{cfg.pop('default_git_account')}' was the default git account; now there is none")
+    mapping = cfg.get("project_git_accounts", {})
+    if isinstance(mapping, dict):
+        for project in [p for p, value in mapping.items() if value in removed]:
+            print(f"  project '{_shown(project)}' had '{mapping.pop(project)}' as its git account; "
+                  "now it has the default")
+        if not mapping:
+            cfg.pop("project_git_accounts", None)
+    valid = sorted(git_accounts(cfg)[0])
+    if not valid or _input_closed:
+        return  # nothing to name, or no keyboard: the defaults stay as runner.json has them
+
+    current = cfg.get("default_git_account") if isinstance(cfg.get("default_git_account"), str) else ""
+    while True:
+        answer = ask(f"Default git account for every project ({', '.join(valid)}; "
+                     + ("'-' for none)" if current else "blank for none)"), current).strip()
+        if answer in ("", "-") or answer in valid:
+            break
+        if _input_closed:
+            return  # no keyboard: leave what runner.json has
+        print(f"  Pick one of: {', '.join(valid)}, or '-' for none.")
+    if answer in ("", "-"):
+        cfg.pop("default_git_account", None)
+    else:
+        cfg["default_git_account"] = answer
+
+    if not isinstance(mapping, dict):
+        print("  project_git_accounts in runner.json isn't an object of project and account names. Fix it by hand.")
+        return
+    mapping = dict(mapping)
+    for project in list(mapping):
+        value = mapping[project]
+        state = "" if isinstance(value, str) and value in valid else " (not a valid git account)"
+        if not ask_yes(f"Keep git account '{_shown(value)}' for project '{_shown(project)}'{state}?", True):
+            mapping.pop(project)
+    projects = sorted(cfg.get("projects") or {})
+    while ask_yes("Give a project a git account of its own?", False):
+        project = ask(f"  Which project ({', '.join(projects)})").strip()
+        if project not in projects:
+            print(f"  there is no project called '{_shown(project)}' on this machine")
+            continue
+        name = ask(f"  Git account for {project} ({', '.join(valid)})").strip()
+        if name not in valid:
+            print(f"  Pick one of: {', '.join(valid)}.")
+            continue
+        mapping[project] = name
+    if mapping:
+        cfg["project_git_accounts"] = mapping
+    else:
+        cfg.pop("project_git_accounts", None)
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     path = Path(args.config)
     cfg = load_config(path) if path.exists() else {"agents": {}, "projects": {}}
@@ -4712,6 +6102,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  added {pname}")
         else:
             print("  skipped: that folder doesn't exist")
+
+    ask_git_accounts(cfg)  # after the projects, so one added just now can have an account of its own
 
     save_config(path, cfg)
     print(f"\nSaved {path}. Agents: {', '.join(agents) or 'none yet'}.")
@@ -4796,6 +6188,21 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"\nCredits agent: none ({why})")
     else:
         print("\nCredits agent: none")
+    git = git_account_info(cfg)
+    accounts = git_accounts(cfg)[0]
+    if not (accounts or git["git_account_problems"] or git["default_git_account"] or git["project_git_accounts"]):
+        print("\nGit accounts: none")
+    else:
+        # Which credentials each account has, never their values (nor its commit name or email).
+        print("\nGit accounts:")
+        for name, account in sorted(accounts.items()):
+            print(f"  ok {name:<12} {account['host']:<24} {account['kind']:<7} {git_credentials(account)}")
+        for problem in git["git_account_problems"]:
+            print(f"  !! {problem}")
+        print(f"  default for every project: {git['default_git_account'] or 'none'}")
+        for project, name in sorted(git["project_git_accounts"].items()):
+            later = "" if project in cfg["projects"] else " (applies when that project is cloned)"
+            print(f"  default for {_shown(project)}: {name}{later}")
     print("\nProjects:")
     for name, p in sorted(cfg["projects"].items()):
         exists = "ok " if os.path.isdir(expand_path(p)) else "!! "
@@ -4850,9 +6257,9 @@ def cmd_test(args: argparse.Namespace) -> int:
                             "prompt": "Reply with exactly one word: pong", "options": {"timeout_min": 3}})
     job.run()
     if result.get("status") == "done":
-        print(f"\nOK — {args.agent} answered: {(result.get('result') or '').strip()[:200]}")
+        print(f"\nOK: {args.agent} answered: {(result.get('result') or '').strip()[:200]}")
         return 0
-    print(f"\nFAILED — {result.get('error')}")
+    print(f"\nFAILED: {result.get('error')}")
     return 1
 
 

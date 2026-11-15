@@ -313,6 +313,15 @@ class Delegation:
         # 1. Allowed by the owner, and not a subtask itself (depth 1).
         if not _opts(parent).get("delegate") or parent.get("delegated_by") or parent.get("kind") != "task":
             raise DelegationError("This job can't hand out subtasks.")
+        # A subtask gets no git account (the parent's isn't copied, and the runner applies no default): it
+        # uses the machine user's own git setup. The tool doesn't offer one; one passed anyway is refused
+        # rather than dropped, so the agent never thinks it got it.
+        if "git_account" in args:
+            raise DelegationError("A subtask can't pick a git account: it uses the machine's own git setup.")
+        # Nor MCP servers (the parent's aren't copied either): the tools of picked servers are allowed at every
+        # level, so an agent could give its subtask more than the owner's limit for subtasks allows.
+        if "mcp_add" in args or "mcp_only" in args:
+            raise DelegationError("A subtask can't pick MCP servers: it gets its agent's usual ones.")
         # 2. What and where.
         agent, prompt = _text(args.get("agent")), args.get("prompt")
         if not NAME_RE.fullmatch(agent):
@@ -438,6 +447,8 @@ class Delegation:
         intro = (f"This task comes from another AI agent (job #{parent['id']}, {parent.get('agent')} on "
                  f"{parent.get('runner')}), not directly from the user. Do only what it asks, within your own "
                  "permissions. Your final answer goes back to that agent.\n\n")
+        # Built fresh, so a subtask never writes a job summary and never starts from the handoff (hub/memory.py),
+        # whatever its parent asked for; the hub keeps no summary of a subtask either (app.runner_finish).
         options = {"timeout_min": timeout_min, "not_after": deadline, "capture_diff": autonomy != "readonly",
                    "delegated": True, "account": key, "needs": needs}
         child_id = self.db.create_job(

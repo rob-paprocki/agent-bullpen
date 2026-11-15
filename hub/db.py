@@ -25,7 +25,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
-from common import LOST_JOB_GRACE, MAX_TAGS, ONLINE_WINDOW, TAG_RE, clean_tags
+from common import LOST_JOB_GRACE, MAX_TAGS, ONLINE_WINDOW, TAG_RE, clean_tags, summary_refusal
 from credits import claim_route
 
 SCHEMA = """
@@ -106,7 +106,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_kind       TEXT,             -- e.g. 'quota', 'claude_limit' or 'credits', when the error is known
     named_agent      TEXT,             -- the agent the seat or subtask named, when it ran on credits instead
     credits          TEXT,             -- JSON: how platform credits were involved (hub/credits.py)
-    retry_of         INTEGER           -- a retry on credits: the job that stopped at a usage limit
+    retry_of         INTEGER,          -- a retry on credits: the job that stopped at a usage limit
+    summary_note     INTEGER           -- job summaries: the note its summary went to (the first job of a
+                                       -- conversation: the conversation's note, see Memory.save_summary)
 );
 
 CREATE INDEX IF NOT EXISTS jobs_queue  ON jobs(status, runner, kind);
@@ -169,7 +171,8 @@ JSON_FIELDS = {"agents", "projects", "running", "options", "meta", "info", "usag
 MIGRATIONS = {
     "jobs": {"model": "TEXT", "token_hash": "TEXT", "delegated_by": "INTEGER", "target_tag": "TEXT",
              "end_requested": "INTEGER DEFAULT 0", "usage": "TEXT", "usage_reported": "TEXT",
-             "error_kind": "TEXT", "named_agent": "TEXT", "credits": "TEXT", "retry_of": "INTEGER"},
+             "error_kind": "TEXT", "named_agent": "TEXT", "credits": "TEXT", "retry_of": "INTEGER",
+             "summary_note": "INTEGER"},
     "runners": {"info": "TEXT", "auth": "TEXT", "conflict_host": "TEXT", "conflict_at": "REAL",
                 "machine_tags": "TEXT", "accepted": "TEXT", "clock_skew": "REAL"},
 }
@@ -181,6 +184,7 @@ POST_MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS jobs_tag_queue ON jobs(status, target_tag)",
     "CREATE INDEX IF NOT EXISTS jobs_follow_up ON jobs(follow_up_of)",
     "CREATE INDEX IF NOT EXISTS jobs_retry ON jobs(retry_of)",
+    "CREATE INDEX IF NOT EXISTS jobs_summary_note ON jobs(summary_note)",
 ]
 MAX_LOG_LINES_PER_JOB = 5000
 TERMINAL_STATUSES = ("done", "error", "cancelled")
@@ -522,6 +526,20 @@ class Database:
     def job(self, job_id: int) -> dict | None:
         return self.query_one("SELECT * FROM jobs WHERE id=?", (job_id,))
 
+    def conversation_root(self, job_id: int) -> int:
+        """The first job of the conversation a job belongs to: back along follow_up_of, as far as the jobs
+        exist, and never onto a subtask: the owner's follow-up of one starts a conversation of its own, so its
+        summary's note never lands on the subtask's row (a subtask's summary is never kept). Each job follows an
+        older one, so the walk ends; the bound only guards it."""
+        with self.lock:
+            for _ in range(100_000):
+                row = self.conn.execute("SELECT p.id, p.delegated_by, p.options FROM jobs j "
+                                        "JOIN jobs p ON p.id = j.follow_up_of WHERE j.id=?", (job_id,)).fetchone()
+                if row is None or row["delegated_by"] or _options(row["options"]).get("delegated"):
+                    break
+                job_id = row["id"]
+        return job_id
+
     def children(self, parent_id: int) -> list[dict]:
         return self.query("SELECT * FROM jobs WHERE parent_id=? ORDER BY id", (parent_id,))
 
@@ -531,12 +549,13 @@ class Database:
         `offer` says what the machine offers, built by poll() from its last check-in:
             {"auth": "machine" | "shared", "tags": [effective tags],
              "agents": {name: {"account": account key, "features": [...]}},
-             "projects": [...], "accept_delegated": bool,
+             "projects": [...], "accept_delegated": bool, "git_accounts": bool (it reports them),
              "credits": None | {"agent", "org", "features", "subscription_agents"}}
         Two queries, so tag jobs can't starve jobs aimed at the machine by name:
           * named: the oldest queued job for this runner, machine actions first (a busy machine
             still answers them). A task that may hand out subtasks, or a subtask, is passed over on a
-            machine that didn't check in with its own runner token.
+            machine that didn't check in with its own runner token; a task whose agent lacks a
+            feature it needs, or with a git account picked on a machine that reports none, waits.
           * tag (tasks only, own token only): the oldest queued job for one of the machine's
             accepted tags, for one of its agents with the job's account key, in one of its
             projects, needing only features the agent has; a subtask only where
@@ -548,7 +567,8 @@ class Database:
         With offer["credits"] (the owner turned on "platform credits first" and the machine's credits
         agent's organization is available), a council step or subtask named for one of the machine's
         subscription agents runs on its credits agent instead (credits.claim_route), and the job keeps
-        the agent it named in named_agent."""
+        the agent it named in named_agent. A task with options.summarize whose agent (the one it runs on)
+        doesn't report the summary feature is handed out without it, with options.summary_skipped saying why."""
         offer = offer if isinstance(offer, dict) else {}
         own = offer.get("auth") == "machine"
         kinds = "('admin')" if admin_only else "('task', 'admin')"
@@ -559,7 +579,7 @@ class Database:
                 if _expired(row["options"], now):
                     self.update_job(row["id"], status="cancelled", finished_at=now, error=ADMIN_EXPIRED)
             for _ in range(CLAIM_TRIES):
-                named = self._named_job(runner, kinds, own)
+                named = self._named_job(runner, kinds, own, offer)
                 tagged = None if admin_only or not own else self._tag_job(offer)
                 if named is not None and (named["kind"] == "admin" or tagged is None or named["id"] < tagged["id"]):
                     pick = named
@@ -593,6 +613,21 @@ class Database:
                                                    (row["delegated_by"],)).fetchone()
                         parent_options = _options(parent["options"]) if parent else {"delegate_agents": []}
                     moved = claim_route(row or {}, offer["credits"], parent_options) or {}
+                if pick["kind"] == "task" and opts.get("summarize") is True:
+                    # Summarize jobs (the Memory page's switch) is dropped here for an agent that can't write a
+                    # summary: the job runs where it was going, without one, and says why. A ticked box puts the
+                    # feature in the needs of a task, and of the council steps in the session that writes the
+                    # council's summary (CouncilEngine._step), so their agent, the credits agent included
+                    # (credits.claim_route), always can.
+                    agent = moved.get("agent") or pick["agent"]
+                    agents = offer.get("agents") if isinstance(offer.get("agents"), dict) else {}
+                    entry = agents.get(agent) if isinstance(agents.get(agent), dict) else {}
+                    features = entry.get("features") if isinstance(entry.get("features"), list) else []
+                    if "summary" not in features:
+                        del opts["summarize"]
+                        opts["summary_skipped"] = summary_refusal(agent, runner, offer.get("version"),
+                                                                  offer.get("hub_version") or "")
+                        options_text = json.dumps(opts)
                 if moved:
                     cur = self.conn.execute(
                         "UPDATE jobs SET status='running', started_at=?, runner=?, options=?, agent=?, named_agent=?, "
@@ -606,15 +641,29 @@ class Database:
                     return self.job(pick["id"])
             return None
 
-    def _named_job(self, runner: str, kinds: str, own: bool) -> sqlite3.Row | None:
+    def _named_job(self, runner: str, kinds: str, own: bool, offer: dict) -> sqlite3.Row | None:
         """The oldest queued job aimed at this runner by name (machine actions first). Called with
-        the lock held. Tasks that hand out subtasks, and subtasks, need the machine's own token."""
-        for row in self.conn.execute(f"SELECT id, kind, options FROM jobs WHERE status='queued' AND kind IN {kinds} "
-                                     "AND runner=? ORDER BY kind='admin' DESC, id", (runner,)):
-            if row["kind"] == "task" and not own:
-                opts = _options(row["options"])
-                if opts.get("delegate") or opts.get("delegated"):
+        the lock held. Tasks that hand out subtasks, and subtasks, need the machine's own token. A
+        task waits, as a tag job does, until its agent has every feature in its needs, and a task,
+        clone or pull with a git account picked by name until the machine reports git accounts: a
+        runner put back to an older one after the job was queued would run it without them."""
+        agents = offer.get("agents") if isinstance(offer.get("agents"), dict) else {}
+        for row in self.conn.execute(f"SELECT id, kind, agent, options FROM jobs WHERE status='queued' "
+                                     f"AND kind IN {kinds} AND runner=? ORDER BY kind='admin' DESC, id", (runner,)):
+            opts = _options(row["options"])
+            if row["kind"] == "task":
+                if not own and (opts.get("delegate") or opts.get("delegated")):
                     continue
+                agent = agents.get(row["agent"]) if isinstance(agents.get(row["agent"]), dict) else {}
+                features = agent.get("features") if isinstance(agent.get("features"), list) else []
+                needs = opts.get("needs") if isinstance(opts.get("needs"), list) else []
+                if not set(needs) <= set(features):
+                    continue
+                pick = opts.get("git_account")
+            else:  # a clone or pull keeps its pick in its params
+                pick = opts.get("params").get("git_account") if isinstance(opts.get("params"), dict) else None
+            if pick not in (None, "", "-") and offer.get("git_accounts") is not True:
+                continue
             return row
         return None
 

@@ -339,8 +339,10 @@ def retry_target(job: dict, runner: dict | None, org_names: list[str], states: d
                  by_hand: bool = False) -> tuple[str | None, str | None, str]:
     """Where a task the owner started, which stopped at a subscription usage limit, may run again:
     (credits agent, org, "") or (None, None, why not). Once only, never for a live session, a
-    follow-up (its session belongs to the first agent), or a job that may have changed files unless
-    it was read only. `by_hand` (Retry on credits) skips the last rule and also runs in reserve."""
+    follow-up (its session belongs to the first agent), a job that may have changed files unless
+    it was read only, or a job with MCP servers picked for it (their tools are allowed even in read
+    only, so they may have changed things). `by_hand` (Retry on credits) skips the last two rules and
+    also runs in reserve."""
     opts = _opts(job)
     if job.get("kind") != "task" or job.get("parent_id") or job.get("delegated_by"):
         return None, None, "only tasks you started are retried"
@@ -367,4 +369,6 @@ def retry_target(job: dict, runner: dict | None, org_names: list[str], states: d
         return None, None, f"{agent} can't do what this task needs"
     if not by_hand and job.get("autonomy") != "readonly" and (not opts.get("capture_diff") or job.get("diff")):
         return None, None, "it may have changed files"
+    if not by_hand and (opts.get("mcp_add") or opts.get("mcp_only")):
+        return None, None, "its MCP servers may have changed things"
     return agent, org, ""

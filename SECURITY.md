@@ -54,6 +54,7 @@ can log in can do everything.
 | The **shared runner token** (`HUB_RUNNER_TOKEN`, for machines set up by hand) | `/etc/bullpen/hub.env`, and the `runner.json` of each machine that uses it | the same, for any machine name, except tasks that hand out subtasks and tasks for a tag, which only go to machines with their own token |
 | The hub's **MCP token** | every agent's settings on every machine | read and write the shared notes, and call every MCP server that goes through the hub, with your keys and sign-ins |
 | A **job token** | a file in `~/.bullpen/jobs/<job>/` on the machine running that job, only for jobs that ask before commands or hand out subtasks; removed when the job ends; the hub keeps only a fingerprint. Any program running as the runner's user on that machine can read it while the job runs, other jobs included | while that one job runs: read the job's own details; in jobs set to "ask me before commands", ask you a question on the dashboard (not answer it); in jobs allowed to hand out subtasks, list the machines you allowed and start up to 5 subtasks within that job's scope and limits, and read their answers |
+| A **git account's token** (and the path of its SSH key) | that machine's `~/.bullpen/runner.json`, readable only by its user. It never reaches the hub: the hub learns only the account's name, host and kind | sign in to that git host as the account, with whatever access the token has. While a job with that account runs, its token is in the agent's environment, so the agent can use it too |
 | **Your Claude account's sign-in** (claude.ai, the Claude app) | wherever you are signed in | while Remote Control runs on a machine: drive Claude in that project folder there, and approve its commands |
 | A one-time **enrollment code** | the command **Add a machine** shows | add a machine and get a runner token: so the same as a runner token, until it is used or its hour is up |
 
@@ -100,6 +101,9 @@ On the hub, readable only by root and the hub's service user:
   - shared notes;
   - the list of machines, the fingerprints of their tokens, the tags, plan-limit readings, account labels
     and Remote Control servers they report, and the tags and labels you accepted;
+  - for each task, the name of the git account and the MCP servers you picked (names only), and for each
+    machine the git accounts it reports: name, host and kind, and which are its defaults. Never a token, a
+    key path, a commit name or an email;
   - the MCP token;
   - the MCP servers with their keys and headers, OAuth sign-ins (access and refresh tokens) and your own
     OAuth apps' client secrets;
@@ -145,6 +149,47 @@ and API keys on each machine, in their own folders. The hub only starts them thr
 
   Each subtask is a job on the dashboard, titled "Subtask of #N", and its prompt says it comes from another
   agent.
+- **Git accounts.** A task, follow-up, council, clone or pull can use a named git account from the machine's
+  `runner.json` ([guide 5](docs/05-linux-and-macos-machines.md#git-accounts)). The runner gives that
+  account alone to the job for its host: a per-job SSH settings file, the machine's credential helpers for the
+  host switched off, and the token in an environment variable, never in a command line or a file. For a
+  `github` or `gitlab` account, `gh` and `glab` get its token, or are signed out when it has none; they never
+  use your own login. The kind comes from the host for `github.com` and `gitlab.com`, so set `kind` for a
+  GitHub or GitLab server of your own. Git can't ask a terminal or another program for a password in the
+  job, so an account without a token fails over HTTPS. The job doesn't start when something else would sign
+  in to the host first: a `~/.netrc` entry for the host or a `default` one (on Windows `_netrc` too), or, for a
+  task, a remote or a `url.<base>.insteadOf` setting with a user name or password for the host. The job's
+  log, answer and diff are masked with the token. What this does not do:
+  - The agent runs as you, with the token in its environment, so it can use it. Give the token only the
+    access the work needs.
+  - A command that an "ask me before commands" job shows you on the dashboard goes to the hub as the agent
+    wrote it. If it holds the account's token in plain text, the hub masks it only when the token has a known
+    prefix such as `ghp_`, `github_pat_` or `glpat-`.
+  - An SSH host alias in your own `~/.ssh/config` that points to the account's host still gets your own
+    setup. `core.sshCommand` and `GIT_SSH` are ignored in account jobs, and the log warns when they are set.
+    A path-specific `http.<url>.extraHeader` for one longer address still applies.
+  - Subtasks and Remote Control get no git account.
+  - A clone address with a user name or password in it is refused.
+  - The GitHub account rules are in [guide 1](docs/01-accounts-and-rules.md#git-hosts-github-gitlab-and-others).
+- **MCP servers picked for a task.** A task can add servers marked "on demand" or limit the agent to the
+  servers it lists ([guide 10](docs/10-shared-memory-and-mcp.md#servers-for-one-task-only)). Three things to
+  know:
+  - **The tools of picked servers are allowed at every level, Read only included.** The dashboard says so
+    where you pick: "Tools of the picked servers are allowed even in Read only." A job with picks is
+    never retried on credits by itself.
+  - **The agent program enforces the limit, not the hub.** The hub's relay at `/mcp/s/<name>` accepts the
+    shared MCP token from any agent, so a program holding the token can call any server routed through the hub,
+    whatever a task picked. Narrowing is Claude Code's `--strict-mcp-config`.
+  - **Subtasks never get a task's git account or MCP choice.** This stops an agent from giving itself tools
+    beyond the subtask limits.
+
+  The settings file written for a job holds the hub's MCP token and any key of a server added directly. It is
+  private to the runner's user and deleted when the job ends. Its secrets are masked in the job's log, answer
+  and diff: the job token and anything shaped like one, every value of 6 characters or more, and a shorter
+  one when its name or place marks it as a secret (a header value, a URL's password, `API_KEY=12345`,
+  `PIN=1234`). A short secret under an ordinary name (such as `CODE=1234`) isn't masked. Give a short secret
+  a name with `key`, `token`, `pin` and so on, or use a longer one
+  ([guide 10](docs/10-shared-memory-and-mcp.md#secrets-in-the-jobs-file)).
 - **Tags and account labels are claims a machine makes.** A machine reports its own tags and labels, so they
   count for tasks aimed at a tag and for subtasks only after you accept them on its page. The operating-system
   tag counts at once. A task for a tag runs under the one account it was made for, and only on a machine with

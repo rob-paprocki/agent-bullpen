@@ -45,7 +45,8 @@ Read `CONTRIBUTING.md` for the full rules; this file is the short version for wo
 - **Ordinary jobs keep their command line.** Extra flags appear only for jobs that use the feature.
 - **Escape everything in the dashboard** that comes from a runner, an agent or the user (`esc()`); no raw
   HTML from data.
-- **Keep paired copies in sync:** the secret patterns in `runner/runner.py` and `hub/redact.py`, and the
+- **Keep paired copies in sync:** the secret patterns and the clone-URL credentials check (`url_has_userinfo`,
+  `URL_AUTHORITY_RE`, `NO_URL_CREDENTIALS`) in `runner/runner.py` and `hub/redact.py`, and the
   hidden-character patterns in `hub/static/app.js` and `hub/approvals.py`. `tests/check_repo.py` compares
   the first pair.
 - **Names:** the product is "Agent Bullpen"; everything on disk is `bullpen` (`bullpen.service`,
@@ -101,4 +102,3 @@ the unit tests that cover it first; run the end-to-end test before you finish.
 - Versions follow SemVer: Fixed and Security notes make a patch, other notes a minor version, and
   `**Breaking**` entries or `### Removed` a major one. Upgrading steps that aren't breaking don't make a
   major version.
-- If `private/RELEASING.md` exists, follow it when asked to cut a release.

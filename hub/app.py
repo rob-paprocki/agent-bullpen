@@ -31,24 +31,26 @@ import secrets
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from approvals import Approvals, Refused as ApprovalRefused
+from approvals import HIDDEN_RE, Approvals, Refused as ApprovalRefused
 from common import ACCOUNT_RE, LOST_JOB_GRACE, MODEL_RE, NAME_RE, ONLINE_WINDOW, TAG_RE, Autonomy, TargetError, \
     accepted_of, account_key, agent_features, effective_tags, job_tools_for, own_token, permission_flags, public_job, \
-    reported_tags, runner_projects, tag_job_fits, tag_target, takes_subtasks, to_accept, valid_account_key, vtuple
-from council import MAX_DEBATE_PARTICIPANTS, MAX_REVIEWERS, CouncilEngine
+    reported_tags, runner_projects, summary_refusal, tag_job_fits, tag_target, takes_subtasks, to_accept, \
+    valid_account_key, vtuple
+from council import MAX_DEBATE_PARTICIPANTS, MAX_REVIEWERS, MCP_PICK_KEYS, CouncilEngine
 from db import Database
 from delegation import Delegation
 import delegation
-from memory import Memory
+from memory import HANDOFF_SUMMARIES, MAX_SUMMARY_CHARS, SUMMARIZE_JOBS, Memory, summary_scope, without_handoff
 from notify import Notifier
-from registry import Registry
+from redact import NO_URL_CREDENTIALS, redact, url_has_userinfo
+from registry import NAME_RE as MCP_NAME_RE, Registry
 import credits
 import limits
 import mcp_server
@@ -209,7 +211,11 @@ def retry_on_credits(job: dict, by_hand: bool = False) -> int:
         if agent is None:
             raise HTTPException(400, f"It can't be retried on platform credits: {why}.")
         opts = job["options"] if isinstance(job.get("options"), dict) else {}
-        keep = {k: opts[k] for k in ("timeout_min", "capture_diff", "needs", "title_typed") if k in opts}
+        # The credits agent is on the same machine, so the git account picked for the job means the same there.
+        # So do the MCP picks: the job's needs (kept) say the credits agent must take them (retry_target).
+        # And the job summaries: the retry writes the summary asked for, and its prompt (kept) has the handoff.
+        keep = {k: opts[k] for k in ("timeout_min", "capture_diff", "needs", "title_typed", "git_account",
+                                     "mcp_add", "mcp_only", "summarize", "handoff") if k in opts}
         new_id = db.create_job(
             kind="task", title=job["title"], runner=job["runner"], agent=agent, project=job["project"],
             autonomy=job["autonomy"], prompt=job["prompt"], model=job.get("model"), retry_of=job["id"],
@@ -221,8 +227,11 @@ def retry_on_credits(job: dict, by_hand: bool = False) -> int:
     return new_id
 
 
-councils = CouncilEngine(db, on_finish=council_finished)
 memory = Memory(db)
+# A council's seats start from the job summaries of the project their step runs in, when it asks.
+councils = CouncilEngine(db, on_finish=council_finished,
+                         handoff=lambda project, prompt, exclude_root: memory.handoff(summary_scope(project), prompt,
+                                                                                      exclude_root))
 _upstreams: dict | None = None  # the servers the hub proxies, rebuilt after every registry change
 
 
@@ -605,6 +614,120 @@ def check_target(runner_name: str, agent: str, project: str | None) -> None:
         raise HTTPException(400, f"Machine '{runner_name}' has no project called '{project}'.")
 
 
+# The git account picked for a task, follow-up, council, clone or pull (runner.json "git_accounts" on the
+# machine): "-" for none (the machine user's own git setup), else one of the names the machine reports. Each
+# machine names its own accounts, so only a job aimed at a machine by name can pick one, and subtasks never
+# do. A name only picks credentials on that machine: it never changes which machine, agent or AI account
+# runs the job.
+GIT_ACCOUNT_PATTERN = r"^(-|[a-z0-9][a-z0-9-]{0,31})$"
+GIT_ACCOUNT_RE = re.compile(GIT_ACCOUNT_PATTERN)
+# A task or follow-up may also send "" for "Default" (no account name is empty): nothing is stored, and a
+# follow-up goes back to the default instead of keeping the previous turn's pick.
+TASK_GIT_ACCOUNT_PATTERN = r"^(-|[a-z0-9][a-z0-9-]{0,31})?$"
+GIT_ACCOUNT_FOR_TAGS = "A git account can only be picked for a named machine."
+GIT_ACCOUNT_FOR_TAG_SEATS = "A git account can only be picked when every seat is a named machine."
+
+
+def reported_git_accounts(runner_name: str) -> list | None:
+    """The git accounts a machine reports (info.git_accounts), or None for a runner from before them."""
+    info = (db.runner(runner_name) or {}).get("info")
+    accounts = info.get("git_accounts") if isinstance(info, dict) else None
+    return accounts if isinstance(accounts, list) else None
+
+
+def check_git_account(runner_name: str, choice: str) -> None:
+    """Refuse a git account the machine doesn't report (info.git_accounts), and any choice at all on a
+    runner from before git accounts, which would ignore it."""
+    accounts = reported_git_accounts(runner_name)
+    if accounts is None:
+        raise HTTPException(409, f"{runner_name}'s runner is too old for git accounts: update it.")
+    if choice != "-" and choice not in {a.get("name") for a in accounts if isinstance(a, dict)}:
+        raise HTTPException(400, f"{runner_name} has no git account '{choice}'.")
+
+
+# The MCP servers picked for a task, follow-up or council, by their names on the MCP page: mcp_add adds
+# on-demand servers (left out of every agent's normal setup) for this job; mcp_only narrows the agent to the
+# listed servers, on-demand ones included (the hub's own bullpen server and the job tools always stay). The
+# runner gives them to the job, and allows their tools at every level, read only included: the hub only checks
+# and carries the choice. Claude Code agents only (they report mcp_pick), and never subtasks.
+MAX_MCP_PICKS = 20
+McpNames = Optional[list[Annotated[str, Field(pattern=MCP_NAME_RE.pattern)]]]
+MCP_PICK_TARGET = "claude"  # the kind of agent (an MCP page target) picks are for: Claude Code
+MCP_PICK_REFUSAL = ("Picking MCP servers works with Claude Code agents on an up-to-date runner ({agent} on {machine} "
+                    "can't).")
+MCP_PICK_SEAT_REFUSAL = ("A council can pick MCP servers only when every seat can. Picking works with Claude Code "
+                         "agents on an up-to-date runner ({agent} on {machine} can't).")
+# A subtask gets its agent's usual servers, so a task narrowed to some of them can't hand one out (that would
+# give back, through the subtask, a server the owner left out).
+MCP_ONLY_NO_SUBTASKS = ("A task that uses only some MCP servers can't hand out subtasks: a subtask would get its "
+                        "agent's usual servers. Turn off 'Only these servers' or 'May hand subtasks to other "
+                        "machines'.")
+
+
+def mcp_names(names: list[str] | None) -> list[str]:
+    """The names as given, each once."""
+    return list(dict.fromkeys(names or []))
+
+
+def check_mcp_pick(runner_name: str, agent: str, refusal: str = MCP_PICK_REFUSAL) -> None:
+    """The agent takes MCP picks (a Claude Code agent on an up-to-date runner)."""
+    require_feature(runner_name, agent, "mcp_pick", refusal.format(agent=agent, machine=runner_name))
+
+
+def mcp_pick_servers(add: list[str], only: list[str]) -> list[dict]:
+    """The MCP page's entries for the picked names. Refuses a name it doesn't have or has turned off, one
+    that isn't for Claude Code, and an added server that isn't on demand (agents have it already)."""
+    picked = []
+    for name in mcp_names(add + only):
+        server = registry.by_name(name)
+        if server is None:
+            raise HTTPException(400, f"There is no MCP server called '{name}' (see the MCP page).")
+        if not server["enabled"]:
+            raise HTTPException(400, f"The MCP server '{name}' is turned off on the MCP page.")
+        if name in add and not server["on_demand"]:
+            raise HTTPException(400, f"The MCP server '{name}' isn't on demand: agents have it already, so it can't "
+                                     "be added for a task.")
+        if MCP_PICK_TARGET not in server["targets"]:
+            raise HTTPException(400, f"The MCP server '{name}' isn't for Claude Code agents.")
+        picked.append(server)
+    return picked
+
+
+def check_mcp_platform(servers: list[dict], runner_name: str) -> None:
+    """For a machine by name: every picked server is for its platform. A job aimed at a tag isn't checked
+    here: the machine that takes it refuses a server it doesn't have."""
+    info = (db.runner(runner_name) or {}).get("info")
+    platform = info.get("platform") if isinstance(info, dict) else None
+    for server in servers:
+        if platform not in server["platforms"]:
+            raise HTTPException(400, f"The MCP server '{server['name']}' isn't for {runner_name}'s platform "
+                                     f"({platform or 'unknown'}).")
+
+
+# Job summaries (hub/memory.py), for a task, follow-up or council: `summarize` (the agent writes a summary when the
+# job is done, kept as the conversation's note) and `handoff` (the prompt starts from the project's newest summaries).
+# Absent: the Memory page's switches. A ticked Summarize box needs an agent that reports the summary feature: refused
+# otherwise, and also in the needs, as an MCP pick is: a task's, and a council's steps in the session that writes its
+# summary (its seat is checked when the council is made, see CouncilEngine._step). The switch never routes a job: the
+# machine that takes it skips the summary where the agent can't write one (Database.claim_next_job). The handoff is
+# the hub's own text, so any agent can get it. Never subtasks.
+def check_summary(runner_name: str, agent: str) -> None:
+    """A ticked Summarize box, for a machine by name: its agent can write a summary."""
+    require_feature(runner_name, agent, "summary",
+                    summary_refusal(agent, runner_name, (db.runner(runner_name) or {}).get("version"), VERSION))
+
+
+def check_summary_on_tag(tag: str, agent: str, project: str | None, account: str, needs: list[str]) -> None:
+    """A ticked Summarize box, for a tag: some machine with the tag has the agent, on the account already worked out
+    without the box, that can write a summary. So the box never picks the account."""
+    check_tag_target(tag, agent, project, account, needs=needs + ["summary"])
+
+
+def memory_settings() -> dict:
+    """The Memory page's two switches for job summaries."""
+    return {SUMMARIZE_JOBS: memory.flag(SUMMARIZE_JOBS), HANDOFF_SUMMARIES: memory.flag(HANDOFF_SUMMARIES)}
+
+
 def check_tag_target(tag: str, agent: str, project: str | None, account: str | None = None,
                      needs: Any = (), delegated: bool = False) -> str:
     """Check a job aimed at "any machine tagged `tag`" and return the account key it runs under
@@ -797,6 +920,12 @@ def state() -> dict:
         # Platform credits: "credits first" and, per machine with a credits agent, its state (from the
         # spend figures last fetched).
         "credits": credits_state(),
+        # The MCP servers a task, follow-up or council can pick (see MAX_MCP_PICKS): where each goes, and
+        # nothing else (no address, header, environment value or secret).
+        "mcp_servers": [{k: s[k] for k in ("name", "on_demand", "targets", "platforms", "enabled")}
+                        for s in registry.list()],
+        # The Memory page's switches for job summaries, which preset a task's, follow-up's and council's boxes.
+        "memory_settings": memory_settings(),
     }
 
 
@@ -834,6 +963,18 @@ class NewTask(BaseModel):
     delegate_projects: Literal["same", "any"] = "same"
     delegate_accounts: Optional[list[str]] = None
     delegate_agents: Optional[list[str]] = None
+    # The git account (check_git_account): absent or "" for the default (the project's, else the machine's,
+    # else none), "-" for none, or a name. Named machines only. A follow-up without it keeps the previous
+    # turn's ("-" after a subtask, which ran with none); "" takes it back to the default.
+    git_account: Optional[str] = Field(default=None, pattern=TASK_GIT_ACCOUNT_PATTERN)
+    # MCP servers for this task (see MAX_MCP_PICKS): on-demand servers to add, and the servers to narrow the
+    # agent to. Absent or empty: none. A follow-up without one keeps the previous turn's; [] turns it off.
+    mcp_add: McpNames = Field(default=None, max_length=MAX_MCP_PICKS)
+    mcp_only: McpNames = Field(default=None, max_length=MAX_MCP_PICKS)
+    # Job summaries (see check_summary): absent for the Memory page's switch. A follow-up never gets the handoff (it
+    # continues its session), even with the box ticked.
+    summarize: Optional[bool] = None
+    handoff: Optional[bool] = None
 
 
 @app.post("/api/tasks", dependencies=[Depends(require_user)])
@@ -863,34 +1004,89 @@ def create_task(body: NewTask) -> dict:
         # account are not copied.
         body.runner, body.agent, body.project = prev["runner"], prev["agent"], prev["project"]
         resume = prev["session_id"]
-    # What the machine's agent must support, for claiming the job.
+        prev_options = prev["options"] if isinstance(prev.get("options"), dict) else {}
+        if body.git_account is None:
+            # Not in the request: the previous turn's git account (none picked there: the default again),
+            # checked below like a new pick. A subtask ran with none, default included (R-A4), so a
+            # follow-up of one keeps none on a machine that knows git accounts (an older one applies none).
+            kept = prev_options.get("git_account")
+            if ((prev.get("delegated_by") or prev_options.get("delegated"))
+                    and reported_git_accounts(prev["runner"]) is not None):
+                kept = "-"
+            body.git_account = kept if isinstance(kept, str) else None
+        # The same for the MCP picks, each on its own (a subtask had none), checked below like new ones: one the
+        # agent or the MCP page can no longer give refuses the follow-up, which never runs without it.
+        for key in MCP_PICK_KEYS:
+            kept = prev_options.get(key)
+            if getattr(body, key) is None and isinstance(kept, list):
+                setattr(body, key, [n for n in kept if isinstance(n, str)])
+    if body.git_account == "":
+        body.git_account = None  # "Default": nothing stored, and a follow-up doesn't keep the previous pick
+    mcp_add, mcp_only = mcp_names(body.mcp_add), mcp_names(body.mcp_only)
+    picking = bool(mcp_add or mcp_only)
+    if body.delegate and mcp_only:  # a kept narrowing counts too
+        raise HTTPException(400, MCP_ONLY_NO_SUBTASKS)
+    # What the machine's agent must support, for claiming the job (and for a retry on credits).
     needs = ((["approvals"] if body.autonomy == "ask" else []) + (["live"] if body.live else [])
-             + (["job_mcp"] if body.delegate else []))
+             + (["job_mcp"] if body.delegate else []) + (["mcp_pick"] if picking else []))
+    summarize = memory.flag(SUMMARIZE_JOBS) if body.summarize is None else body.summarize
+    handoff = not body.follow_up_of and (memory.flag(HANDOFF_SUMMARIES) if body.handoff is None else body.handoff)
     options: dict[str, Any] = {"timeout_min": body.timeout_min, "capture_diff": body.capture_diff}
     if tag:
+        if body.git_account is not None:
+            raise HTTPException(400, GIT_ACCOUNT_FOR_TAGS)
+        if picking:
+            # The agent is checked through needs; the machine that takes the job checks the platform.
+            mcp_pick_servers(mcp_add, mcp_only)
         check_autonomy(body.autonomy, None, body.agent)
         if body.delegate:
             options.update(delegation_options(body, None, body.agent))
         options["account"] = check_tag_target(tag, body.agent, body.project, (body.account or "").strip() or None,
                                               needs=needs)
+        if body.summarize:
+            check_summary_on_tag(tag, body.agent, body.project, options["account"], needs)
     else:
         check_target(body.runner, body.agent, body.project)
+        if body.git_account is not None:
+            check_git_account(body.runner, body.git_account)
+            options["git_account"] = body.git_account
+        if picking:
+            check_mcp_pick(body.runner, body.agent)
+            check_mcp_platform(mcp_pick_servers(mcp_add, mcp_only), body.runner)
         check_autonomy(body.autonomy, body.runner, body.agent)
         if body.live:
             check_live(body.runner, body.agent)
         if body.delegate:
             options.update(delegation_options(body, body.runner, body.agent))
+        if body.summarize:
+            check_summary(body.runner, body.agent)
+    if body.summarize:
+        needs.append("summary")  # the box ticked: never run without it
+    # Run again (the job page) sends back the prompt the job had, its handoff included: only the owner's own part is
+    # kept, so notes never come back as the owner's text or twice (the handoff below is made afresh, when asked).
+    prompt = without_handoff(body.prompt)
+    if not prompt.strip():
+        raise HTTPException(400, "Write a prompt.")
     typed = (body.title or "").strip()
-    title = typed or body.prompt.strip().splitlines()[0][:80]
+    title = typed or prompt.strip().splitlines()[0][:80]
     if typed:
         options["title_typed"] = True  # the owner typed it, so a notification may show it
     if body.live:
         options.update(live=True, idle_min=body.idle_min)
+    if mcp_add:
+        options["mcp_add"] = mcp_add
+    if mcp_only:
+        options["mcp_only"] = mcp_only
+    if summarize:
+        options["summarize"] = True
+    if handoff:
+        options["handoff"] = True
+        prompt = memory.handoff(summary_scope(body.project), prompt)
     if needs:
         options["needs"] = needs
     job_id = db.create_job(
         kind="task", title=title, runner=None if tag else body.runner, target_tag=tag, agent=body.agent,
-        project=body.project, autonomy=body.autonomy, prompt=body.prompt, resume_session=resume, model=model,
+        project=body.project, autonomy=body.autonomy, prompt=prompt, resume_session=resume, model=model,
         follow_up_of=body.follow_up_of, options=options,
     )
     return {"id": job_id}
@@ -919,6 +1115,15 @@ class NewCouncil(BaseModel):
     fix: bool = True                   # review: let the builder answer the reviews
     autonomy: Autonomy = "edits"       # review: what the builder may do
     timeout_min: int = Field(default=60, ge=1, le=24 * 60)
+    # The git account for every step (see NewTask): every seat must be a named machine that reports it.
+    git_account: Optional[str] = Field(default=None, pattern=GIT_ACCOUNT_PATTERN)
+    # The MCP servers for every step (see NewTask): every seat's agent must take them.
+    mcp_add: McpNames = Field(default=None, max_length=MAX_MCP_PICKS)
+    mcp_only: McpNames = Field(default=None, max_length=MAX_MCP_PICKS)
+    # Job summaries (see check_summary and CouncilEngine): one summary, of the last step (a ticked box needs the judge's
+    # or the builder's agent to write one), and the handoff in every seat's first prompt.
+    summarize: Optional[bool] = None
+    handoff: Optional[bool] = None
 
 
 @app.post("/api/councils", dependencies=[Depends(require_user)])
@@ -939,6 +1144,13 @@ def create_council(body: NewCouncil) -> dict:
         if not body.builder.project:
             raise HTTPException(400, "The builder needs a project to work in.")
         seats = [body.builder] + body.reviewers
+    # MCP picks hold for every step only if every seat's agent (the judge's too) takes them: a council of
+    # Claude Code and Gemini agents runs without picks.
+    mcp_add, mcp_only = mcp_names(body.mcp_add), mcp_names(body.mcp_only)
+    picks = mcp_pick_servers(mcp_add, mcp_only) if mcp_add or mcp_only else []
+    body.mcp_add, body.mcp_only = mcp_add or None, mcp_only or None  # each name once, in the council's options
+    # The seat whose step is the council's last, which writes its summary.
+    writer = body.judge if body.mode == "debate" else body.builder
     for seat in seats:
         seat.runner = seat.runner.strip()
         seat.tag = (seat.tag or "").strip().lower() or None
@@ -947,17 +1159,31 @@ def create_council(body: NewCouncil) -> dict:
         seat.model = check_model(seat.model)
         if seat.runner:
             check_target(seat.runner, seat.agent, seat.project)
+            if body.git_account is not None:
+                check_git_account(seat.runner, body.git_account)
+            if picks:
+                check_mcp_pick(seat.runner, seat.agent, MCP_PICK_SEAT_REFUSAL)
+                check_mcp_platform(picks, seat.runner)
+            if body.summarize and seat is writer:
+                check_summary(seat.runner, seat.agent)
             seat.account = None
         else:
+            if body.git_account is not None:
+                raise HTTPException(400, GIT_ACCOUNT_FOR_TAG_SEATS)
             # The builder of a build + review that asks before commands needs agents that can ask.
             ask = body.mode == "review" and seat is body.builder and body.autonomy == "ask"
             # A step without a project of its own runs in chat (CouncilEngine._step).
+            needs = (["approvals"] if ask else []) + (["mcp_pick"] if picks else [])
             seat.account = check_tag_target(seat.tag, seat.agent, seat.project or "chat",
-                                            (seat.account or "").strip() or None,
-                                            needs=["approvals"] if ask else [])
+                                            (seat.account or "").strip() or None, needs=needs)
+            if body.summarize and seat is writer:
+                check_summary_on_tag(seat.tag, seat.agent, seat.project or "chat", seat.account, needs)
     if body.mode == "review":
         check_autonomy(body.autonomy, body.builder.runner or None, body.builder.agent)
     spec: dict[str, Any] = body.model_dump()
+    spec["summarize"] = memory.flag(SUMMARIZE_JOBS) if body.summarize is None else body.summarize
+    spec["summary_box"] = body.summarize is True  # the box ticked: the writer's steps need the feature
+    spec["handoff"] = memory.flag(HANDOFF_SUMMARIES) if body.handoff is None else body.handoff
     council_id = councils.create(spec)
     return {"id": council_id}
 
@@ -1373,7 +1599,9 @@ ADMIN_ACTIONS = {
     "rc.start": "Start Remote Control",
     "rc.stop": "Stop Remote Control",
 }
-GIT_URL_RE = re.compile(r"^(https://|ssh://|git@)[^\s'\"`$;|&<>]+$")
+GIT_URL_RE = re.compile(r"^(?:(?:https|ssh)://|git@)[^/\s'\"`$;|&<>][^\s'\"`$;|&<>]*$")
+
+
 # Check limits runs Claude Code's /usage at most once in this many seconds for one agent, and for
 # one account (on any machine).
 USAGE_CHECK_EVERY = 300
@@ -1586,6 +1814,17 @@ def queue_admin(runner: dict, action: str, params: dict[str, str]) -> int:
             raise HTTPException(400, "The 'chat' project is built in.")
         if action == "project.clone" and not GIT_URL_RE.match(params.get("url", "")):
             raise HTTPException(400, "Use an https://, ssh:// or git@ repository address.")
+        if action == "project.clone" and url_has_userinfo(params.get("url", "")):
+            raise HTTPException(400, NO_URL_CREDENTIALS)
+        if action in ("project.clone", "project.pull"):
+            # The git account to clone or pull with; left empty, the default (the runner gets none).
+            choice = params.pop("git_account", "")
+            if choice:
+                if not GIT_ACCOUNT_RE.fullmatch(choice):
+                    raise HTTPException(400, "That isn't a git account name: use 1 to 32 lowercase letters, digits "
+                                             "or dashes, starting with a letter or digit, or '-' for none.")
+                check_git_account(name, choice)
+                params["git_account"] = choice
     if action == "runner.update":
         if not info.get("remote_update"):
             raise HTTPException(400, f"{name} doesn't allow updates from the dashboard "
@@ -1769,6 +2008,26 @@ def add_note(body: NoteIn) -> dict:
         raise HTTPException(400, str(err))
 
 
+class MemorySettingsIn(BaseModel):
+    # The Memory page's switches for job summaries (see check_summary); a switch left out stays as it is.
+    summarize_jobs: Optional[bool] = None
+    handoff_summaries: Optional[bool] = None
+
+
+# Declared before /api/notes/{note_id}, which would otherwise take "settings" for a note's id.
+@app.get("/api/notes/settings", dependencies=[Depends(require_user)])
+def get_memory_settings() -> dict:
+    return memory_settings()
+
+
+@app.post("/api/notes/settings", dependencies=[Depends(require_user)])
+def save_memory_settings(body: MemorySettingsIn) -> dict:
+    for key, on in body.model_dump().items():
+        if on is not None:
+            memory.set_flag(key, on)
+    return memory_settings()
+
+
 @app.put("/api/notes/{note_id}", dependencies=[Depends(require_user)])
 def edit_note(note_id: int, body: NoteUpdate) -> dict:
     try:
@@ -1819,6 +2078,7 @@ class McpServerIn(BaseModel):
     targets: list[str] = ["claude", "gemini", "antigravity"]
     platforms: list[str] = ["linux", "macos", "windows"]
     enabled: bool = True
+    on_demand: bool = False
     note: str = ""
     route: Optional[Literal["hub", "direct"]] = None
     auth: Literal["headers", "oauth"] = "headers"
@@ -2404,7 +2664,9 @@ def runner_search_notes(body: RunnerSearch) -> dict:
 
 
 class ContextAsk(BaseModel):
-    features: list[str] = []  # what the runner understands; "hub-route": servers relayed by the hub
+    # What the runner understands: "hub-route", servers relayed by the hub; "on-demand", servers only for the
+    # jobs that pick them.
+    features: list[str] = []
 
 
 @app.post("/api/runner/context", dependencies=[Depends(require_runner)])
@@ -2413,8 +2675,12 @@ def runner_context(body: ContextAsk = ContextAsk()) -> dict:
     server, the central MCP list and the agent add-ons."""
     # Servers relayed by the hub have no address of their own in this list; a runner that doesn't
     # know that would write them with an empty URL, so it doesn't get them (until it updates).
+    # In the same way, a runner that doesn't know on-demand servers would wire them into every
+    # agent's own setup, so it doesn't get them either.
     relay = proxy is not None and "hub-route" in body.features
-    servers = [s for s in registry.for_runners() if s["route"] != "hub" or relay]
+    on_demand = "on-demand" in body.features
+    servers = [s for s in registry.for_runners()
+               if (s["route"] != "hub" or relay) and (not s["on_demand"] or on_demand)]
     return {"version": context_token(), "files": memory.context_files(),
             "mcp_enabled": hub_mcp is not None, "mcp_token": mcp_token(),
             "servers": servers, "kit": KIT,
@@ -2457,15 +2723,19 @@ class Poll(BaseModel):
 def claim_offer(name: str, auth: RunnerAuth) -> dict:
     """What a machine offers for claiming jobs (Database.claim_next_job), from its last check-in:
     whether this poll came with its own runner token, its accepted tags, each agent's account key
-    and features, its projects, and whether it takes subtasks."""
+    and features, its projects, whether it takes subtasks, whether it reports git accounts, and its
+    version next to the hub's (why a job's summary is skipped, common.summary_refusal)."""
     row = db.runner(name) or {"name": name}
     agents = {a["name"]: {"account": account_key(row, a["name"]), "features": agent_features(row, a["name"])}
               for a in row.get("agents") or [] if isinstance(a, dict) and isinstance(a.get("name"), str)}
     # Platform credits first: the machine's credits agent, while its organization is available.
     plan = credits.plan(row, usage.org_names(), credit_states()) if credit_settings()["first"] else None
+    info = row.get("info") if isinstance(row.get("info"), dict) else {}
     # The poll's own token decides (a machine with its own token can't poll with the shared one).
     return {"auth": "machine" if auth.kind == "machine" else "shared", "tags": effective_tags(row), "agents": agents,
-            "projects": runner_projects(row), "accept_delegated": takes_subtasks(row), "credits": plan}
+            "projects": runner_projects(row), "accept_delegated": takes_subtasks(row), "credits": plan,
+            "git_accounts": isinstance(info.get("git_accounts"), list), "version": row.get("version"),
+            "hub_version": VERSION}
 
 
 @app.post("/api/runner/poll")
@@ -2593,10 +2863,30 @@ class Finish(BaseModel):
     # know would leave the runner retrying it for half an hour.
     usage: Any = None          # the tokens the agent reported (runner/runner.py UsageTracker.total)
     error_kind: Any = None     # "claude_limit" or "quota" at a usage limit, "credits" when credits ran out
+    summary: Any = None        # job summaries: the agent's summary (at most 2,000 characters, masked by the runner)
 
 
 # The error kinds the dashboard shows in their own way; anything else a runner sends is dropped.
 ERROR_KINDS = ("claude_limit", "quota", "credits")
+
+
+def save_job_summary(job: dict, summary: str) -> None:
+    """Keep the summary a runner sent for a job that asked for one: masked again here (hub/redact.py), then cut to
+    MAX_SUMMARY_CHARS, as its conversation's note in its project's scope (Memory.save_summary). A summary that
+    can't be kept is said in the job's log; it never stops the job from finishing."""
+    try:
+        # First out: characters that hide text (approvals.HIDDEN_RE: control, bidi, zero-width and tag characters),
+        # all but line breaks and tabs. A handoff must say only what the job page shows of it.
+        summary = HIDDEN_RE.sub(lambda m: m.group() if m.group() in "\n\t" else "", summary)
+        text = redact(summary).strip()[:MAX_SUMMARY_CHARS].rstrip()  # masked before the cut, so no secret is cut in half
+        if not text:
+            return
+        note_id = memory.save_summary(db.conversation_root(job["id"]), text, summary_scope(job.get("project")),
+                                      f"job #{job['id']} {job.get('agent')}@{job.get('runner')}")
+        db.update_job(job["id"], summary_note=note_id)
+    except Exception as err:  # noqa: BLE001 - a summary must never stop the job from finishing
+        log.warning("job %s: summary not saved: %s", job["id"], err)
+        db.append_logs(job["id"], [f"Summary not saved to shared memory: {err}"])
 
 
 def usage_baseline(job: dict) -> dict | None:
@@ -2636,6 +2926,11 @@ def runner_finish(job_id: int, body: Finish, auth: RunnerAuth = Depends(require_
     db.update_job(job_id, status=body.status, exit_code=body.exit_code, result=body.result,
                   error=body.error, diff=body.diff, session_id=body.session_id,
                   finished_at=time.time(), **fields)
+    opts = job["options"] if isinstance(job.get("options"), dict) else {}
+    # Only a job that asked for a summary (as it was handed out) and is done; never a subtask's.
+    if body.status == "done" and job["kind"] == "task" and opts.get("summarize") is True \
+            and not (job.get("delegated_by") or opts.get("delegated")) and isinstance(body.summary, str):
+        save_job_summary(job, body.summary)
     if job["parent_id"]:
         councils.advance(job["parent_id"])
     if body.status in ("done", "error") and top_level_task(job):

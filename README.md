@@ -4,7 +4,9 @@
 
 **One self-hosted dashboard for the AI coding agents on all your machines.**
 
-[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/rob-paprocki/agent-bullpen)](https://github.com/rob-paprocki/agent-bullpen/releases)
+[![Licence: MIT](https://img.shields.io/github/license/rob-paprocki/agent-bullpen)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/rob-paprocki/agent-bullpen)](https://github.com/rob-paprocki/agent-bullpen/commits/main)
 [![CI](https://github.com/rob-paprocki/agent-bullpen/actions/workflows/ci.yml/badge.svg)](https://github.com/rob-paprocki/agent-bullpen/actions/workflows/ci.yml)
 [![Hub: Python 3.11+](https://img.shields.io/badge/hub-Python%203.11%2B-3776AB)](#requirements-and-sizing)
 [![Runner: Python 3.9+](https://img.shields.io/badge/runner-Python%203.9%2B-3776AB)](#requirements-and-sizing)
@@ -73,6 +75,8 @@ macOS or Windows machines for the agents, and your own Claude subscription or AP
 | Any number of accounts | Several Claude logins per machine, Gemini CLI with an API key, and other programs as "text" agents ([guide 11](docs/11-adding-agents.md)). |
 | [Shared memory](docs/10-shared-memory-and-mcp.md#shared-memory) | `/remember` in any agent saves a note every agent can find. Pinned notes go into every agent's own memory file. |
 | [One MCP list](docs/10-shared-memory-and-mcp.md#the-central-mcp-list) | Add an MCP server once on the hub, and every agent gets it. Keys and OAuth sign-ins stay on the hub. |
+| [Git accounts](docs/05-linux-and-macos-machines.md#git-accounts) | Name several GitHub, GitLab or other git logins on a machine, and pick one per task, follow-up, clone or pull. A job uses only that login for its host. |
+| [MCP servers per task](docs/10-shared-memory-and-mcp.md#servers-for-one-task-only) | MCP servers are add-on tools an agent can call. Keep a risky one off every agent, add it to one task, or limit a task to the servers you tick. |
 | [Plan limits](docs/08-daily-use.md#usage) | Each Claude account's 5-hour and weekly limits, and the tokens each job used. For planning only: the hub never switches accounts. |
 | [Platform credits](docs/08-daily-use.md#platform-credits) | The Usage page estimates what is left of the monthly API credits some Claude plans include. If you turn it on, council steps, subtasks and a task stopped by a usage limit can run on a machine's API-key "credits agent" ([terms](#terms-and-accounts)). |
 | [Machine management](docs/08-daily-use.md#a-machines-own-page) | Clone and pull projects, and update every runner, from the dashboard. |
@@ -93,6 +97,14 @@ This is the short version of [guide 2](docs/02-architecture.md). The hub never c
 Each runner asks the hub for work, so the machines need no open ports. The agents talk to their providers
 directly, with the logins on that machine. The hub does no AI work itself.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-fits-together-dark.svg">
+  <img alt="You open the dashboard on the hub. Runners on Linux, macOS and Windows machines ask the hub for work and start the agents, which sign in to their AI providers directly." src="docs/images/how-it-fits-together-light.svg">
+</picture>
+
+<details>
+<summary>Diagram source (Mermaid)</summary>
+
 ```mermaid
 flowchart LR
   you["You<br/>(browser or phone)"] -- "dashboard: LAN, VPN or tunnel" --> hub
@@ -110,6 +122,8 @@ flowchart LR
   a1 -. "own logins" .-> prov["AI providers"]
   a2 -. "own logins" .-> prov
 ```
+
+</details>
 
 ## Requirements and sizing
 
@@ -218,7 +232,7 @@ did and the log lines. Remove passwords, tokens, API keys and enrollment codes f
 Help is welcome. A report from real hardware helps most, even when everything worked: a Proxmox VE host, a
 Mac, a Fedora or Arch machine, or Windows 10. Small fixes to the guides need no issue. For another agent CLI,
 open an issue first. [CONTRIBUTING.md](CONTRIBUTING.md) has the ground rules, the checks and how to set up a
-development copy. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
+development copy. Development happens in a separate repository. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 <details>
 <summary><b>What's in this repository</b></summary>

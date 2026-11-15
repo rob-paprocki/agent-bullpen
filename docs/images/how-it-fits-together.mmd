@@ -1,0 +1,15 @@
+flowchart LR
+  you["You<br/>(browser or phone)"] -- "dashboard: LAN, VPN or tunnel" --> hub
+  subgraph hubhost["Proxmox container, or any Debian/Ubuntu machine"]
+    hub["Agent Bullpen<br/>tasks, councils, memory, MCP relay"]
+  end
+  subgraph lin["Linux and macOS machines (any number)"]
+    r1["runner"] --> a1["Claude Code (one or more accounts)<br/>Gemini CLI, other agent CLIs"]
+  end
+  subgraph win["Windows machines (any number)"]
+    r2["runner"] --> a2["Claude Code (one or more accounts)<br/>Gemini CLI, other agent CLIs"]
+  end
+  r1 -- "asks for work" --> hub
+  r2 -- "asks for work" --> hub
+  a1 -. "own logins" .-> prov["AI providers"]
+  a2 -. "own logins" .-> prov

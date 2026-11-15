@@ -100,6 +100,11 @@ Click a machine's name to manage it without going to it:
   agents that can't run it (an API key, a `setup-token` login) are listed with the reason.
 - **Projects:** every folder it offers, with **Pull** (`git pull --ff-only`) and **Remove**. Remove only stops
   offering the folder; nothing is deleted.
+- **Git accounts:** each account the machine has, with its host and kind, and the projects and machine it is
+  the default for. Never a key or token. Accounts are set on the machine itself
+  ([guide 5](05-linux-and-macos-machines.md#git-accounts)). A notice at the top of the page lists any account
+  that can't be used and any default that names none: a job, clone or pull that would use a broken default
+  doesn't start until it is fixed.
 - **Clone a git repository** or create a **new empty project**. New projects always go inside that machine's
   projects folder (`~/projects`, or `C:\Users\<you>\projects` on Windows). Project folders elsewhere on the
   disk can only be added on the machine itself. (That guards against mistakes. It won't stop a determined
@@ -126,6 +131,9 @@ If you don't want a machine to be managed remotely, answer "no" to those two que
    a different account on different machines with that tag, an **Account** box appears: choose one. The
    task waits for a machine with that account rather than run under another one. Only machines with their
    own runner token take tasks for a tag.
+   Under the agent you may also see a **Git account** box and an **MCP servers** box
+   ([below](#picking-a-git-account-and-mcp-servers)), and boxes for summaries
+   ([below](#summaries-and-recent-summaries)).
 2. Pick what the agent may do:
    - **Read only** is the default. Use it for questions, explanations and reviews.
    - **Edit files** lets it change files in the project. Tick "show me a diff" to see the changes afterwards.
@@ -152,6 +160,94 @@ Example uses:
 - `build-box · claude-work · myapp · Full auto`: "Run the test suite and fix whatever makes it fail."
 - `desktop · gemini · chat · Read only`: "Compare WireGuard and Tailscale for remote access to a Proxmox node."
 - `Any machine tagged gpu · claude · myapp · Edit files`: "Profile the training script and make it faster."
+
+### Picking a git account and MCP servers
+
+Two boxes on New task, on a follow-up and on a council choose more than the agent and the level. Each shows
+only when it has something to offer.
+
+**Git account.** It shows for a task aimed at a machine by name, when that machine has git accounts in its
+`runner.json` ([guide 5](05-linux-and-macos-machines.md#git-accounts)) or a problem with one. The choices:
+
+- **Default** is the project's account, else the machine's, if it has either.
+- Each account, as its name and host.
+- **None** is the machine user's own git setup, as before git accounts.
+
+A task for "Any machine tagged …" has no git account box, because each machine names its own accounts.
+
+The job's page shows the choice in the line with the agent and the machine: `git account: <name>`,
+`git account: none`, or, on a machine with git accounts, `git account: default`. A subtask shows
+`git account: none (subtask)`. The log's first lines name the account the job used:
+`Git account: <name> (<host>)`.
+
+A **follow-up** shows the box set to its job's choice, and you can change it. This is how you switch git
+accounts in the middle of a conversation. The machine, the agent and the AI login stay the same: nothing
+here changes which Claude or Gemini account does the work. A follow-up of a subtask keeps none, because a
+subtask never gets a git account.
+
+A **council** has one box, **Git account for every step**. It lists only the accounts that every seat's
+machine has, and it is missing when a seat is aimed at a tag.
+
+**MCP servers.** It shows for Claude Code agents on an up-to-date runner. MCP servers give an agent extra
+tools. The central list is in [guide 10](10-shared-memory-and-mcp.md#servers-for-one-task-only). The box has two
+parts:
+
+- **Add for this task** lists the servers marked **Only for tasks that pick it** on the MCP page. Agents
+  don't have them otherwise. Ticked ones are added for this task.
+- **Only these servers** is a switch. When it is on, you tick the servers the agent may use, and it uses no
+  others. The box warns: "This agent's own Claude Code servers are left out." The hub's own `bullpen` memory
+  server and the job's own tools stay. With the switch on and nothing ticked, **Send** says "Tick at least
+  one server under "Only these servers", or turn it off."
+
+**Warning: picked servers work in Read only too.** The box says it, and so does the job's page: "Tools of
+the picked servers are allowed even in Read only." The tools of every server you add or keep are allowed at
+every level, without asking. Pick servers only for tasks whose input you trust, and think twice before you
+pick a server that can change things when the task is meant to be read only.
+
+More about picks:
+
+- A follow-up shows the last turn's picks and keeps them unless you change them. A server that is no longer
+  offered stays ticked and says "not available now", so the follow-up is refused rather than run without it.
+- A task that uses only some servers can't hand out subtasks, and a subtask never gets a git account or MCP
+  servers of its own. The hub refuses both.
+- A council can pick servers only when every seat's agent can.
+- A task with picked servers is never retried on credits by itself, even in Read only, because the tools may
+  have changed things. **Retry on credits** on the job's page still works.
+- The choice is enforced by Claude Code on the machine, not by the hub
+  ([guide 10](10-shared-memory-and-mcp.md#servers-for-one-task-only)).
+- Gemini CLI agents can't pick servers yet.
+
+**Clone and pull.** The machine's page has the same box for a clone, and **Git account for Pull** for the
+**Pull** buttons. The default works as above. A clone or pull that can't use the account (the address is on
+another host, say) stops with a message that says why
+([guide 9](09-troubleshooting.md#git-accounts-and-mcp-picks)).
+
+### Summaries and recent summaries
+
+New task, a follow-up and a council have up to two more boxes. They start out as the two switches on the
+Memory page say ([guide 10](10-shared-memory-and-mcp.md#job-summaries)), which are both off at first.
+
+- **Save a summary of this job to shared memory.** When the job is done, the agent writes a short summary
+  into the Memory page. It is one extra short turn on the same AI account, so it costs like one more turn.
+  The box shows only for agents that can write one (Claude Code and Gemini CLI agents on an up-to-date
+  runner). For another agent the box is missing, and a line says so while the switch is on.
+- **Start from the project's recent summaries.** The hub puts the newest three summaries of the project in
+  front of your prompt, as context and not as instructions. Any agent can get this. A follow-up has no such
+  box, because it continues a session that already has the context.
+
+A box you leave as it was drawn does what the switch says. A box you change wins over the switch for this
+one job. A council has one summary, written by the judge or the builder, so the box follows that seat's
+agent. A subtask never gets either.
+
+Ticking **Save a summary…** for an agent that can't write one is refused. A switch that is on is skipped for
+such an agent, and nothing else changes: the job runs on the same machine and account.
+
+The job's page says what happened to the summary: "Summary saved to shared memory (note #12)", or "No
+summary:" and the reason. For a council, this line is on the page of the step that wrote the summary: the
+judge's, or the builder's fix or build step. A task that starts from earlier summaries shows
+"starts with the project's recent summaries" in its first line, and **Prompt** has the whole text. A
+council's page shows "asked to start from the project's recent summaries".
+**Run again…** fills in only your own prompt and the same two boxes.
 
 ### Letting an agent hand out subtasks
 
@@ -306,6 +402,9 @@ below it:
    - if **fix** is ticked, the builder checks each finding against the code, fixes the valid ones and
      explains which it rejected.
 
+A council can also carry one git account and one set of MCP servers for every step
+([above](#picking-a-git-account-and-mcp-servers)).
+
 Any seat can be **Any machine tagged …** instead of one machine, as on New task. A builder aimed at a tag
 builds on the first free machine with that tag. A reviewer on that same machine opens the real files, and
 the fix step goes back to the machine that built, where its session is. The result's "who was who" names the
@@ -326,7 +425,8 @@ ten. Councils are for things worth that. Several runs at once on one subscriptio
 ### Memory and MCP
 
 - **Memory** shows every shared note. You can search, add, edit, pin and delete them there. Agents add
-  notes with `/remember`.
+  notes with `/remember`. The two switches for job summaries are at the top, and **Job summaries only**
+  shows just the notes that jobs left.
 - **MCP** is the central list of MCP servers every agent gets, plus the hub's own `bullpen` memory server.
 
 Both are explained in [guide 10](10-shared-memory-and-mcp.md).

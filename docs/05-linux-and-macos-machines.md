@@ -325,6 +325,165 @@ For it to count:
 `runner.py list` shows the credits agent, and the machine's page on the dashboard shows it with its
 organization's state.
 
+## Git accounts
+
+A **git account** is a named git login on this machine: a commit name and email, an SSH key, an HTTPS token,
+or a mix. You pick one for a task, a follow-up, a council, a clone or a pull
+([guide 8](08-daily-use.md#picking-a-git-account-and-mcp-servers)). Without accounts, jobs use the machine
+user's own git setup, as before.
+
+A git account only picks credentials on this machine. Which machine, agent or AI account runs a job stays
+as it was. Check your git host's rules before you set up a second account on it
+([guide 1](01-accounts-and-rules.md#git-hosts-github-gitlab-and-others)).
+
+### Setting them up
+
+Run the setup questions and answer the **Git accounts** step. It asks for one account at a time:
+
+```bash
+python3 ~/.bullpen/runner/runner.py init
+```
+
+Or edit `~/.bullpen/runner.json` yourself. A running runner picks up the change within 15 seconds. This
+example has a personal account that uses an SSH key, a GitHub machine account that uses a token, and a
+self-hosted GitLab:
+
+```json
+"git_accounts": {
+  "personal": {"host": "github.com", "name": "Your Name", "email": "you@example.com",
+               "ssh_key": "~/.ssh/id_ed25519"},
+  "bot":      {"host": "github.com", "token": "github_pat_EXAMPLE-TOKEN-0123456789",
+               "name": "build-box bot", "email": "bot@example.com"},
+  "lab":      {"host": "gitlab.example.com", "kind": "gitlab", "token": "glpat-EXAMPLE-TOKEN-0123456789",
+               "name": "Your Name", "email": "you@example.com"}
+},
+"default_git_account": "personal",
+"project_git_accounts": {"homelab": "lab"}
+```
+
+The fields of an account:
+
+| Field | Meaning |
+|---|---|
+| name of the account | 1 to 32 lowercase letters, digits or dashes, starting with a letter or digit. This is what you pick on the dashboard. |
+| `host` | Required. The host name only, such as `github.com` or `gitlab.example.com`: no `https://`, no path, no `user@`. A port after a colon is the host's **SSH** port. |
+| `kind` | `github`, `gitlab` or `other`. Left out, it is `github` for `github.com`, `gitlab` for `gitlab.com` (with or without a port) and `other` for anything else. Set it for a GitHub or GitLab server of your own. |
+| `name`, `email` | The commit author and committer for the job. |
+| `ssh_key` | The path of a private key file on this machine. |
+| `token` | An HTTPS access token, at least 8 characters. |
+| `user` | The user name sent with the token. The default is `x-access-token`. Some hosts want the real user name. |
+
+An account needs an `ssh_key`, a `token`, or a `name` or `email`. An entry that doesn't pass these checks is
+left out. `runner.py list` shows it with the reason, and so does the machine's page, so a typo is visible
+before it stops a job.
+
+Two more settings choose the default:
+
+- `default_git_account` is the account for every project, `chat` included.
+- `project_git_accounts` gives one project its own default.
+
+A task that picks an account always uses it. A default applies only when the task picks nothing. It is
+skipped for an agent whose own `env` in `runner.json` sets `GIT_SSH_COMMAND`, `GIT_AUTHOR_*`,
+`GIT_COMMITTER_*`, `GIT_CONFIG_COUNT`, `GH_TOKEN`, `GH_ENTERPRISE_TOKEN` or `GITLAB_TOKEN`. That agent
+keeps its own git setup, and the job's log says the default was skipped. This means the older way of
+working, one agent entry per git login, keeps working. A default that names an account that doesn't exist
+or is invalid stops the jobs it would apply to. Pick an account or **None** for the task, or fix
+`runner.json`.
+
+To see what the runner understood, without any key or token shown:
+
+```bash
+python3 ~/.bullpen/runner/runner.py list
+```
+
+Its **Git accounts** section lists each account with its host, kind and what credentials it has, then the
+problems, then the defaults. A default for a project that isn't on this machine yet says "applies when that
+project is cloned".
+
+### An SSH key or a token
+
+| | SSH key | Token |
+|---|---|---|
+| Works for | `git@host:…` and `ssh://` addresses | `https://` addresses |
+| Where it lives | the key file stays where it is; `runner.json` holds its path | in `runner.json`, which only your user can read, like an API key in an agent's `env` |
+| Needs | the key file to exist, with no passphrase prompt (the job has no terminal) | nothing more |
+
+Every git account needs git 2.31 or later on this machine, whatever it holds. With an older git, a job that
+uses an account stops before it starts, and the machine's page says so.
+
+An account may have both. Then both kinds of address work for its host.
+
+### What a job with an account gets
+
+A job, clone or pull with an account uses that account alone for its host:
+
+- **Commit name and email.** `GIT_AUTHOR_NAME`, `GIT_COMMITTER_NAME`, `GIT_AUTHOR_EMAIL` and
+  `GIT_COMMITTER_EMAIL`.
+- **SSH.** A settings file in the job's private folder gives the account's key to its host only
+  (`IdentitiesOnly yes`), and git uses it through `GIT_SSH_COMMAND`. Your own `~/.ssh/config` still applies to
+  every other host. An account without a key can't sign in to its host over SSH at all, so an `ssh` or
+  `git@` address fails rather than use your own key.
+- **HTTPS.** The machine's credential helpers for the host are switched off for the job. If the account has
+  a token, git gets a helper that reads it from the environment (`BULLPEN_GIT_TOKEN`), never from a command
+  line or a file. An account without a token makes HTTPS to its host fail. That also holds for an account
+  with only a name and email.
+- **The `gh` and `glab` programs.** For a `github` or `gitlab` account, they get an empty settings folder
+  of their own, so they never fall back to your own login. They get the account's token if it has one;
+  without one they are signed out for the job, and the log says so.
+- **The log.** One line, `Git account: <name> (<host>)`, and the job page shows the account name.
+
+The variables set for `gh` and `glab` are the ones their documentation names (last checked 2026-11-08):
+
+| Kind | Variables | Source |
+|---|---|---|
+| `github`, host `github.com` | `GH_TOKEN`, `GH_CONFIG_DIR` | [gh environment variables](https://cli.github.com/manual/gh_help_environment) |
+| `github`, another host | `GH_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` (a `ghe.com` host uses `GH_TOKEN`) | the same page |
+| `gitlab` | `GITLAB_TOKEN`, `GITLAB_HOST`, `GLAB_CONFIG_DIR` | [glab configuration](https://docs.gitlab.com/cli/configuration/) |
+
+### Clone and pull
+
+A clone or pull with an account refuses an address on another host than the account's, an address that
+carries a user name or password, and an `ssh` address when the account has no key. The runner checks the
+address git would really use, after your `url.<base>.insteadOf` settings. Pick **None** to clone from
+another host with your own git setup.
+
+### What this does not cover
+
+Read these before you rely on an account to keep two identities apart:
+
+- **A token is a secret the job can use.** The agent runs as your user, with the token in its environment. Use
+  a token with only the access the work needs, and one you can revoke.
+- **Masking.** The runner hides the token, and the encoded form git sends, in the job's log, answer and diff.
+  A command an "ask me before commands" job shows you on the dashboard goes to the hub as the agent wrote
+  it. If it holds the token in plain text, the hub masks it only when the token has a known prefix such as
+  `ghp_`, `github_pat_` or `glpat-` ([SECURITY.md](../SECURITY.md)).
+- **SSH aliases.** A host alias in your own `~/.ssh/config` that points to the account's host (a
+  `Host work` with `HostName github.com`) still gets your setup when a remote uses the alias.
+- **Another ssh program.** Jobs with an account ignore `core.sshCommand` and `GIT_SSH` and use the `ssh` on
+  the `PATH`. The log warns when either is set. A key that only an ssh agent holds on your behalf can't be
+  used, because the job has no terminal.
+- **Extra HTTP headers.** For the account's host, the job clears the extra headers set for the whole host
+  (the form `actions/checkout` writes), not only `Authorization`. A header set for one longer address, such
+  as a single repository, still applies. If a self-hosted git server sits behind a proxy that needs a
+  header, test a clone with the account first.
+- **Settings given with `git -c`.** `GIT_CONFIG_PARAMETERS` in the environment is dropped for the job, and
+  the log says so, because git reads it after the account's settings.
+- **A `~/.netrc` file.** Git's HTTPS goes through curl, and curl signs in with a `~/.netrc` entry for the
+  host, or a `default` entry, before git asks for the account's token. While such an entry is there, a job,
+  clone or pull with the account is refused. On Windows, `%USERPROFILE%\_netrc` counts too. Remove the entry,
+  or pick **None**.
+- **A user name or password in an address.** Git uses those before the account's token. A task with an
+  account is refused when a remote of its project, or a `url.<base>.insteadOf` or `pushInsteadOf` setting,
+  gives an address on the account's host with a user name or password, over `https://` or `http://`. A
+  setting that adds them to every `https://` address counts too. A clone or pull checks its own address
+  ([Clone and pull](#clone-and-pull)).
+- **Password prompts.** In a job with an account, git can't ask a terminal or another program
+  (`core.askPass`, `SSH_ASKPASS`) for a password. An account without a token fails over HTTPS.
+- **Subtasks and Remote Control.** Subtasks never get an account, a default included. They use the machine
+  user's own git setup. Remote Control gets none either.
+- **Tasks aimed at a tag.** Each machine names its own accounts, so only a task for a named machine can pick
+  one.
+
 ## Tags and subtasks
 
 **Tags** are a few words about a machine, for example `gpu` or `security-tools`. On New task and in a

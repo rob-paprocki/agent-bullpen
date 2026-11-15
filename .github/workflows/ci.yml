@@ -3,7 +3,7 @@ name: CI
 on:
   push:
   pull_request:
-  # The maintainer's release workflow, in the development repository, runs every check before it releases.
+  # Other workflows can call this one to run every check.
   workflow_call:
 
 # Read the code, nothing more. No job here needs to write anything.
@@ -54,6 +54,8 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, python: "3.11", hub: true }
+          # The runner supports Python 3.9 on Windows too (the hub needs 3.11). setup-python has 3.9 for Windows.
+          - { os: windows-latest, python: "3.9" }
           - { os: macos-latest, python: "3.11", hub: true }
     steps:
       - uses: actions/checkout@v7
@@ -117,7 +119,7 @@ jobs:
       - name: Versions, personal references and links (tests/check_repo.py)
         env:
           # Optional: private words to keep out, one regular expression per line (never printed).
-          BULLPEN_DENYLIST: ${{ secrets.BULLPEN_DENYLIST }}
+          PRIVATE_WORDLIST: ${{ secrets.PRIVATE_WORDLIST }}
         run: python tests/check_repo.py
       - name: The release scripts (tests/test_release.py)
         run: python tests/test_release.py

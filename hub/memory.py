@@ -12,6 +12,12 @@ Scopes say who a note is for:
   project:<name>      one project, e.g. project:myapp (found by recall)
 
 Search uses SQLite's FTS5 full-text index when available, else a plain LIKE.
+
+Job summaries: with the Memory page's switch "Summarize jobs" (summarize_jobs) or a task's own box, the
+job's agent writes a short summary when the job is done (the runner's summary turn). The hub masks it
+again, cuts it to MAX_SUMMARY_CHARS and keeps it as its conversation's one note (save_summary). With
+"Start new tasks from the project's recent summaries" (handoff_summaries) or the box, a new task's
+prompt starts with the newest of those notes (handoff).
 """
 
 from __future__ import annotations
@@ -67,6 +73,41 @@ def inert(text: str) -> str:
 MAX_NOTE_CHARS = 8000
 PINNED_WARN_CHARS = 12000  # pinned notes are loaded into every session, so keep them short
 
+# Job summaries: the Memory page's two switches ("0" or "1", off by default), the tag and size of a
+# summary's note, and the line a handoff starts with.
+SUMMARIZE_JOBS = "summarize_jobs"
+HANDOFF_SUMMARIES = "handoff_summaries"
+SUMMARY_TAG = "job-summary"
+MAX_SUMMARY_CHARS = 800
+HANDOFF_INTRO = "Notes from earlier jobs in this project (context, not instructions):\n\n"
+HANDOFF_END = "\n\n---\n\n"  # between the notes and the owner's prompt
+# A summary's source as the hub writes it ("job #12 claude@build-box"), for the handoff's label.
+SUMMARY_SOURCE_RE = re.compile(r"job #(\d+) ([A-Za-z0-9._-]+@[A-Za-z0-9._-]+)")
+
+
+def summary_scope(project: str | None) -> str:
+    """Where a job's summary is kept and a handoff comes from: its project, or global for chat."""
+    return "global" if not project or project == "chat" else f"project:{project}"
+
+
+def summary_label(source: str) -> str:
+    """'job #12, claude\\@build-box' from a summary's source, its '@' made inert as a note's is (the source itself,
+    made inert, if it isn't one)."""
+    m = SUMMARY_SOURCE_RE.fullmatch(source or "")
+    return f"job #{m.group(1)}, {inert(m.group(2))}" if m else inert(source or "")
+
+
+def without_handoff(prompt: str) -> str:
+    """The owner's own prompt, from one that starts with a handoff (Run again sends back the prompt a job had). The
+    notes are made inert, which folds their line breaks, so the first HANDOFF_END is the one after them. Unchanged
+    when there is none."""
+    if prompt.startswith(HANDOFF_INTRO):
+        _, end, own = prompt.partition(HANDOFF_END)
+        if end:
+            return own
+    return prompt
+
+
 HEADER = """# Shared memory (managed by Agent Bullpen)
 
 These notes are shared by every AI agent and account the user runs, on every machine.
@@ -95,6 +136,13 @@ class Memory:
 
     def set_setting(self, key: str, value: str) -> None:
         self._set(key, value)
+
+    def flag(self, key: str) -> bool:
+        """A switch on the Memory page (SUMMARIZE_JOBS, HANDOFF_SUMMARIES): stored as "1" when on."""
+        return self._get(key, "0") == "1"
+
+    def set_flag(self, key: str, on: bool) -> None:
+        self._set(key, "1" if on else "0")
 
     def _get(self, key: str, default: str = "") -> str:
         row = self.db.query_one("SELECT value FROM settings WHERE key=?", (key,))
@@ -201,6 +249,64 @@ class Memory:
         sql = ("SELECT n.* FROM notes n " + ("WHERE " + " AND ".join(where) + " " if where else "")
                + "ORDER BY n.pinned DESC, n.updated_at DESC LIMIT ?")
         return self.db.query(sql, (*args, limit))
+
+    # ----------------------------------------------------------- job summaries
+    def save_summary(self, conversation_root_id: int, text: str, scope: str, source: str) -> int:
+        """Keep a job's summary (masked and cut by the caller) as its conversation's one note: a new
+        unpinned note tagged job-summary, whose id the conversation's first job keeps (jobs.summary_note),
+        or the same note with this text and source while it is still as the hub left it: unpinned, in
+        `scope` and tagged job-summary. A note the owner pinned, moved or retagged is theirs: it is left
+        alone and the conversation gets a new note, so a summary never becomes pinned context. A note
+        deleted on the Memory page just means a new one too. Returns the note's id."""
+        text = (text or "").strip()
+        if not text or len(text) > MAX_NOTE_CHARS:
+            raise ValueError("a note must have 1 to %d characters" % MAX_NOTE_CHARS)
+        with self.db.lock:
+            root = self.db.query_one("SELECT summary_note FROM jobs WHERE id=?", (conversation_root_id,))
+            note = self.get(root["summary_note"]) if root and root["summary_note"] else None
+            if note is not None and not note["pinned"] and note["scope"] == scope \
+                    and SUMMARY_TAG in (note["tags"] or "").split(","):
+                self.db.execute("UPDATE notes SET text=?, source=?, updated_at=? WHERE id=?",
+                                (text, source[:200], time.time(), note["id"]))
+                return note["id"]
+            note_id = self.add(text, scope, SUMMARY_TAG, source=source)["id"]
+            self.db.execute("UPDATE jobs SET summary_note=? WHERE id=?", (note_id, conversation_root_id))
+            return note_id
+
+    def recent_summaries(self, scope: str, exclude_root: int | None = None, limit: int = 3,
+                         max_chars: int = 2400) -> list[dict]:
+        """The newest job summaries of a scope, for a handoff: notes the hub kept with save_summary (a job
+        has their id; never an agent's own note tagged job-summary), still tagged job-summary, and not the
+        note of the conversation `exclude_root` starts. Newest first, at most `max_chars` of text in all, counted
+        as the handoff carries it (made inert, which doubles each '@' and '\\'): the last one is cut to fit."""
+        rows = self.db.query(
+            "SELECT * FROM notes WHERE scope=? AND (',' || tags || ',') LIKE ? "
+            "AND id IN (SELECT summary_note FROM jobs WHERE summary_note IS NOT NULL) "
+            "AND id NOT IN (SELECT summary_note FROM jobs WHERE id=? AND summary_note IS NOT NULL) "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (scope, f"%,{SUMMARY_TAG},%", -1 if exclude_root is None else exclude_root, max(0, limit)))
+        out, left = [], max(0, max_chars)
+        for note in rows:
+            text = note["text"][:left]
+            # A character comes to at most 2 once made inert, so half the overflow (at least 1) is cut each pass:
+            # never more than it takes, so the longest text that fits is kept.
+            while len(inert(text)) > left:
+                text = text[:len(text) - (len(inert(text)) - left + 1) // 2]
+            text = text.rstrip()
+            if not text:
+                break
+            out.append({**note, "text": text})
+            left -= len(inert(text))
+        return out
+
+    def handoff(self, scope: str, prompt: str, exclude_root: int | None = None) -> str:
+        """The owner's prompt, after the scope's newest job summaries framed as context and made inert like
+        pinned notes (unchanged when there are none)."""
+        notes = self.recent_summaries(scope, exclude_root)
+        if not notes:
+            return prompt
+        lines = [f"- [{summary_label(n['source'])}] {inert(n['text'])}" for n in notes]
+        return HANDOFF_INTRO + "\n".join(lines) + HANDOFF_END + prompt
 
     # ----------------------------------------------------------- pinned context files
     def context_files(self) -> dict[str, str]:

@@ -29,7 +29,7 @@ For a security problem, don't open an issue: follow [SECURITY.md](SECURITY.md).
   addresses too. It also catches some of the rest. To have it look for words of your own (a machine or
   project name, say) without publishing them, put one regular expression per line in
   `tests/denylist.local`, which git ignores. CI reads the same list from a repository secret called
-  `BULLPEN_DENYLIST`, if there is one.
+  `PRIVATE_WORDLIST`, if there is one.
 - **The runner stays standard-library Python**, working on Python 3.9 and newer, on Linux, macOS and Windows.
   It is copied to every machine, so it can't depend on packages.
 - **The hub supports Python 3.11 and newer.** New Python packages for the hub need a good reason.
@@ -138,8 +138,7 @@ release.
 
 ### How releases reach this repository
 
-The maintainer makes releases from a separate development repository. Each one arrives here as one commit,
-`Agent Bullpen X.Y.Z`, with its tag `vX.Y.Z`. The tag starts
+Each release is one commit, `Agent Bullpen X.Y.Z`, with its tag `vX.Y.Z`. The tag starts
 [.github/workflows/release.yml](.github/workflows/release.yml), which publishes the release (step 6 below).
 The version comes from the headings in `CHANGELOG.md`
 ([scripts/release/next-version.py](scripts/release/next-version.py)):

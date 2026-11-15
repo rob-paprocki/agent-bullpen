@@ -44,6 +44,8 @@ MAX_PROMPT_CHARS = 400_000
 
 DEBATE_STAGES = ["answer", "critique", "revise", "judge"]
 REVIEW_STAGES = ["build", "review", "fix"]
+# The options that carry the MCP servers picked for a task or council (app.py checks them).
+MCP_PICK_KEYS = ("mcp_add", "mcp_only")
 
 
 def _clip(text: str | None, limit: int) -> str:
@@ -190,11 +192,20 @@ log = logging.getLogger("hub.council")
 
 class CouncilEngine:
     """`on_finish(council_id, status)` is called when a council finishes ("done" or "error"),
-    not when it is cancelled. The hub sends its notification from there."""
+    not when it is cancelled. The hub sends its notification from there.
 
-    def __init__(self, db: Database, on_finish: Callable[[int, str], None] | None = None):
+    Job summaries (hub/memory.py): a council that asks for them (options.summarize) has one, of its
+    last step: the judge's, or the builder's last (its fix step, or its build without one). With the
+    box ticked (options.summary_box), the steps of the session that writes it (the judge's; the build
+    and its fix) need the summary feature. One that asks for the handoff (options.handoff) puts
+    `handoff(project, prompt, exclude_root)` in every seat's first prompt: the answers and the
+    judge's, the build and the reviews."""
+
+    def __init__(self, db: Database, on_finish: Callable[[int, str], None] | None = None,
+                 handoff: Callable[[str, str, int | None], str] | None = None):
         self.db = db
         self.on_finish = on_finish
+        self.handoff = handoff
 
     # -- creation -------------------------------------------------------------
     def create(self, spec: dict[str, Any]) -> int:
@@ -219,11 +230,22 @@ class CouncilEngine:
         else:
             raise ValueError(f"unknown council mode {mode!r}")
 
+        options: dict[str, Any] = {"timeout_min": spec.get("timeout_min", 60)}
+        if typed:
+            options["title_typed"] = True  # the owner typed the title, so a notification may show it
+        if isinstance(spec.get("git_account"), str):
+            options["git_account"] = spec["git_account"]  # for every step (the hub checked every seat's machine)
+        for key in MCP_PICK_KEYS:  # the MCP picks, for every step too (the hub checked every seat's agent)
+            if isinstance(spec.get(key), list) and spec[key]:
+                options[key] = list(spec[key])
+        for key in ("summarize", "handoff"):  # job summaries, as the hub decided them (switch or box)
+            if spec.get(key) is True:
+                options[key] = True
+        if options.get("summarize") and spec.get("summary_box") is True:
+            options["summary_box"] = True  # the box, not the switch: the writer's steps need the feature
         council_id = self.db.create_job(
             kind="council", title=title, status="running", started_at=time.time(),
-            prompt=spec["prompt"], meta=meta,
-            # title_typed: the owner typed the title, so a notification may show it.
-            options={"timeout_min": spec.get("timeout_min", 60), **({"title_typed": True} if typed else {})},
+            prompt=spec["prompt"], meta=meta, options=options,
         )
         self._start_stage(council_id, meta, "answer" if mode == "debate" else "build")
         return council_id
@@ -299,16 +321,37 @@ class CouncilEngine:
         return [c for c in self.db.children(council_id) if c["stage"] == stage]
 
     def _step(self, council_id: int, who: dict, stage: str, prompt: str, label: str,
-              autonomy: str = "readonly", **extra: Any) -> None:
+              autonomy: str = "readonly", first: bool = False, last: bool = False, writer: bool = False,
+              exclude_root: int | None = None, **extra: Any) -> None:
         """Queue one step for a seat: a machine by name, or (a tag seat) the first free machine
-        with the accepted tag, the agent on the seat's account key, and what the step needs."""
+        with the accepted tag, the agent on the seat's account key, and what the step needs. Every step
+        gets the git account and the MCP servers picked for the council (and so needs an agent that takes
+        picks, also when it moves to the machine's credits agent). The council's `last` step writes its
+        summary and each seat's `first` gets the handoff, when the council asks. A `writer` step (in the
+        session that writes the summary) needs the summary feature when the box was ticked, as a pick
+        does: so the build's agent, the credits agent included, and the fix that resumes its session can
+        write one. By the switch alone, the machine that takes the last step skips it where the agent
+        can't (Database.claim_next_job)."""
         council = self.db.job(council_id)
-        options = {"timeout_min": (council["options"] or {}).get("timeout_min", 60)}
+        settings = council["options"] or {}
+        options = {"timeout_min": settings.get("timeout_min", 60)}
+        if isinstance(settings.get("git_account"), str):
+            options["git_account"] = settings["git_account"]
+        picks = {k: list(settings[k]) for k in MCP_PICK_KEYS if isinstance(settings.get(k), list) and settings[k]}
+        options.update(picks)
         options.update(extra.pop("options", {}))
+        if last and settings.get("summarize") is True:
+            options["summarize"] = True
+        if first and settings.get("handoff") is True and self.handoff is not None:
+            prompt = self.handoff(who.get("project") or "chat", prompt, exclude_root)
+            options["handoff"] = True
         runner = who.get("runner") or None
         tag = None if runner else who.get("tag")
-        if autonomy == "ask":
-            options["needs"] = ["approvals"]
+        needs = (["approvals"] if autonomy == "ask" else []) + (["mcp_pick"] if picks else [])
+        if writer and settings.get("summarize") is True and settings.get("summary_box") is True:
+            needs.append("summary")
+        if needs:
+            options["needs"] = needs
         if tag:
             options["account"] = who.get("account")
         self.db.create_job(
@@ -326,7 +369,7 @@ class CouncilEngine:
 
         if stage == "answer":
             for who, label in zip(meta["participants"], meta["labels"]):
-                self._step(council_id, who, stage, prompt_answer(question), label)
+                self._step(council_id, who, stage, prompt_answer(question), label, first=True)
 
         elif stage == "critique":
             answers = {s["label"]: s["result"] for s in self._results(council_id, "answer")
@@ -358,12 +401,13 @@ class CouncilEngine:
             revised = [(s["label"].replace(" revised", ""), s["result"])
                        for s in self._results(council_id, "revise") if s["status"] == "done"]
             self._step(council_id, meta["judge"], stage,
-                       prompt_judge(question, answers, critiques, revised), "Judge")
+                       prompt_judge(question, answers, critiques, revised), "Judge", first=True, last=True,
+                       writer=True)
 
         elif stage == "build":
             self._step(council_id, meta["builder"], stage, prompt_build(question), "Builder",
-                       autonomy=meta.get("autonomy", "edits"),
-                       options={"capture_diff": True})
+                       autonomy=meta.get("autonomy", "edits"), first=True, last=not meta.get("fix"),
+                       writer=True, options={"capture_diff": True})
 
         elif stage == "review":
             build = self._results(council_id, "build")[-1]
@@ -373,9 +417,10 @@ class CouncilEngine:
                 # the builder's seat was a tag) can also open the real files.
                 if who.get("runner") and who.get("runner") == build["runner"] and not who.get("project"):
                     who["project"] = meta["builder"].get("project")
+                # Without a fix step the build wrote the council's summary: not handed back to its reviewers.
                 self._step(council_id, who, stage,
                            prompt_review(question, build["result"], build.get("diff") or ""),
-                           f"Reviewer {i}")
+                           f"Reviewer {i}", first=True, exclude_root=build["id"])
 
         elif stage == "fix":
             build = self._results(council_id, "build")[-1]
@@ -387,7 +432,7 @@ class CouncilEngine:
             moved = {"named_agent": build["named_agent"], "credits": build["credits"]} \
                 if build.get("named_agent") else {}
             self._step(council_id, builder, stage, prompt_fix(question, reviews),
-                       "Builder (fixes)", autonomy=meta.get("autonomy", "edits"),
+                       "Builder (fixes)", autonomy=meta.get("autonomy", "edits"), last=True, writer=True,
                        resume_session=build.get("session_id"),
                        options={"capture_diff": True}, **moved)
 
@@ -425,7 +470,7 @@ class CouncilEngine:
                                ("fix", "Builder's response to the reviews")):
             for step in self._results(council_id, stage):
                 if step["status"] == "done":
-                    out.append(f"## {heading} — {step['label']} (`{step['agent']}` on {self._where(step)}"
+                    out.append(f"## {heading}: {step['label']} (`{step['agent']}` on {self._where(step)}"
                                f"{', on platform credits' if step.get('named_agent') else ''})\n\n"
                                f"{(step['result'] or '').strip()}\n")
         return "\n".join(out) or "(no results)"

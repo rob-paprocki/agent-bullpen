@@ -70,7 +70,7 @@ Remote Control and plan limits per account. These would build on them; none is i
 | **A cap per account** | At most a set number of runs at once per account label, across all machines. It would only hold jobs back, never move them to another account. | S | planned |
 | **Remote Control after a reboot** | Start chosen Remote Control servers again when the runner starts, not only after an update. | S | considered |
 | **"Always allow this command in this job"** | One click to let the same command run again in a job without asking. | S | considered |
-| **Approvals for Gemini CLI** | Gemini CLI has no hook like Claude Code's permission prompt tool, so "ask me before commands" is Claude only. | — | waiting (for Gemini CLI) |
+| **Approvals for Gemini CLI** | Gemini CLI has no hook like Claude Code's permission prompt tool, so "ask me before commands" is Claude only. | - | waiting (for Gemini CLI) |
 | **Checking limits on a timer** | Today **Check limits** runs only when you press it, on purpose. A slow timer (an hour or more) may come once `/usage` in print mode and its report are no longer marked experimental. | S | considered |
 | **Trusted tags from enrollment** | Let **Add a machine** set a machine's tags and labels up front, so they need no separate Accept. | S | considered |
 | **Commit and push between machines** | Branches named by the hub, so a subtask's or a builder's work can move to another machine without manual steps. | M | considered |
