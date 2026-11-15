@@ -54,7 +54,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 IS_WINDOWS = os.name == "nt"
 IS_MACOS = sys.platform == "darwin"
 # The machine kind the hub's MCP list uses ("platforms" on the MCP page).

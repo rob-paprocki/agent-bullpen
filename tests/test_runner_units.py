@@ -1004,6 +1004,13 @@ class Usage(unittest.TestCase):
 
 
 class LimitStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The fixtures are dated NOW, and the store forgets windows older than LIMITS_MAX_AGE by the
+        # real clock. Pin the clock just after NOW, or these tests expire eight days after NOW.
+        clock = mock.patch.object(runner.time, "time", return_value=NOW + 60)
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def obs(self, at: float, **fields) -> dict:
         base = {"used": None, "status": None, "resets_at": None, "threshold": None, "resets_text": None,
                 "observed_at": at, "source": "job"}
@@ -1377,7 +1384,8 @@ class RunnerLimits(TempDirCase):
         path.write_text(json.dumps(cfg), encoding="utf-8")
         r = runner.Runner(path)
         r.limits = runner.LimitStore(path=None)
-        r.limits.record("one", {"five_hour": {"used": 0.2, "observed_at": NOW, "source": "job"}}, None)
+        # observed now: the store forgets windows older than LIMITS_MAX_AGE by the real clock
+        r.limits.record("one", {"five_hour": {"used": 0.2, "observed_at": time.time(), "source": "job"}}, None)
         agents = {a["name"]: a for a in r.heartbeat_payload()["agents"]}
         self.assertEqual(agents["one"]["limits"]["windows"]["five_hour"]["used"], 0.2)
         self.assertEqual(agents["one"]["account"], "work")

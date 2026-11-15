@@ -5,6 +5,14 @@ All notable changes to Agent Bullpen are listed here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The hub and the runner always share one
 version number, because the hub hands its own copy of the runner to every machine.
 
+## [1.0.1] - 2026-11-15
+
+**Upgrading:** nothing to do.
+
+### Fixed
+
+- The runner's plan-limit tests no longer start failing eight days after the date their test data uses.
+
 ## [1.0.0] - 2026-11-15
 
 **Upgrading:** nothing to do. This is the first release.
@@ -171,4 +179,5 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
   but not save them.
 - The installers download a release and check it against its `SHA256SUMS` before installing it.
 
+[1.0.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.0

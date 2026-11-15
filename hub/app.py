@@ -56,7 +56,7 @@ import limits
 import mcp_server
 import usage
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("hub")
 
