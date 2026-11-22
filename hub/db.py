@@ -4,8 +4,9 @@ Everything the hub knows lives in one small SQLite file:
   - runners:        every machine that checks in
   - jobs:           every task and every multi-agent "council" run
   - job_logs:       the live log lines a runner streams back while a job runs
-  - machine_tokens: each enrolled machine's own runner token (only its sha256)
-  - enroll_codes:   the one-time codes from "Add a machine" (only their sha256)
+  - machine_tokens: each enrolled machine's own runner token and MCP token (only their sha256)
+  - enroll_codes:   the one-time codes from "Add a machine" (only their sha256), with the tags and
+                    account labels the owner accepted for the machine up front
   - approvals:      questions from 'ask' jobs, answered on the dashboard
   - job_messages:   live sessions: what the owner typed, and the agent's answer to each turn
   - settings:       the owner's hub settings made on the dashboard (platform credits), as JSON
@@ -25,7 +26,8 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Any
 
-from common import LOST_JOB_GRACE, MAX_TAGS, ONLINE_WINDOW, TAG_RE, clean_tags, summary_refusal
+from common import LOST_JOB_GRACE, MAX_TAGS, ONLINE_WINDOW, TAG_RE, accepted_of, clean_install_id, clean_tags, \
+    merge_accepted, summary_refusal
 from credits import claim_route
 
 SCHEMA = """
@@ -45,7 +47,11 @@ CREATE TABLE IF NOT EXISTS runners (
     conflict_at  REAL,
     machine_tags TEXT,     -- JSON list: the tags it reports (not 'tags': see JSON_FIELDS)
     accepted     TEXT,     -- JSON {"tags": [...], "accounts": {agent: label}}: what the owner accepted
-    clock_skew   REAL      -- seconds the hub's clock is ahead of the machine's, at its last check-in
+    clock_skew   REAL,     -- seconds the hub's clock is ahead of the machine's, at its last check-in
+    paused       INTEGER DEFAULT 0, -- taken out of service on the dashboard: no new tasks (Database.claim_next_job)
+    paused_at    REAL,     -- when it was paused
+    paused_by    TEXT,     -- where the pause came from ('dashboard')
+    install_id   TEXT      -- the random id of the install that last checked in (never shown); NULL from older runners
 );
 
 -- Each enrolled machine's own runner token. The token is shown once, to the
@@ -55,7 +61,12 @@ CREATE TABLE IF NOT EXISTS machine_tokens (
     token_hash  TEXT NOT NULL UNIQUE,
     hostname    TEXT,                  -- the computer it was issued to
     os          TEXT,
-    created_at  REAL
+    created_at  REAL,
+    preaccepted TEXT,                  -- JSON {"tags", "accounts"} from its enrollment code: added to what
+                                       -- the owner accepted for the machine at its first check-in
+    mcp_token_hash TEXT,               -- sha256 of the machine's own MCP token (NULL: none issued yet, or rotated)
+    mcp_token_at REAL                  -- when its MCP token was last issued or rotated (NULL: never: the machine
+                                       -- still uses the shared MCP token)
 );
 
 -- One-time enrollment codes ("Add a machine"): valid for an hour, used once.
@@ -67,7 +78,9 @@ CREATE TABLE IF NOT EXISTS enroll_codes (
     created_at  REAL,
     expires_at  REAL,
     used_at     REAL,
-    used_by     TEXT                   -- the machine name it was exchanged for
+    used_by     TEXT,                  -- the machine name it was exchanged for
+    preaccepted TEXT                   -- JSON {"tags": [...], "accounts": {agent: label}}: what the owner
+                                       -- accepted for the machine up front (NULL: nothing)
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -107,8 +120,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     named_agent      TEXT,             -- the agent the seat or subtask named, when it ran on credits instead
     credits          TEXT,             -- JSON: how platform credits were involved (hub/credits.py)
     retry_of         INTEGER,          -- a retry on credits: the job that stopped at a usage limit
-    summary_note     INTEGER           -- job summaries: the note its summary went to (the first job of a
+    summary_note     INTEGER,          -- job summaries: the note its summary went to (the first job of a
                                        -- conversation: the conversation's note, see Memory.save_summary)
+    continued_from   INTEGER           -- "Continue on another machine": the job whose conversation this one
+                                       -- carries on (hub/moves.py)
 );
 
 CREATE INDEX IF NOT EXISTS jobs_queue  ON jobs(status, runner, kind);
@@ -131,10 +146,14 @@ CREATE TABLE IF NOT EXISTS approvals (
                                     -- longer requests are denied unseen); redacted once the job ends
     tool_use_id TEXT,
     status      TEXT NOT NULL,      -- pending / allowed / denied / expired / cancelled
-    message     TEXT,               -- the reason typed with Deny, or why it expired
+    message     TEXT,               -- the reason typed with Deny, why it expired, or which question it matched
     created_at  REAL,
     expires_at  REAL,
-    decided_at  REAL
+    decided_at  REAL,
+    for_job     INTEGER DEFAULT 0,  -- 1: allowed with "Allow for this job" (hub/approvals.py)
+    same_as     INTEGER,            -- allowed automatically: the for_job question it matched
+    match_key   TEXT                -- sha256 of what makes two requests the same (approvals.match_key), never the
+                                    -- input; cleared once the job ends
 );
 CREATE INDEX IF NOT EXISTS approvals_job ON approvals(job_id, status);
 
@@ -165,16 +184,20 @@ CREATE TABLE IF NOT EXISTS settings (
 # Columns holding JSON, decoded on the way out. This applies to a column of that name in every
 # table, which is why a machine's tags are called machine_tags: notes.tags is a plain string.
 JSON_FIELDS = {"agents", "projects", "running", "options", "meta", "info", "usage", "usage_reported",
-               "machine_tags", "accepted", "credits"}
+               "machine_tags", "accepted", "credits", "preaccepted"}
 
 # Columns added after the first release; created on start-up if missing.
 MIGRATIONS = {
     "jobs": {"model": "TEXT", "token_hash": "TEXT", "delegated_by": "INTEGER", "target_tag": "TEXT",
              "end_requested": "INTEGER DEFAULT 0", "usage": "TEXT", "usage_reported": "TEXT",
              "error_kind": "TEXT", "named_agent": "TEXT", "credits": "TEXT", "retry_of": "INTEGER",
-             "summary_note": "INTEGER"},
+             "summary_note": "INTEGER", "continued_from": "INTEGER"},
     "runners": {"info": "TEXT", "auth": "TEXT", "conflict_host": "TEXT", "conflict_at": "REAL",
-                "machine_tags": "TEXT", "accepted": "TEXT", "clock_skew": "REAL"},
+                "machine_tags": "TEXT", "accepted": "TEXT", "clock_skew": "REAL",
+                "paused": "INTEGER DEFAULT 0", "paused_at": "REAL", "paused_by": "TEXT", "install_id": "TEXT"},
+    "approvals": {"for_job": "INTEGER DEFAULT 0", "same_as": "INTEGER", "match_key": "TEXT"},
+    "machine_tokens": {"preaccepted": "TEXT", "mcp_token_hash": "TEXT", "mcp_token_at": "REAL"},
+    "enroll_codes": {"preaccepted": "TEXT"},
 }
 
 # Indexes on columns that MIGRATIONS may have just added: run after the migrations, not in SCHEMA.
@@ -185,6 +208,9 @@ POST_MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS jobs_follow_up ON jobs(follow_up_of)",
     "CREATE INDEX IF NOT EXISTS jobs_retry ON jobs(retry_of)",
     "CREATE INDEX IF NOT EXISTS jobs_summary_note ON jobs(summary_note)",
+    "CREATE INDEX IF NOT EXISTS jobs_continued ON jobs(continued_from)",
+    "CREATE INDEX IF NOT EXISTS approvals_match ON approvals(job_id, match_key)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS machine_tokens_mcp ON machine_tokens(mcp_token_hash)",
 ]
 MAX_LOG_LINES_PER_JOB = 5000
 TERMINAL_STATUSES = ("done", "error", "cancelled")
@@ -195,6 +221,11 @@ JOB_TOKEN_MACHINE_WINDOW = ONLINE_WINDOW + LOST_JOB_GRACE
 JOB_TOKEN_GRACE_MIN = 5
 # An agent's entry in a heartbeat larger than this loses its usage limits before it is stored.
 MAX_AGENT_JSON = 16 * 1024
+
+
+def same_as_message(rule_id: int) -> str:
+    """The note on a question allowed automatically because it matched one allowed for the whole job."""
+    return f"Same as question #{rule_id}, which you allowed for this job."
 
 
 def _redacted_input(text: str | None) -> str | None:
@@ -213,8 +244,11 @@ def _redacted_input(text: str | None) -> str | None:
         return None
 
 
-# Why a machine action that waited too long (Start Remote Control) was dropped.
+# Why a machine action that waited too long (Start Remote Control, Sign out) was dropped.
 ADMIN_EXPIRED = "Not picked up within 2 minutes; press Start again."
+ADMIN_EXPIRED_OTHER = "Not picked up within 2 minutes, so nothing was done. Try again when the machine is online."
+# Why a Start Remote Control queued before its machine was paused was dropped.
+PAUSED_RC = "{name} was paused before it started Remote Control. Resume it on its page, then press Start again."
 
 
 def _options(options_text: str | None) -> dict:
@@ -224,6 +258,16 @@ def _options(options_text: str | None) -> dict:
     except ValueError:
         return {}
     return opts if isinstance(opts, dict) else {}
+
+
+def _waiting_move(opts: dict) -> bool:
+    """Is this task an exact move whose session copy hasn't reached the hub yet (options.move.waiting)?"""
+    move = opts.get("move")
+    return isinstance(move, dict) and move.get("waiting") is True
+
+
+# An exact move (hub/moves.py): the machine action that sends the session's transcript to the hub.
+SESSION_EXPORT = "session.export"
 
 
 def _expired(options_text: str | None, now: float) -> bool:
@@ -304,14 +348,15 @@ class Database:
         self.execute(
             """
             INSERT INTO runners (name, hostname, os, version, agents, projects, max_parallel, running, last_seen,
-                                 info, auth, machine_tags, clock_skew)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 info, auth, machine_tags, clock_skew, install_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 hostname=excluded.hostname, os=excluded.os, version=excluded.version,
                 agents=excluded.agents, projects=excluded.projects,
                 max_parallel=excluded.max_parallel, running=excluded.running,
                 last_seen=excluded.last_seen, info=excluded.info, auth=excluded.auth,
-                machine_tags=excluded.machine_tags, clock_skew=excluded.clock_skew
+                machine_tags=excluded.machine_tags, clock_skew=excluded.clock_skew,
+                install_id=excluded.install_id
             """,
             (
                 info["name"],
@@ -327,6 +372,8 @@ class Database:
                 auth,
                 json.dumps(clean_tags(info.get("tags"))),
                 now - sent_at if sent_at > 0 else None,
+                # Always this check-in's own (none from an older runner), so the next one is compared with it.
+                clean_install_id(info.get("install_id")) or None,
             ),
         )
 
@@ -337,6 +384,22 @@ class Database:
     def note_name_conflict(self, name: str, other_hostname: str) -> None:
         self.execute("UPDATE runners SET conflict_host=?, conflict_at=? WHERE name=?",
                      (other_hostname, time.time(), name))
+
+    def set_paused(self, name: str, paused: bool, by: str = "dashboard") -> bool:
+        """Pause a machine (it gets no new tasks, council steps or subtasks; machine actions still run)
+        or resume it. Heartbeats never touch these columns. False if there is no such machine."""
+        with self.lock:
+            if paused:
+                cur = self.conn.execute("UPDATE runners SET paused=1, paused_at=COALESCE(paused_at, ?), "
+                                        "paused_by=COALESCE(paused_by, ?) WHERE name=?", (time.time(), by, name))
+            else:
+                cur = self.conn.execute("UPDATE runners SET paused=0, paused_at=NULL, paused_by=NULL WHERE name=?",
+                                        (name,))
+            return cur.rowcount == 1
+
+    def paused_runners(self) -> set[str]:
+        """The names of the machines that are paused."""
+        return {r["name"] for r in self.query("SELECT name FROM runners WHERE paused=1")}
 
     def runners(self) -> list[dict]:
         return self.query("SELECT * FROM runners ORDER BY name")
@@ -359,28 +422,91 @@ class Database:
     def machine_token_of(self, name: str) -> dict | None:
         return self.query_one("SELECT name, hostname, os, created_at FROM machine_tokens WHERE name=?", (name,))
 
-    def set_machine_token(self, name: str, token_hash: str, hostname: str, os_name: str) -> None:
-        """Give a machine name its own token. An earlier token for that name stops working."""
+    def set_machine_token(self, name: str, token_hash: str, hostname: str, os_name: str,
+                          preaccepted: dict | None = None) -> None:
+        """Give a machine name its own token. An earlier token for that name stops working, and so does
+        the machine's own MCP token: the runner asks for a new one at its next sync (mcp_token_at is
+        kept, so the shared MCP token isn't handed to that name again). `preaccepted` (from its
+        enrollment code) is added to what the owner accepted for the machine at its first check-in
+        (apply_preaccepted); it replaces any that an earlier code left waiting."""
         self.execute(
-            "INSERT INTO machine_tokens (name, token_hash, hostname, os, created_at) VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO machine_tokens (name, token_hash, hostname, os, created_at, preaccepted) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(name) DO UPDATE SET token_hash=excluded.token_hash, hostname=excluded.hostname, "
-            "os=excluded.os, created_at=excluded.created_at",
-            (name, token_hash, hostname, os_name, time.time()))
+            "os=excluded.os, created_at=excluded.created_at, preaccepted=excluded.preaccepted, "
+            "mcp_token_hash=NULL, mcp_token_at=CASE WHEN machine_tokens.mcp_token_at IS NULL THEN NULL "
+            "ELSE excluded.created_at END",
+            (name, token_hash, hostname, os_name, time.time(), json.dumps(preaccepted) if preaccepted else None))
+
+    def apply_preaccepted(self, name: str) -> dict | None:
+        """At a machine's check-in: add what the owner accepted up front on its enrollment code to what it
+        accepted for the machine (merge_accepted), once. Returns what was added, or None when nothing
+        waited or the machine has no row yet."""
+        with self.lock:
+            row = self.query_one("SELECT preaccepted FROM machine_tokens WHERE name=?", (name,))
+            if not row or not row.get("preaccepted"):
+                return None
+            runner = self.runner(name)
+            if runner is None:
+                return None
+            pre = accepted_of({"accepted": row["preaccepted"]})
+            self.set_accepted(name, merge_accepted(accepted_of(runner), pre))
+            self.execute("UPDATE machine_tokens SET preaccepted=NULL WHERE name=?", (name,))
+            return pre
 
     def revoke_machine_token(self, name: str) -> bool:
+        """Forget: the machine's runner token and its own MCP token stop working at once."""
         with self.lock:
             return self.conn.execute("DELETE FROM machine_tokens WHERE name=?", (name,)).rowcount > 0
 
+    # ------------------------------------------------------- per-machine MCP tokens
+    # A machine with its own runner token gets an MCP token of its own (app.machine_mcp_token), for its
+    # agents' settings. Only its sha256 is kept; the token itself goes to that machine's runner, once.
+    def machine_mcp_state(self, name: str) -> dict | None:
+        """{"has_token": bool, "at": float | None} for a machine with its own runner token; None otherwise.
+        Never the hash."""
+        row = self.query_one("SELECT mcp_token_hash, mcp_token_at FROM machine_tokens WHERE name=?", (name,))
+        if row is None:
+            return None
+        return {"has_token": bool(row["mcp_token_hash"]), "at": row["mcp_token_at"]}
+
+    def machine_mcp_hash(self, name: str) -> str | None:
+        row = self.query_one("SELECT mcp_token_hash FROM machine_tokens WHERE name=?", (name,))
+        return row["mcp_token_hash"] if row else None
+
+    def set_machine_mcp_hash(self, name: str, token_hash: str) -> bool:
+        """Store the sha256 of a machine's new MCP token; its earlier one stops working. False when the
+        machine has no runner token of its own (any more): then nothing is stored."""
+        with self.lock:
+            return self.conn.execute("UPDATE machine_tokens SET mcp_token_hash=?, mcp_token_at=? WHERE name=?",
+                                     (token_hash, time.time(), name)).rowcount > 0
+
+    def rotate_machine_mcp(self, name: str) -> bool:
+        """Stop a machine's own MCP token now; its runner gets a new one at its next sync. False when the
+        machine has no runner token of its own."""
+        with self.lock:
+            return self.conn.execute("UPDATE machine_tokens SET mcp_token_hash=NULL, mcp_token_at=? WHERE name=?",
+                                     (time.time(), name)).rowcount > 0
+
+    def machine_for_mcp_token(self, token_hash: str) -> str | None:
+        """The machine whose own MCP token has this sha256, or None."""
+        row = self.query_one("SELECT name FROM machine_tokens WHERE mcp_token_hash=?", (token_hash,))
+        return row["name"] if row else None
+
     # ---------------------------------------------------------- enrollment codes
-    def add_enroll_code(self, code_hash: str, hint: str, name: str | None, hub_url: str, ttl: float) -> dict:
+    def add_enroll_code(self, code_hash: str, hint: str, name: str | None, hub_url: str, ttl: float,
+                        preaccepted: dict | None = None) -> dict:
+        """Store a new code. `preaccepted`: the tags and account labels the owner accepts for the machine
+        up front ({"tags": [...], "accounts": {agent: label}}, already checked), or None."""
         now = time.time()
         with self.lock:
             # Codes that ended more than a day ago are no use to anyone.
             self.conn.execute("DELETE FROM enroll_codes WHERE expires_at < ? OR used_at < ?",
                               (now - 86400, now - 86400))
             self.conn.execute(
-                "INSERT INTO enroll_codes (code_hash, code_hint, name, hub_url, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)", (code_hash, hint, name, hub_url, now, now + ttl))
+                "INSERT INTO enroll_codes (code_hash, code_hint, name, hub_url, created_at, expires_at, preaccepted) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (code_hash, hint, name, hub_url, now, now + ttl, json.dumps(preaccepted) if preaccepted else None))
             return self.enroll_code(code_hash)
 
     def enroll_code(self, code_hash: str) -> dict | None:
@@ -460,9 +586,32 @@ class Database:
             masked = _redacted_input(row["tool_input"])
             if masked != row["tool_input"]:
                 conn.execute("UPDATE approvals SET tool_input=? WHERE id=?", (masked, row["id"]))
+        # "Allow for this job" ends here, and the hash of the unmasked input goes with it (a short secret
+        # could be guessed from it).
+        conn.execute("UPDATE approvals SET match_key=NULL WHERE job_id=? AND match_key IS NOT NULL", (job_id,))
         conn.execute("UPDATE job_messages SET undelivered=1 WHERE job_id=? AND role='user' AND delivered_at IS NULL",
                      (job_id,))
         self._settle_subtasks(job_id, cancel=status == "cancelled")
+        self._settle_move(job_id)
+
+    def _settle_move(self, job_id: int) -> None:
+        """An exact move's session copy (hub/moves.py) ended without reaching the hub: failed, cancelled, lost, or
+        not picked up in time. The task waiting for it never starts. Called with the lock held. (A copy that
+        reached the hub cleared the task's options.move.waiting first, so nothing happens then.)"""
+        row = self.conn.execute("SELECT kind, runner, options, error FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None or row["kind"] != "admin":
+            return
+        opts = _options(row["options"])
+        params = opts.get("params") if isinstance(opts.get("params"), dict) else {}
+        target = params.get("target_job")
+        if opts.get("action") != SESSION_EXPORT or not isinstance(target, int) or isinstance(target, bool):
+            return
+        waiting = self.conn.execute("SELECT options FROM jobs WHERE id=? AND status='queued'", (target,)).fetchone()
+        if waiting is None or not _waiting_move(_options(waiting["options"])):
+            return
+        why = (row["error"] or "it didn't finish").strip().rstrip(".")
+        self.update_job(target, status="error", finished_at=time.time(),
+                        error=f"The session couldn't be copied from {row['runner']}: {why}.")
 
     def _settle_subtasks(self, job_id: int, cancel: bool) -> None:
         """A parent job ended or is being cancelled. Its queued subtasks never start. When it was
@@ -560,7 +709,9 @@ class Database:
             accepted tags, for one of its agents with the job's account key, in one of its
             projects, needing only features the agent has; a subtask only where
             accept_delegated is true.
-        A machine action is taken before anything, a named job before a newer tag job. A machine
+        A paused machine (Database.set_paused) gets machine actions only: no task, council step or
+        subtask, named for it or for one of its tags, and a Start Remote Control queued for it is settled
+        as cancelled. A machine action is taken before anything, a named job before a newer tag job. A machine
         action past its `expires_at` (Start Remote Control) is settled as cancelled, and so is a
         subtask past its `not_after` (its parent's time limit ran out); neither is handed out. A
         subtask's time limit is cut to the minutes left until its `not_after` as it is handed out.
@@ -571,13 +722,20 @@ class Database:
         doesn't report the summary feature is handed out without it, with options.summary_skipped saying why."""
         offer = offer if isinstance(offer, dict) else {}
         own = offer.get("auth") == "machine"
-        kinds = "('admin')" if admin_only else "('task', 'admin')"
         with self.lock:
+            # Read in the same step as the claim, so a pause can't slip in between.
+            row = self.conn.execute("SELECT paused FROM runners WHERE name=?", (runner,)).fetchone()
+            paused = bool(row and row["paused"])
+            admin_only = admin_only or paused
+            kinds = "('admin')" if admin_only else "('task', 'admin')"
             now = time.time()
             for row in self.conn.execute("SELECT id, options FROM jobs WHERE status='queued' AND kind='admin' "
                                          "AND runner=?", (runner,)).fetchall():
                 if _expired(row["options"], now):
-                    self.update_job(row["id"], status="cancelled", finished_at=now, error=ADMIN_EXPIRED)
+                    why = ADMIN_EXPIRED if _options(row["options"]).get("action") == "rc.start" else ADMIN_EXPIRED_OTHER
+                    self.update_job(row["id"], status="cancelled", finished_at=now, error=why)
+                elif paused and _options(row["options"]).get("action") == "rc.start":
+                    self.update_job(row["id"], status="cancelled", finished_at=now, error=PAUSED_RC.format(name=runner))
             for _ in range(CLAIM_TRIES):
                 named = self._named_job(runner, kinds, own, offer)
                 tagged = None if admin_only or not own else self._tag_job(offer)
@@ -654,6 +812,8 @@ class Database:
             if row["kind"] == "task":
                 if not own and (opts.get("delegate") or opts.get("delegated")):
                     continue
+                if _waiting_move(opts):
+                    continue  # an exact move waits for its session's copy (hub/moves.py)
                 agent = agents.get(row["agent"]) if isinstance(agents.get(row["agent"]), dict) else {}
                 features = agent.get("features") if isinstance(agent.get("features"), list) else []
                 needs = opts.get("needs") if isinstance(opts.get("needs"), list) else []
@@ -755,16 +915,38 @@ class Database:
 
     # ---------------------------------------------------------------- approvals
     def add_approval_if_running(self, job_id: int, tool_name: str, tool_input: str, tool_use_id: str | None,
-                                ttl: float) -> dict | None:
+                                ttl: float, match_key: str | None = None) -> dict | None:
         """Record a pending question, but only while its job runs and isn't being cancelled (in one
         statement, so a question can't slip in after Cancel). None if the job has ended."""
         now = time.time()
         with self.lock:
             cur = self.conn.execute(
-                "INSERT INTO approvals (job_id, tool_name, tool_input, tool_use_id, status, created_at, expires_at) "
-                "SELECT ?, ?, ?, ?, 'pending', ?, ? WHERE EXISTS "
+                "INSERT INTO approvals (job_id, tool_name, tool_input, tool_use_id, status, created_at, expires_at, "
+                "match_key) SELECT ?, ?, ?, ?, 'pending', ?, ?, ? WHERE EXISTS "
                 "(SELECT 1 FROM jobs WHERE id=? AND status='running' AND cancel_requested=0)",
-                (job_id, tool_name, tool_input, tool_use_id, now, now + ttl, job_id))
+                (job_id, tool_name, tool_input, tool_use_id, now, now + ttl, match_key, job_id))
+            if cur.rowcount != 1:
+                return None
+            return self.approval(cur.lastrowid)
+
+    def add_allowed_if_remembered(self, job_id: int, tool_name: str, tool_input: str, tool_use_id: str | None,
+                                  match_key: str) -> dict | None:
+        """A request the owner already allowed with "Allow for this job" (same job, same match_key): recorded
+        as allowed at once, with same_as naming the question it matched, but only while the job runs and
+        isn't being cancelled (in one statement, as add_approval_if_running). None when there is no such
+        question or the job has ended."""
+        now = time.time()
+        with self.lock:
+            rule = self.conn.execute("SELECT id FROM approvals WHERE job_id=? AND match_key=? AND for_job=1 "
+                                     "AND status='allowed' ORDER BY id LIMIT 1", (job_id, match_key)).fetchone()
+            if rule is None:
+                return None
+            cur = self.conn.execute(
+                "INSERT INTO approvals (job_id, tool_name, tool_input, tool_use_id, status, message, created_at, "
+                "decided_at, same_as, match_key) SELECT ?, ?, ?, ?, 'allowed', ?, ?, ?, ?, ? WHERE EXISTS "
+                "(SELECT 1 FROM jobs WHERE id=? AND status='running' AND cancel_requested=0)",
+                (job_id, tool_name, tool_input, tool_use_id, same_as_message(rule["id"]), now, now, rule["id"],
+                 match_key, job_id))
             if cur.rowcount != 1:
                 return None
             return self.approval(cur.lastrowid)
@@ -772,13 +954,32 @@ class Database:
     def approval(self, aid: int) -> dict | None:
         return self.query_one("SELECT * FROM approvals WHERE id=?", (aid,))
 
-    def decide_approval(self, aid: int, status: str, message: str | None) -> bool:
+    def decide_approval(self, aid: int, status: str, message: str | None, for_job: bool = False) -> bool:
         """Answer a question that is still pending. False if it was answered, expired or cancelled
-        meanwhile (the first answer wins)."""
+        meanwhile (the first answer wins). `for_job` ("Allow for this job", status 'allowed' only): the
+        same request is allowed again without asking until the job ends (add_allowed_if_remembered)."""
         with self.lock:
-            cur = self.conn.execute("UPDATE approvals SET status=?, message=?, decided_at=? "
-                                    "WHERE id=? AND status='pending'", (status, message, time.time(), aid))
+            cur = self.conn.execute("UPDATE approvals SET status=?, message=?, decided_at=?, for_job=? "
+                                    "WHERE id=? AND status='pending'",
+                                    (status, message, time.time(), 1 if for_job and status == "allowed" else 0, aid))
             return cur.rowcount == 1
+
+    def allow_pending_matches(self, job_id: int, rule_id: int, match_key: str) -> list[int]:
+        """After "Allow for this job" on question `rule_id`: this job's other questions still pending for
+        the same request (asked in parallel) are allowed too, each naming the question it matched. Their
+        ids."""
+        now = time.time()
+        with self.lock:
+            ids = [r["id"] for r in self.conn.execute(
+                "SELECT id FROM approvals WHERE job_id=? AND match_key=? AND status='pending' AND id!=?",
+                (job_id, match_key, rule_id)).fetchall()]
+            done = []
+            for aid in ids:
+                cur = self.conn.execute("UPDATE approvals SET status='allowed', message=?, decided_at=?, same_as=? "
+                                        "WHERE id=? AND status='pending'", (same_as_message(rule_id), now, rule_id, aid))
+                if cur.rowcount == 1:
+                    done.append(aid)
+            return done
 
     def approval_count(self, job_id: int) -> int:
         """How many questions this job has asked (every status)."""

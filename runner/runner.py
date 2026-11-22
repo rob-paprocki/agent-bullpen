@@ -44,6 +44,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -52,9 +53,9 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Optional
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 IS_WINDOWS = os.name == "nt"
 IS_MACOS = sys.platform == "darwin"
 # The machine kind the hub's MCP list uses ("platforms" on the MCP page).
@@ -64,8 +65,23 @@ BASE_DIR = Path(os.environ.get("BULLPEN_HOME", HOME / ".bullpen"))
 DEFAULT_CONFIG = BASE_DIR / "runner.json"
 CONTEXT_DIR = BASE_DIR / "context"  # pinned shared notes, synced from the hub
 HERE = Path(__file__).resolve().parent
+APPLE_PYTHON = "/usr/bin/python3"
+# Xcode wherever it is (Xcode-beta.app too), or the Command Line Tools.
+APPLE_DEVELOPER_PYTHON_RE = re.compile(r"/Xcode[^/]*\.app/Contents/Developer/|^/Library/Developer/CommandLineTools/")
 
 log = logging.getLogger("runner")
+
+
+def stable_python() -> str:
+    """The Python to write into the `bullpen` command and to restart with: this one, except on a Mac where
+    it is Apple's Python inside Xcode or the Command Line Tools (what /usr/bin/python3 runs, and what
+    sys.executable then names). That copy moves when Xcode is moved or switched, so it is /usr/bin/python3,
+    which follows xcode-select, as the setup puts in the launchd agent."""
+    exe = sys.executable
+    if (sys.platform == "darwin" and APPLE_DEVELOPER_PYTHON_RE.search(exe or "")
+            and os.access(APPLE_PYTHON, os.X_OK)):
+        return APPLE_PYTHON
+    return exe
 
 # ---------------------------------------------------------------------------
 # Agent presets: how to drive each official CLI headlessly.
@@ -110,6 +126,12 @@ log = logging.getLogger("runner")
 #                  the agent answers once per job.
 #   remote_control arguments (after the command) that start the CLI's Remote Control server in a
 #                  project, with "{rc_name}" and "{rc_spawn}". Absent: no Remote Control.
+#   cli_version    arguments (after the command) that print the CLI's version ("--version"), checked
+#                  before auth_status and auth_logout run, so an older CLI never gets them.
+#   auth_status    arguments that print the CLI's own sign-in status as JSON ("auth status --json"),
+#                  shown on the machine page (see SignInStore). Absent: no sign-in status.
+#   auth_logout    arguments that sign the CLI out ("auth logout"), for "Sign out" on the machine page
+#                  when runner.json allows it (allow_remote_sign_out). Absent: no sign-out.
 #
 # The "ask" level needs the hub's job tools (see prepare_job_tools): Claude Code asks through their
 # permission prompt tool, which the runner never pre-approves.
@@ -132,6 +154,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "model": ["--model", "{model}"],
         "live": ["--input-format", "stream-json"],
         "remote_control": ["remote-control", "--name", "{rc_name}", "--spawn", "{rc_spawn}"],
+        "cli_version": ["--version"],
+        "auth_status": ["auth", "status", "--json"],
+        "auth_logout": ["auth", "logout"],
         "models": ["opus", "sonnet", "haiku", "fable"],  # suggestions; any model id works
         "parser": "claude-stream",
         # Claude Code refuses to start "inside" another Claude Code session;
@@ -179,6 +204,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         # The fake needs its script first (the rest is Claude's).
         "remote_control": [str(HERE / "selftest_agent.py"), "remote-control", "--name", "{rc_name}",
                            "--spawn", "{rc_spawn}"],
+        "cli_version": [str(HERE / "selftest_agent.py"), "--version"],
+        "auth_status": [str(HERE / "selftest_agent.py"), "auth", "status", "--json"],
+        "auth_logout": [str(HERE / "selftest_agent.py"), "auth", "logout"],
         "models": ["fake-small", "fake-large"],
         "parser": "claude-stream",
         "job_mcp": "mcp-config",
@@ -186,6 +214,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "strict_mcp_args": ["--strict-mcp-config"],
         "allow_tools_flag": "--allowedTools",
         "terminal": "selftest --resume {session_id}",  # a pretend command, for the tests
+        # Its transcripts go to CLAUDE_CONFIG_DIR only when its own env sets one (runner.json), never to one the
+        # runner happens to have: that would be a real Claude Code folder (see session_config_dir).
+        "unset_env": ["CLAUDE_CONFIG_DIR"],
         # The fake needs its script first (the CLI flags are Claude's).
         "usage_check": {"args": [str(HERE / "selftest_agent.py"), "-p", "--output-format", "stream-json",
                                  "--verbose", "--max-turns", "1", "--permission-mode", "dontAsk"],
@@ -361,9 +392,10 @@ SECRET_VALUE_RES = [
     # gldt deploy, glrt/glrtr runner (glrtr: made from a registration token), glptt trigger, glft feed, glimt incoming email, glagent Kubernetes agent,
     # gloas OAuth application secret, glcbt CI job, glsoat SCIM, glffct feature flags client, glwt workspace.
     re.compile(r"\bgl(?:pat|dt|rtr?|ptt|ft|imt|agent|oas|cbt|soat|ffct|wt)-[A-Za-z0-9_-]{20,}"),
-    # Agent Bullpen machine and job tokens: "bp_" or "bpj_" and secrets.token_urlsafe(32), which is always
-    # 43 URL-safe characters. Only that exact shape, so names like bp_admin_routes are left alone.
-    re.compile(r"\bbpj?_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
+    # Agent Bullpen machine, job and per-machine MCP tokens: "bp_", "bpj_" or "bpm_" and
+    # secrets.token_urlsafe(32), which is always 43 URL-safe characters. Only that exact shape, so names
+    # like bp_admin_routes are left alone.
+    re.compile(r"\bbp[jm]?_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
     # JWTs. Tried once per run of key characters (the run must end in ".xxxxxxxx."), so a long run can't
     # make it backtrack; a word joined to the token by a hyphen is masked with it.
     re.compile(r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{8,}\.)[A-Za-z0-9_-]*?\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"),
@@ -678,7 +710,8 @@ def agent_features(spec: dict, env: dict) -> list[str]:
     own, so the names mean what they say. summary: it can continue a job's session for a summary
     (can_summarize). limits: its jobs report the account's plan limits (a claude.ai login or a
     setup-token token). usage_check: "Check limits" can ask it for them, and remote_control: it
-    can run Remote Control (a full login only: a setup-token token can do neither)."""
+    can run Remote Control (a full login only: a setup-token token can do neither). sign_out: "Sign out"
+    can run its auth_logout (a full login only)."""
     features = []
     claude_like = spec.get("parser") == "claude-stream"
     auth = claude_auth(env) if claude_like else ""
@@ -707,7 +740,161 @@ def agent_features(spec: dict, env: dict) -> list[str]:
         features.append("usage_check")
     if claude_like and auth == "login" and isinstance(spec.get("remote_control"), list) and spec["remote_control"]:
         features.append("remote_control")
+    if claude_like and auth == "login" and isinstance(spec.get("auth_logout"), list) and spec["auth_logout"]:
+        features.append("sign_out")
+    if takes_session_moves(spec, env):
+        features.append("session_move")
     return features
+
+
+# ------------------------------------------------------------------ moving a session (exact moves)
+# "Continue on another machine" on the dashboard can move one Claude Code session to another machine signed in to the
+# same account (hub/moves.py). Claude Code keeps each session's transcript as
+#   <config folder>/projects/<project folder>/<session id>.jsonl
+# where the config folder is CLAUDE_CONFIG_DIR or ~/.claude, and the project folder is the working folder's path with
+# every character other than a letter or digit replaced by "-" (a name over 200 characters is cut and gets a hash
+# instead, which isn't documented, so such paths can't move), or CLAUDE_CODE_PROJECT_DIR_NAME when it is set with
+# CLAUDE_CONFIG_DIR (https://code.claude.com/docs/en/sessions, "Where transcripts are stored", checked 2026-11-17).
+# The runner reads and writes that one file, by its exact path: nothing else in the config folder (no login, no
+# settings), no listing, and never through a link.
+SESSION_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+SESSION_MOVE_MAX_BYTES = 256 * 1024 * 1024  # the most a runner ever reads or writes, whatever the hub asks
+CLAUDE_DIR_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+CLAUDE_PROJECT_NAME_MAX = 200
+
+
+class SessionMoveError(Exception):
+    """A session that can't be read or written here. The message says why, for the job's error."""
+
+
+def takes_session_moves(spec: dict, env: dict) -> bool:
+    """Can this agent's sessions move between machines: a Claude Code agent (or the self-test one) that resumes a
+    session by its id and keeps transcripts (CLAUDE_CODE_SKIP_PROMPT_HISTORY turns them off)?"""
+    resume = spec.get("resume")
+    return (spec.get("preset") in ("claude", "selftest") and spec.get("parser") == "claude-stream"
+            and isinstance(resume, list) and any("{session_id}" in str(a) for a in resume)
+            and not env.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY"))
+
+
+def session_config_dir(spec: dict, env: dict) -> Path:
+    """The agent's config folder, where its sessions are: CLAUDE_CONFIG_DIR, else ~/.claude (the self-test agent's
+    pretend one is in the runner's own folder, so tests never touch a real one)."""
+    custom = env.get("CLAUDE_CONFIG_DIR") or ""
+    if custom:
+        return Path(expand_path(custom))
+    if spec.get("preset") == "selftest":
+        return BASE_DIR / "selftest" / "claude"
+    return HOME / ".claude"
+
+
+def claude_project_dirnames(workdir: str, env: dict) -> list[str]:
+    """The names Claude Code may give the project folder of sessions started in workdir, most likely first: the
+    pinned name (CLAUDE_CODE_PROJECT_DIR_NAME with CLAUDE_CONFIG_DIR), else the path with every character other than
+    a letter or digit made "-". On Linux and macOS the path with its links resolved comes first (the folder a
+    program finds itself in), then the path as written. Paths with other than plain ASCII characters, or whose name
+    would be over 200 characters, give none: their names aren't documented."""
+    pinned = env.get("CLAUDE_CODE_PROJECT_DIR_NAME") or ""
+    if env.get("CLAUDE_CONFIG_DIR") and CLAUDE_DIR_NAME_RE.match(pinned):
+        return [pinned]
+    paths = [os.path.abspath(workdir)] if IS_WINDOWS else [os.path.realpath(workdir), os.path.abspath(workdir)]
+    names: list[str] = []
+    for path in paths:
+        name = claude_project_dirname(path)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def claude_project_dirname(path: str) -> str | None:
+    """Claude Code's project folder name for a full path ("/home/me/myapp" gives "-home-me-myapp"), or None for a
+    path with other than plain ASCII characters or a name over 200 characters (not documented)."""
+    if not all(ord(c) < 128 for c in path):
+        return None
+    name = re.sub(r"[^A-Za-z0-9]", "-", path)
+    return name if len(name) <= CLAUDE_PROJECT_NAME_MAX else None
+
+
+def _plain_file(path: Path) -> bool:
+    """A file of its own (not a link, a folder or a device); False when there is nothing there."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    """Is path inside folder, with every link resolved?"""
+    try:
+        Path(os.path.realpath(path)).relative_to(os.path.realpath(folder))
+        return True
+    except ValueError:
+        return False
+
+
+def find_session_transcript(config_dir: Path, workdir: str, session_id: str, env: dict) -> Path:
+    """The transcript of this session, started in workdir: an exact path tried for each name the project folder may
+    have (claude_project_dirnames). Raises SessionMoveError."""
+    if not SESSION_UUID_RE.match(session_id or ""):
+        raise SessionMoveError("this session's id isn't a Claude Code session id")
+    names = claude_project_dirnames(workdir, env)
+    if not names:
+        raise SessionMoveError(f"the project folder {workdir} has a path Claude Code names in a way that isn't "
+                               "documented (non-ASCII characters, or very long)")
+    projects = config_dir / "projects"
+    for name in names:
+        path = projects / name / f"{session_id}.jsonl"
+        if os.path.lexists(path):
+            if not _plain_file(path) or not _inside(path, projects):
+                raise SessionMoveError(f"{path} isn't a plain file, so it isn't read")
+            return path
+    raise SessionMoveError(f"no transcript of session {session_id} in {projects / names[0]}")
+
+
+def read_session_transcript(path: Path, max_bytes: int) -> bytes:
+    """The transcript's bytes, as they are (never masked: that would change the session). Raises SessionMoveError
+    when it is larger than max_bytes."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as err:
+        raise SessionMoveError(f"couldn't open the transcript ({err.strerror or err})")
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise SessionMoveError("the transcript isn't a plain file")
+        data = fh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise SessionMoveError(f"the session is larger than {max_bytes // (1024 * 1024)} MB, the most that can move")
+    return data
+
+
+def install_session_transcript(config_dir: Path, workdir: str, session_id: str, data: bytes, env: dict) -> Path:
+    """Write a moved session's transcript where this machine's agent looks for it first: its project folder for
+    workdir. A transcript already there under that id (the session moved here before) is set aside next to it as
+    <id>.jsonl.superseded-<time>, as Claude Code does itself, not overwritten. Raises SessionMoveError."""
+    if not SESSION_UUID_RE.match(session_id or ""):
+        raise SessionMoveError("this session's id isn't a Claude Code session id")
+    names = claude_project_dirnames(workdir, env)
+    if not names:
+        raise SessionMoveError(f"the project folder {workdir} has a path Claude Code names in a way that isn't "
+                               "documented (non-ASCII characters, or very long)")
+    projects = config_dir / "projects"
+    folder = projects / names[0]
+    try:
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as err:
+        raise SessionMoveError(f"couldn't make the folder {folder} ({err.strerror or err})")
+    if os.path.islink(folder) or not _inside(folder, config_dir):
+        raise SessionMoveError(f"{folder} is a link, so nothing is written there")
+    path = folder / f"{session_id}.jsonl"
+    try:
+        if os.path.lexists(path):
+            if not _plain_file(path):
+                raise SessionMoveError(f"{path} isn't a plain file, so it isn't replaced")
+            os.replace(path, path.with_name(f"{path.name}.superseded-{int(time.time() * 1000)}"))
+        write_private_bytes(path, data)
+    except OSError as err:
+        raise SessionMoveError(f"couldn't write {path} ({err.strerror or err})")
+    return path
 
 
 def cli_command(spec: dict, env: dict) -> str:
@@ -716,6 +903,11 @@ def cli_command(spec: dict, env: dict) -> str:
     preset = spec.get("preset")
     if preset == "claude":
         cfg_dir = env.get("CLAUDE_CONFIG_DIR") or ""
+        # An agent whose command is a wrapper of its own on PATH (runner.json "command": "claude-work") is
+        # started by that name, which sets up its login itself.
+        own = re.sub(r"(?i)\.(exe|cmd|bat|ps1)$", "", str(spec.get("command") or ""))
+        if own != "claude" and COMMAND_NAME_RE.fullmatch(own):
+            return own
         if not cfg_dir:
             return "claude"
         name = spec.get("name") or ""
@@ -963,8 +1155,11 @@ def git_credentials(account: dict) -> str:
                      if account.get(field)) or "no ssh key or token"
 
 
-def agent_status(cfg: dict, name: str) -> dict:
-    """What the dashboard shows about an agent: is it installed, does it look logged in?"""
+def agent_status(cfg: dict, name: str, sign_in: dict | None = None) -> dict:
+    """What the dashboard shows about an agent: is it installed, does it look logged in? sign_in: what
+    its CLI last said about its sign-in (SignInStore.view), when the runner has checked; a Claude agent
+    the CLI calls signed out isn't ready. Without an answer (none yet, or a CLI too old to say), the
+    login file is looked for instead."""
     spec = agent_spec(cfg, name)
     info: dict[str, Any] = {"name": name, "label": spec.get("label", name), "preset": spec.get("preset", "text"),
                             "ready": True, "note": "", "models": list(spec.get("models") or []),
@@ -980,12 +1175,22 @@ def agent_status(cfg: dict, name: str) -> dict:
     if resolve_command(spec) is None:
         info.update(ready=False, note=f"'{spec.get('command')}' not found on this machine")
         return info
+    state = sign_in.get("state") if isinstance(sign_in, dict) else None
+    if state in SIGN_IN_STATES and sign_in_applies(spec, env):
+        # The login command is shown on the machine page, to run on this machine itself.
+        info["sign_in"] = {**sign_in, "command": cli_command(spec, env) + " auth login"}
+    else:
+        state = None
     if spec.get("preset") == "claude":
         cfg_dir = Path(env.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
         if env.get("ANTHROPIC_API_KEY"):
             info["note"] = "uses an API key (billed per token)"
         elif env.get("CLAUDE_CODE_OAUTH_TOKEN"):
             info["note"] = "uses a long-lived subscription token"
+        elif state == "in":
+            pass  # the CLI says so itself (on a Mac too, where the login is in the Keychain)
+        elif state == "out":
+            info.update(ready=False, note=f"signed out; run '{cli_command(spec, env)} auth login' on this machine")
         elif (cfg_dir / ".credentials.json").exists():
             pass
         elif IS_MACOS:
@@ -1001,6 +1206,219 @@ def agent_status(cfg: dict, name: str) -> dict:
         else:
             info.update(ready=False, note=f"no Gemini API key (set one in {GEMINI_ENV})")
     return info
+
+
+# ============================================================ sign-in status
+# The machine page shows whether each Claude agent is signed in, from the CLI's own
+# "claude auth status --json", run with the agent's command and environment. It costs no usage.
+# The runner keeps only the fields in parse_auth_status (never the account's email, organization
+# or folders), and never reads a login's files or the macOS Keychain. Signing in is never done
+# from here: it happens on the machine itself, through Anthropic's own flow.
+# Claude Code's changelog (https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md, last
+# checked 2026-11-17): "claude auth status" and "claude auth logout" came in 2.1.41. Before 2.1.317,
+# "auth status" could exit in the middle of a token refresh and sign the login out (fixed in 2.1.301
+# and 2.1.317), so the runner asks only 2.1.317 and newer; older ones show "Unknown (CLI too old)".
+AUTH_STATUS_SINCE = (2, 1, 317)
+AUTH_LOGOUT_SINCE = (2, 1, 41)
+SIGN_IN_EVERY = 600          # seconds between checks of a signed-in agent
+SIGN_IN_RETRY = 60           # ... of one that is signed out, or couldn't be checked
+SIGN_IN_TIMEOUT = 120        # generous: cutting "auth status" off during a token refresh is what harmed logins
+SIGN_IN_STATES = ("in", "out", "unknown")
+SIGN_IN_WORD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,39}$")
+# The fields kept from "auth status --json", and the names they go by in the check-in.
+SIGN_IN_FIELDS = (("authMethod", "method"), ("apiProvider", "provider"), ("subscriptionType", "plan"),
+                  ("planTier", "tier"))
+CLI_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_auth_status(text: str) -> dict | None:
+    """What "auth status --json" printed, as {"state": "in" or "out", and any of "method", "provider",
+    "plan", "tier" (short plain words) and "expires_at" (epoch seconds)}; None when it isn't that JSON
+    (an older CLI, an error message). Nothing else is kept: no email, organization or folder."""
+    text = (text or "").strip()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")  # a line printed before or after the JSON
+        try:
+            data = json.loads(text[start:end + 1]) if 0 <= start < end else None
+        except ValueError:
+            return None
+    if not isinstance(data, dict) or not isinstance(data.get("loggedIn"), bool):
+        return None
+    out: dict[str, Any] = {"state": "in" if data["loggedIn"] else "out"}
+    for field, key in SIGN_IN_FIELDS:
+        value = data.get(field)
+        if isinstance(value, str) and SIGN_IN_WORD_RE.match(value):
+            out[key] = value
+    expires = data.get("loginExpiresAt")
+    when = _iso_epoch(expires) if isinstance(expires, str) else None
+    if when is not None:
+        out["expires_at"] = when
+    return out
+
+
+def cli_run(argv: list[str], env: dict, timeout: float) -> tuple[int, str, str] | None:
+    """Run one short CLI command (no input, no window on Windows); (exit code, stdout, stderr) or None."""
+    try:
+        done = subprocess.run(argv, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, stdin=subprocess.DEVNULL,
+                              creationflags=0x08000000 if IS_WINDOWS else 0)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as err:
+        log.warning("%s failed: %s", redact_argv(argv[:4]), err)
+        return None
+    return done.returncode, done.stdout or "", done.stderr or ""
+
+
+def cli_version(spec: dict, env: dict) -> tuple[int, int, int] | None:
+    """The agent's CLI version from its cli_version arguments, run with its environment (asked each time:
+    a check runs every few minutes at most, and the CLI may have updated itself); None when it has none or
+    doesn't say."""
+    exe, args = resolve_command(spec), spec.get("cli_version")
+    if exe is None or not isinstance(args, list) or not args:
+        return None
+    done = cli_run([exe, *[str(a) for a in args]], env, 60)
+    m = CLI_VERSION_RE.search(done[1] + "\n" + done[2]) if done is not None and done[0] == 0 else None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def sign_in_applies(spec: dict, env: dict) -> bool:
+    """Does the machine page show this agent's sign-in: a Claude agent with a full login (not an API key,
+    a token or another service) whose CLI can say (auth_status)?"""
+    return spec.get("parser") == "claude-stream" and claude_auth(env) == "login" \
+        and isinstance(spec.get("auth_status"), list) and bool(spec["auth_status"])
+
+
+def check_sign_in(spec: dict, env: dict) -> dict:
+    """Ask the agent's CLI whether it is signed in: parse_auth_status's answer, or {"state": "unknown",
+    "why": "old"} for a CLI too old to ask, "error" when it didn't answer."""
+    exe = resolve_command(spec)
+    if exe is None:
+        return {"state": "unknown", "why": "error"}
+    version = cli_version(spec, env)
+    if version is None:
+        return {"state": "unknown", "why": "error"}
+    if version < AUTH_STATUS_SINCE:
+        return {"state": "unknown", "why": "old"}
+    done = cli_run([exe, *[str(a) for a in spec["auth_status"]]], env, SIGN_IN_TIMEOUT)
+    # Signed out, it may exit non-zero and still say so: the answer is read whatever the exit code. Its
+    # output first, so a notice on stderr can't spoil the JSON.
+    parsed = (parse_auth_status(done[1]) or parse_auth_status(done[1] + "\n" + done[2])) if done is not None else None
+    return parsed or {"state": "unknown", "why": "error"}
+
+
+class SignInStore:
+    """Each Claude agent's latest sign-in status, checked in the background: when the runner starts, then
+    every SIGN_IN_EVERY seconds (SIGN_IN_RETRY while it is signed out or couldn't be checked), never while
+    one of the agent's jobs runs, and right after a sign-out. In memory only."""
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.changed = threading.Event()  # a status changed; the runner checks in soon after
+        self.entries: dict[str, dict] = {}  # agent: {"key", "at", "view"}
+        self.busy: set[str] = set()
+        # One per agent, held while its CLI is asked or signed out: a status check during "auth logout" could
+        # save a refreshed login after the logout, or write "signed in" over the answer that follows it.
+        self.agent_locks: dict[str, threading.Lock] = {}
+
+    def agent_lock(self, agent: str) -> threading.Lock:
+        with self.lock:
+            return self.agent_locks.setdefault(agent, threading.Lock())
+
+    @staticmethod
+    def key(spec: dict, env: dict) -> tuple:
+        """What the answer depends on: the program, its arguments and its settings folder."""
+        return (resolve_command(spec), tuple(str(a) for a in spec.get("auth_status") or []),
+                env.get("CLAUDE_CONFIG_DIR") or "")
+
+    def view(self, agent: str, key: tuple) -> dict | None:
+        with self.lock:
+            entry = self.entries.get(agent)
+            return dict(entry["view"]) if entry and entry["key"] == key else None
+
+    def due(self, agent: str, key: tuple) -> bool:
+        with self.lock:
+            if agent in self.busy:
+                return False
+            entry = self.entries.get(agent)
+            if not entry or entry["key"] != key:
+                return True
+            wait = SIGN_IN_EVERY if entry["view"].get("state") == "in" else SIGN_IN_RETRY
+            return self.clock() - entry["at"] >= wait
+
+    def refresh(self, agent: str, spec: dict, env: dict) -> dict:
+        """Check now (in this thread, after any check or sign-out of this agent already running) and keep the
+        answer."""
+        with self.agent_lock(agent):
+            return self.refresh_held(agent, spec, env)
+
+    def refresh_held(self, agent: str, spec: dict, env: dict) -> dict:
+        """refresh(), for a caller that holds agent_lock(agent) already."""
+        key = self.key(spec, env)
+        with self.lock:
+            self.busy.add(agent)
+        try:
+            view = check_sign_in(spec, env)
+            view["checked_at"] = self.clock()
+        finally:
+            with self.lock:
+                self.busy.discard(agent)
+        with self.lock:
+            before = self.entries.get(agent)
+            if not before or {k: v for k, v in before["view"].items() if k != "checked_at"} \
+                    != {k: v for k, v in view.items() if k != "checked_at"}:
+                self.changed.set()
+            self.entries[agent] = {"key": key, "at": self.clock(), "view": view}
+        return view
+
+    def refresh_due(self, cfg: dict, running: set) -> None:
+        """Start a background check for each agent that is due and has no job running."""
+        for name in list(cfg.get("agents") or {}):
+            try:
+                spec = agent_spec(cfg, name)
+            except (KeyError, TypeError, AttributeError):
+                continue
+            env = build_env(spec)
+            if name in running or not sign_in_applies(spec, env) or not self.due(name, self.key(spec, env)):
+                continue
+            with self.lock:
+                self.busy.add(name)  # so the next pass doesn't start a second one
+            threading.Thread(target=self._refresh_quietly, args=(name, spec, env), daemon=True).start()
+
+    def _refresh_quietly(self, agent: str, spec: dict, env: dict) -> None:
+        lock = self.agent_lock(agent)
+        if not lock.acquire(blocking=False):  # a sign-out (or another check) is running: it checks after itself
+            with self.lock:
+                self.busy.discard(agent)
+            return
+        try:
+            self.refresh_held(agent, spec, env)
+        except Exception:  # never let a check take the runner down
+            log.exception("sign-in check for %s failed", agent)
+            with self.lock:
+                self.busy.discard(agent)
+        finally:
+            lock.release()
+
+
+def sign_out(spec: dict, env: dict) -> tuple[bool, str]:
+    """Run the agent's own "auth logout" (its command and environment): (worked, its output, masked)."""
+    exe = resolve_command(spec)
+    args = spec.get("auth_logout")
+    if exe is None or not isinstance(args, list) or not args:
+        return False, "This agent can't be signed out from the dashboard."
+    version = cli_version(spec, env)
+    if version is None:
+        return False, "Couldn't tell which version of the CLI this is, so it wasn't asked to sign out."
+    if version < AUTH_LOGOUT_SINCE:
+        return False, ("This version of Claude Code has no 'auth logout'. Update Claude Code on this machine, "
+                       "or run /logout in it there.")
+    done = cli_run([exe, *[str(a) for a in args]], env, 120)
+    if done is None:
+        return False, "The sign-out command didn't finish (see the runner log)."
+    text = RC_EMAIL_RE.sub("…@…", redact((done[1] + "\n" + done[2]).strip()))[-1500:]
+    return done[0] == 0, text
 
 
 # ================================================================ hub client
@@ -1022,6 +1440,26 @@ class Hub:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg['token']}",
                    "User-Agent": f"bullpen-runner/{VERSION}", **cf_access_headers(cfg)}
         return post_json(url, payload, headers, timeout)
+
+    def call_bytes(self, path: str, data: bytes, content_type: str = "application/octet-stream",
+                   headers: dict | None = None, timeout: float = 120) -> tuple[int, bytes, dict]:
+        """A POST whose body, or answer, is raw bytes (a moved session's transcript): (status, body, headers). An
+        error's body is FastAPI's message, as text."""
+        cfg = self.get_cfg()
+        url = cfg["hub_url"].rstrip("/") + path
+        sent = {"Content-Type": content_type, "Authorization": f"Bearer {cfg['token']}",
+                "User-Agent": f"bullpen-runner/{VERSION}", **cf_access_headers(cfg), **(headers or {})}
+        req = urllib.request.Request(url, data=data, headers=sent, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+        except urllib.error.HTTPError as err:
+            raw = err.read()[:2000].decode(errors="replace")
+            try:
+                detail = json.loads(raw).get("detail", raw)
+            except (ValueError, AttributeError):
+                detail = raw
+            return err.code, str(detail)[:500].encode(), {}
 
 
 def post_json(url: str, payload: dict, headers: dict | None = None, timeout: float = 30) -> tuple[int, dict | None]:
@@ -2196,6 +2634,53 @@ def load_jsonc(path: Path) -> tuple[dict, bool]:
     return json.loads(_jsonc_pass(_jsonc_pass(text, True), False)), True
 
 
+MCP_TOKEN_FILE = BASE_DIR / "mcp-token.json"  # this machine's own MCP token (keep_machine_mcp_token), private
+MCP_TOKEN_LOCK = BASE_DIR / "mcp-token.lock"  # held while one sync reads, renews and keeps that token
+MCP_TOKEN_RE = re.compile(r"^bpm_[A-Za-z0-9_-]{43}$")  # the shape the hub makes
+
+
+def read_machine_mcp_token(cfg: dict, path: Optional[Path] = None) -> str:
+    """This machine's own MCP token, as the hub at cfg's hub_url last gave it ('' for none). The hub keeps only
+    its sha256, so the runner keeps the token itself, readable only by its user, and sends it back at each sync."""
+    path = path or MCP_TOKEN_FILE
+    try:
+        data = json.loads(read_private(path))
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError, UnicodeError) as err:
+        log.warning("couldn't read %s (%s); the hub makes a new MCP token for this machine", path, err)
+        return ""
+    if not isinstance(data, dict) or data.get("hub_url") != str(cfg.get("hub_url") or "").rstrip("/"):
+        return ""  # made by another hub: never sent to this one
+    token = data.get("token")
+    return token if isinstance(token, str) and MCP_TOKEN_RE.match(token) else ""
+
+
+def keep_machine_mcp_token(cfg: dict, context: dict, held: str, path: Optional[Path] = None) -> None:
+    """After a sync: keep the MCP token the hub gave this machine (mcp_token_kind "machine"), atomically and
+    private, when it is new. A hub that gives the shared token (a machine on the shared runner token, or an older
+    hub) makes a kept one useless, so it is deleted. The token itself is never logged."""
+    path = path or MCP_TOKEN_FILE
+    if context.get("mcp_token_kind") != "machine":
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError as err:
+                log.warning("couldn't remove %s (%s)", path, err)
+        return
+    token = context.get("mcp_token")
+    if not isinstance(token, str) or not MCP_TOKEN_RE.match(token) or token == held:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_private(path, json.dumps({"hub_url": str(cfg.get("hub_url") or "").rstrip("/"), "token": token}) + "\n")
+    except OSError as err:
+        log.warning("couldn't save this machine's MCP token in %s (%s); after a restart the hub makes a new one",
+                    path, err)
+        return
+    log.info("the hub gave this machine a new MCP token; this sync writes it into the agents' settings")
+
+
 def claude_import(path: Path) -> str:
     """An @import line Claude Code understands, on Linux and Windows."""
     try:
@@ -2276,15 +2761,33 @@ class Wiring:
 
     def install_kit(self, prefix: str, dest: Path, label: str) -> None:
         for rel, text in self.kit_files(prefix).items():
-            target = dest / rel
-            if target.exists():
-                old = target.read_text(encoding="utf-8", errors="replace")
-                legacy = hashlib.sha256(old.replace("\r\n", "\n").encode()).hexdigest() in LEGACY_KIT_SHA256
-                if MARKER not in old and not legacy:
-                    self.notes.append(f"{label}: {target} exists and isn't ours, so it was left alone")
-                    continue
-            if write_if_changed(target, text):
-                self.emit(f"{label}: wrote {target}")
+            self.install_kit_file(dest / rel, text, label)
+
+    def install_kit_file(self, target: Path, text: str, label: str) -> None:
+        if target.exists():
+            old = target.read_text(encoding="utf-8", errors="replace")
+            legacy = hashlib.sha256(old.replace("\r\n", "\n").encode()).hexdigest() in LEGACY_KIT_SHA256
+            if MARKER not in old and not legacy:
+                self.notes.append(f"{label}: {target} exists and isn't ours, so it was left alone")
+                return
+        if write_if_changed(target, text):
+            self.emit(f"{label}: wrote {target}")
+
+    def remove_kit_file(self, dest: Path, rel: str, label: str) -> None:
+        """Take out an add-on file an earlier sync wrote (and the folders it leaves empty). A file that
+        isn't ours stays."""
+        target = dest / rel
+        if not target.is_file() or target.is_symlink() or not made_by_runner(target):
+            return
+        target.unlink()
+        self.emit(f"{label}: removed {target}")
+        parent = target.parent
+        while parent != dest and _inside(parent, dest):
+            try:
+                parent.rmdir()  # only when it is empty: a file of your own keeps it
+            except OSError:
+                break
+            parent = parent.parent
 
     def sync_servers(self, key: str, current: dict, desired: dict, label: str,
                      apply: Callable[[str, dict | None], bool]) -> None:
@@ -2403,9 +2906,9 @@ class Wiring:
             lines.append("@[Shared memory from the Agent Bullpen](~/.gemini/bullpen-shared.md)")
         if set_block(g / "GEMINI.md", lines):
             self.emit(f"{label}: updated {g / 'GEMINI.md'}")
-        # 2. Commands and skills (the skills folder is read by Gemini CLI and the agy CLI).
+        # 2. Commands and skills.
         self.install_kit("gemini/commands/", g / "commands", label)
-        self.install_kit("skills/", g / "skills", label)
+        self.gemini_skills(label)
         # 3. MCP servers in settings.json.
         settings_file = g / "settings.json"
         try:
@@ -2439,6 +2942,38 @@ class Wiring:
             if had_comments:
                 shutil.copy2(settings_file, settings_file.with_name("settings.json.bak-bullpen"))
             write_if_changed(settings_file, json.dumps(settings, indent=2) + "\n", private=True)
+
+    def gemini_reads_shared_skills(self) -> bool:
+        """Whether Gemini CLI on this machine reads the runner's ~/.agents/skills. Gemini CLI 0.28 and later
+        reads <its home>/.agents/skills as another name for <its home>/.gemini/skills, and its home is
+        GEMINI_CLI_HOME when that is set."""
+        return self.has_gemini and (
+            os.path.normcase(os.path.abspath(self.gemini_dir.parent)) == os.path.normcase(os.path.abspath(HOME)))
+
+    def gemini_skills(self, label: str) -> None:
+        """The add-on skills in ~/.gemini/skills, unless Gemini CLI finds them in ~/.agents/skills already.
+        Gemini CLI warns of a "skill conflict" when a skill is in both. So a skill that is in
+        ~/.agents/skills (ours or yours) is left out here, and a copy an earlier sync wrote here is taken
+        out. Gemini CLI older than 0.28 loses only that copy: /remember and /recall are also its commands,
+        in ~/.gemini/commands.
+        The Antigravity CLI reads ~/.gemini/skills, ~/.gemini/antigravity-cli/skills and
+        ~/.gemini/config/skills, but not ~/.agents/skills. When it has its own folder and the Antigravity
+        skills folder (config/skills) isn't written, it gets the skill in its own folder."""
+        dest = self.gemini_dir / "skills"
+        agy_cli = self.gemini_dir / "antigravity-cli" / "skills"
+        shared = HOME / ".agents" / "skills"
+        reads_shared = self.gemini_reads_shared_skills()
+        agy_cli_needs_it = agy_cli.parent.is_dir() and not self.has_antigravity
+        for rel, text in self.kit_files("skills/").items():
+            in_shared = reads_shared and (shared / rel.split("/")[0] / "SKILL.md").is_file()
+            if in_shared:
+                self.remove_kit_file(dest, rel, label)
+            else:
+                self.install_kit_file(dest / rel, text, label)
+            if in_shared and agy_cli_needs_it:
+                self.install_kit_file(agy_cli / rel, text, "Antigravity CLI")
+            else:
+                self.remove_kit_file(agy_cli, rel, "Antigravity CLI")
 
     def antigravity(self) -> None:
         g = self.gemini_dir
@@ -2476,10 +3011,29 @@ class Wiring:
                 shutil.copy2(mcp_file, mcp_file.with_name("mcp_config.json.bak-bullpen"))
             write_if_changed(mcp_file, json.dumps(data, indent=2) + "\n", private=True)
 
+    # -- the shared skills folder (~/.agents/skills) ------------------------------
+    def shared_skills(self) -> None:
+        """The add-ons for every agent, in the user-level skills folder that many agent CLIs read
+        (Codex, OpenCode, Copilot CLI, Cursor, Qwen Code, Kimi, Vibe, Amp and others). Gemini CLI reads
+        this folder too (see gemini_skills), so a skill you made yourself in ~/.gemini/skills keeps that
+        name: ours isn't put here, where it would replace yours and make Gemini CLI warn."""
+        label, dest = "Shared skills folder", HOME / ".agents" / "skills"
+        gemini_own = self.gemini_dir / "skills"
+        reads_shared = self.gemini_reads_shared_skills()
+        for rel, text in self.kit_files("skills/").items():
+            yours = gemini_own / rel.split("/")[0] / "SKILL.md"
+            if reads_shared and yours.is_file() and not made_by_runner(yours):
+                self.remove_kit_file(dest, rel, label)
+                if rel.endswith("/SKILL.md"):
+                    self.notes.append(f"{label}: Gemini CLI has a skill of yours at {yours}, so the runner's "
+                                      f"wasn't put in {dest}")
+                continue
+            self.install_kit_file(dest / rel, text, label)
+
     # -- the `bullpen` command (fallback for skills, handy in a terminal) ----------
     def command(self) -> None:
         bin_dir = HOME / ".local" / "bin"
-        python = sys.executable
+        python = stable_python()
         if IS_WINDOWS and python.lower().endswith("pythonw.exe"):
             python = python[:-len("pythonw.exe")] + "python.exe"
         runner = HERE / "runner.py"
@@ -2515,7 +3069,9 @@ class Wiring:
             lock.release()
 
     def _run_steps(self) -> list[str]:
-        steps = [("Claude", self.claude), ("bullpen command", self.command)]
+        # The shared skills folder before Gemini CLI: gemini_skills() looks at what is there.
+        steps = [("Claude", self.claude), ("Shared skills folder", self.shared_skills),
+                 ("bullpen command", self.command)]
         if self.has_gemini:
             steps.append(("Gemini", self.gemini))
         if self.has_antigravity:
@@ -3088,11 +3644,21 @@ def write_private(path: Path, text: str) -> None:
     """Write a file only its owner can read, from the first byte (like save_config). The text goes
     to a temporary file next to it, which then replaces the file in one step, so a reader (or a
     crash halfway) never finds it empty or half written."""
+    _write_private(path, text)
+
+
+def write_private_bytes(path: Path, data: bytes) -> None:
+    """write_private for bytes, written exactly as they are (no line-ending change on Windows)."""
+    _write_private(path, data)
+
+
+def _write_private(path: Path, content: str | bytes) -> None:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    binary = getattr(os, "O_BINARY", 0) if isinstance(content, bytes) else 0
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | binary, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        with (os.fdopen(fd, "wb") if isinstance(content, bytes) else os.fdopen(fd, "w", encoding="utf-8")) as fh:
+            fh.write(content)
         if not IS_WINDOWS:
             os.chmod(tmp, 0o600)  # in case a leftover existed with wider permissions
         for attempt in range(20):
@@ -3125,6 +3691,38 @@ def read_private(path: Path) -> str:
                 raise
             time.sleep(0.05)
     return path.read_text(encoding="utf-8")  # the 20th try; its error is raised
+
+
+INSTALL_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def install_id(path: Optional[Path] = None) -> str:
+    """This install's own id: a random value made once and kept in ~/.bullpen/install-id. The hub
+    uses it to tell computers apart that check in under one name; a host name can't do that, because
+    it changes by itself on some computers (a Mac's, with the network). '' when the file can't be
+    read or written: the hub then compares host names, as before. A copy of ~/.bullpen on another
+    computer carries the id along, so delete install-id there (guide 5)."""
+    path = path or BASE_DIR / "install-id"
+    for attempt in range(2):
+        try:
+            found = read_private(path).strip()
+        except FileNotFoundError:
+            found = ""
+        except (OSError, UnicodeError) as err:
+            log.warning("couldn't read %s (%s); the hub tells this computer apart by its host name", path, err)
+            return ""
+        if INSTALL_ID_RE.match(found):
+            return found
+        if attempt:
+            break
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_private(path, uuid.uuid4().hex + "\n")
+        except OSError as err:
+            log.warning("couldn't write %s (%s); the hub tells this computer apart by its host name", path, err)
+            return ""
+        # Read back what is there, so two processes that made one at the same moment agree on it.
+    return ""
 
 
 # Gemini CLI reads its settings in layers: its own defaults, then the system-defaults file, the
@@ -3918,6 +4516,14 @@ class Job:
         if model.startswith("-") or any(c.isspace() for c in model):
             return {"status": "error", "error": f"'{model}' isn't a valid model name"}
         resume = self.data.get("resume_session") or ""
+        move = options.get("move") if isinstance(options.get("move"), dict) else {}
+        if move.get("mode") == "exact":
+            # "Continue on another machine": the session's transcript comes from the machine that ran it first.
+            if not resume:
+                return {"status": "error", "error": "The hub sent no session to continue for this move."}
+            why = self._take_session(spec, build_env(spec), workdir, resume, str(move.get("copy") or ""))
+            if why:
+                return {"status": "error", "error": why}
         new_session_id = str(uuid.uuid4()) if spec.get("new_session") and not resume else ""
         values = {"{model}": model, "{session_id}": resume, "{workdir}": workdir, "{new_session_id}": new_session_id}
 
@@ -4365,6 +4971,10 @@ class Job:
             return self.runner.sync_from_hub(self.emit)
         if action == "usage.check":
             return self._usage_check(params if isinstance(params, dict) else {})
+        if action == "auth.logout":
+            return self._sign_out(params if isinstance(params, dict) else {})
+        if action == "session.export":
+            return self._session_export(params if isinstance(params, dict) else {})
         if action in ("rc.start", "rc.stop"):
             rc = getattr(self.runner, "rc", None)
             params = params if isinstance(params, dict) else {}
@@ -4376,8 +4986,122 @@ class Job:
             if not rc_allowed(cfg):
                 return {"status": "error", "error": f"{self.machine_name()} doesn't allow Remote Control from the "
                                                     "dashboard (allow_remote_control in its runner.json)."}
-            return rc.start(agent, project, self.emit)
+            # "Start again when the runner starts": the hub sends it only to runners that report they can.
+            keep = str(params.get("start_with_runner") or "").strip().lower() in ("1", "true")
+            return rc.start(agent, project, self.emit, keep=keep)
         return {"status": "error", "error": f"unknown action '{action}' (is this runner up to date?)"}
+
+    # -- "Sign out": the agent's own "auth logout", only where runner.json allows it ---------------------
+    def _sign_out(self, params: dict) -> dict:
+        cfg = self.runner.cfg
+        machine = self.machine_name()
+        agent = str(params.get("agent") or "")
+        if not sign_out_allowed(cfg):
+            return {"status": "error", "error": f"{machine} doesn't allow signing agents out from the dashboard "
+                                                "(allow_remote_sign_out in its runner.json)."}
+        if agent not in (cfg.get("agents") or {}):
+            return {"status": "error", "error": f"{machine} has no agent called '{agent}'."}
+        spec = agent_spec(cfg, agent)
+        env = build_env(spec)
+        if "sign_out" not in agent_features(spec, env):
+            return {"status": "error", "error": f"{agent} on {machine} has no claude.ai login to sign out of."}
+        busy_agents = getattr(self.runner, "busy_agents", None)
+        if callable(busy_agents) and agent in busy_agents():
+            return {"status": "error", "error": f"{agent} is running a job on {machine}. Sign it out once the job "
+                                                "has finished, or cancel the job first."}
+        rc = getattr(self.runner, "rc", None)
+        if rc is not None and any(e.get("agent") == agent and e.get("state") in ("starting", "running")
+                                  for e in rc.view()):
+            return {"status": "error", "error": f"Remote Control is running for {agent} on {machine}. Stop it "
+                                                "first."}
+        store = getattr(self.runner, "sign_in", None)
+        lock = store.agent_lock(agent) if store is not None else None
+        # Never at the same time as a status check of this agent: wait for one that is running.
+        if lock is not None and not lock.acquire(timeout=SIGN_IN_TIMEOUT + 30):
+            return {"status": "error", "error": f"{agent}'s sign-in check on {machine} didn't finish, so it wasn't "
+                                                "signed out. Try again in a few minutes."}
+        try:
+            self.emit(f"▶ {cli_command(spec, env)} auth logout")
+            worked, text = sign_out(spec, env)
+            if text:
+                self.emit(text)
+            now = store.refresh_held(agent, spec, env) if store is not None and sign_in_applies(spec, env) else None
+        finally:
+            if lock is not None:
+                lock.release()
+        state = {"in": "still signed in", "out": "signed out"}.get(str((now or {}).get("state")),
+                                                                     "not known (the CLI didn't say)")
+        if not worked:
+            return {"status": "error", "error": f"Signing {agent} out on {machine} didn't work. Its sign-in is "
+                                                f"{state} now." + (f"\n\n{text}" if text else "")}
+        return {"status": "done", "result": f"{agent} on {machine} is {state} now. To sign in again, run "
+                                            f"'{cli_command(spec, env)} auth login' on {machine} itself."}
+
+    # -- "Continue on another machine", the exact session: send its transcript to the hub ---------------
+    def _session_export(self, params: dict) -> dict:
+        """Read one session's transcript from the agent's config folder (find_session_transcript: that file only)
+        and send it to the hub, which hands it once to the machine the owner picked. Its content never goes to the
+        job's log."""
+        cfg = self.runner.cfg
+        agent, project = str(params.get("agent") or ""), str(params.get("project") or "")
+        session, copy_id = str(params.get("session_id") or ""), str(params.get("copy") or "")
+        if agent not in cfg["agents"]:
+            return {"status": "error", "error": f"agent '{agent}' is not configured on this machine"}
+        if project not in cfg["projects"]:
+            return {"status": "error", "error": f"project '{project}' is not configured on this machine"}
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", copy_id):
+            return {"status": "error", "error": "the hub sent no copy to fill (is the hub up to date?)"}
+        spec = agent_spec(cfg, agent)
+        env = build_env(spec)
+        if not takes_session_moves(spec, env):
+            return {"status": "error", "error": f"{agent}'s sessions can't move (only Claude Code agents' can)"}
+        try:
+            limit = min(int(params.get("max_bytes") or SESSION_MOVE_MAX_BYTES), SESSION_MOVE_MAX_BYTES)
+        except (TypeError, ValueError):
+            limit = SESSION_MOVE_MAX_BYTES
+        try:
+            path = find_session_transcript(session_config_dir(spec, env), expand_path(cfg["projects"][project]),
+                                           session, env)
+            data = read_session_transcript(path, limit)
+        except SessionMoveError as err:
+            why = str(err)
+            return {"status": "error", "error": f"{why[:1].upper()}{why[1:]}."}
+        digest = hashlib.sha256(data).hexdigest()
+        self.emit(f"Sending session {session} ({max(1, len(data) // 1024)} KB) to the hub.")
+        try:
+            status, body, _ = self.runner.hub.call_bytes(f"/api/runner/session-copies/{copy_id}", data,
+                                                        headers={"X-Bullpen-Sha256": digest})
+        except OSError as err:
+            return {"status": "error", "error": f"The hub couldn't be reached to send the session ({err})."}
+        if status != 200:
+            why = body.decode("utf-8", "replace").strip() or f"HTTP {status}"
+            return {"status": "error", "error": f"The hub didn't take the session: {why}"}
+        return {"status": "done", "result": f"Sent session {session} ({max(1, len(data) // 1024)} KB) to the hub, "
+                                            "for the machine you picked. It stays on this machine too."}
+
+    def _take_session(self, spec: dict, env: dict, workdir: str, session: str, copy_id: str) -> str:
+        """An exact move: take the session's transcript from the hub (once), check it, and write it where this
+        machine's agent finds it (install_session_transcript). Returns an error, or ''."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", copy_id or ""):
+            return "The hub sent no session copy for this move."
+        if not takes_session_moves(spec, env):
+            return f"{spec.get('name')}'s sessions can't move here (only Claude Code agents' can)."
+        try:
+            status, data, headers = self.runner.hub.call_bytes(
+                f"/api/runner/session-copies/{copy_id}/take", json.dumps({"job_id": self.id}).encode(),
+                content_type="application/json")
+        except OSError as err:
+            return f"The hub couldn't be reached for the session ({err})."
+        if status != 200:
+            return f"The session couldn't be taken from the hub: {data.decode('utf-8', 'replace').strip()}"
+        if len(data) > SESSION_MOVE_MAX_BYTES or hashlib.sha256(data).hexdigest() != headers.get("x-bullpen-sha256"):
+            return "The session arrived damaged (its checksum doesn't match). Move it again."
+        try:
+            install_session_transcript(session_config_dir(spec, env), workdir, session, data, env)
+        except SessionMoveError as err:
+            return f"The session couldn't be written here: {err}."
+        self.emit(f"Copied session {session} here ({max(1, len(data) // 1024)} KB); continuing it.")
+        return ""
 
     # -- "Check limits": ask Claude Code itself (/usage), under each agent's own login ----------------
     def _usage_check(self, params: dict) -> dict:
@@ -4713,6 +5437,10 @@ class Job:
 # the owner can drive Claude there from claude.ai/code or the Claude app (signed in to the same
 # account). Only when runner.json says "allow_remote_control": true. Each server stops after
 # remote_control_max_hours, on Stop, when the setting is turned off, and with the runner.
+# "Start again when the runner starts" (start_with_runner) keeps a server's choice in remote-control.json: the
+# next runner (after a reboot, say) starts it again once it has checked in, inside the same time limit (its
+# hours still count from the first start). Stop, the time limit, the setting turned off, the hub refusing
+# this machine and a start that fails all clear the choice, so nothing is tried over and over.
 RC_STATE_FILE = BASE_DIR / "remote-control.json"
 RC_URL_RE = re.compile(r"https://claude\.ai/\S+")
 RC_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+")
@@ -4721,6 +5449,10 @@ RC_STOP_GRACE = 5           # seconds between asking a server to stop and killin
 RC_KEEP_ENDED = 600         # seconds a failed or stopped server stays on the machine page
 RC_TAIL_LINES = 30          # lines of its output kept (masked) for messages
 RC_SHOWN_LINES = 5          # lines of that tail a message shows
+RC_ERROR_SETTLE = 1         # seconds Start waits for more lines after an "Error:" line, before it stops the server
+# A line Claude Code starts with "Error:" before it shows an address means the server didn't start, even
+# when the process stays up for a while before it exits.
+RC_ERROR_LINE_RE = re.compile(r"^\s*Error:")
 RC_RESTART_WITHIN = 600     # seconds after an update in which the new runner starts them again
 RC_MAX_HOURS = 8            # default remote_control_max_hours
 RC_MAX_SERVERS = 4          # default max_remote_control
@@ -4730,7 +5462,9 @@ RC_HEARTBEATS_REFUSED = 3   # check-ins answered 401 in a row before every serve
 RC_FLAG_VARS_RE = re.compile(r"\b(CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|DISABLE_GROWTHBOOK|"
                              r"CLAUDE_CODE_DISABLE_FEATURE_FLAGS)\b")
 RC_FAILURES = [
-    ("token", re.compile(r"(?i)full-scope login token|setup-token|CLAUDE_CODE_OAUTH_TOKEN")),
+    # `claude remote-control` already runs in a terminal in the same folder (it then waits a minute before it exits).
+    ("busy", re.compile(r"(?i)already served by a terminal")),
+    ("token",re.compile(r"(?i)full-scope login token|setup-token|CLAUDE_CODE_OAUTH_TOKEN")),
     # Couldn't reach the feature-flag service or read the organization's policy (offline, a proxy).
     ("unreachable", re.compile(r"(?i)couldn't verify (remote control eligibility|your organi[sz]ation's)|"
                                r"feature.flag service was unreachable")),
@@ -4760,6 +5494,11 @@ def rc_max_servers(cfg: dict) -> int:
 
 def rc_allowed(cfg: dict) -> bool:
     return cfg.get("allow_remote_control") is True
+
+
+def sign_out_allowed(cfg: dict) -> bool:
+    """runner.json "allow_remote_sign_out": may "Sign out" on the machine page sign an agent out here?"""
+    return cfg.get("allow_remote_sign_out") is True
 
 
 def hours_words(hours: float) -> str:
@@ -4884,6 +5623,10 @@ class RemoteControl:
         self.lock = threading.RLock()  # an RLock: the runner's signal handler may run while it is held
         self.servers: dict[tuple, dict] = {}   # (agent, project) -> what the machine page shows, and the process
         self.restart_after_update: list[dict] = []
+        # (agent, project) -> when that server first started: the ones to start again when the runner starts.
+        self.chosen: dict[tuple, float] = {}
+        self.restarting: set = set()        # (agent, project) being started again by this runner now
+        self.chosen_started = False         # start_chosen has run (once per runner)
         self.job_object: WindowsJobObject | None = None
         self.job_object_failed = False
         self.clock: Callable[[], float] = time.time  # the unit tests move it
@@ -4910,9 +5653,10 @@ class RemoteControl:
         return f"{agent} on {machine} can't run Remote Control (only Claude agents with a full login can)."
 
     def start(self, agent: str, project: str, emit: Callable[..., None] = lambda *a: None,
-              started: float | None = None) -> dict:
+              started: float | None = None, keep: bool = False) -> dict:
         """Start a server for (agent, project) and wait up to RC_URL_WAIT seconds for its address.
-        The outcome for the admin job."""
+        The outcome for the admin job. `keep`: start it again when the runner starts (kept only if it
+        runs; once a server was started, the choice is exactly that)."""
         cfg = self.runner.cfg
         machine = self._machine()
         with self.lock:
@@ -4967,25 +5711,43 @@ class RemoteControl:
                 "agent": agent, "project": project, "name": name, "spawn": spawn, "state": "starting",
                 "since": started if started is not None else now, "begun": time.monotonic(), "url": None,
                 "note": "", "error": "", "proc": proc, "tail": [], "secrets": secrets_, "workdir": workdir,
-                "spec": spec, "env": env, "ended": None, "changed": threading.Event()}
+                "spec": spec, "env": env, "ended": None, "changed": threading.Event(), "error_seen": False}
             self.servers[(agent, project)] = entry
             self._save()
         threading.Thread(target=self._read, args=(entry,), name=f"rc-{agent}-{project}", daemon=True).start()
 
         deadline = time.monotonic() + RC_URL_WAIT
-        while entry["state"] == "starting" and time.monotonic() < deadline:
+        while entry["state"] == "starting" and not entry["error_seen"] and time.monotonic() < deadline:
             entry["changed"].wait(0.25)
             entry["changed"].clear()
+        if entry["error_seen"]:  # give it a moment to say the rest (or to exit)
+            settle = time.monotonic() + RC_ERROR_SETTLE
+            while proc.poll() is None and time.monotonic() < settle:
+                entry["changed"].wait(0.1)
+                entry["changed"].clear()
+        refused = False
         with self.lock:
-            if entry["state"] == "starting":  # still up, but no address yet
+            if entry["state"] == "starting" and entry["error_seen"]:  # it said Error: and no address
+                entry.update(state="failed", error=self._failure(entry, None), ended=self.clock())
+                refused = True
+            elif entry["state"] == "starting":  # still up, but no address yet
                 entry.update(state="running", note="started, but hasn't shown its address")
             state = entry["state"]
+            if state == "running" and keep:
+                self.chosen[(agent, project)] = entry["since"]
+            else:
+                self.chosen.pop((agent, project), None)
             self._save()
+        if refused:  # don't leave it waiting to exit (lock released: the reader needs it to finish)
+            log.info("remote control %s: stopping (it printed an error)", entry["name"])
+            end_process(proc)
         hours = rc_max_hours(cfg)
         if state == "running":
             text = (f"Remote Control is running for {agent} in {project} as '{name}'. Open claude.ai/code or the "
                     f"Claude app, signed in to that account, to start a session. It stops at "
                     f"{_local_time(entry['since'] + hours * 3600)} (after {hours_words(hours)}).")
+            if keep:
+                text += " If the runner restarts before then (after a reboot, say), it starts this server again."
             if entry["url"]:
                 text += "\n\n" + entry["url"]
             else:
@@ -5027,7 +5789,11 @@ class RemoteControl:
                     entry["url"] = found.group(0)[:300]
                     if entry["state"] == "starting":
                         entry.update(state="running", note="")
-            if found:
+                error = (not found and entry["url"] is None and entry["state"] == "starting"
+                         and RC_ERROR_LINE_RE.match(ANSI_RE.sub("", raw)) is not None)
+                if error:
+                    entry["error_seen"] = True
+            if found or error:
                 entry["changed"].set()
         code = proc.wait()
         try:
@@ -5052,7 +5818,11 @@ class RemoteControl:
         command = cli_command(spec, env)
         said = "\n".join(entry["tail"])
         kind = next((k for k, rx in RC_FAILURES if rx.search(said)), "")
-        if kind == "token" and claude_auth(env) == "token":
+        if kind == "busy":
+            text = (f"Remote Control is already running for this folder from a terminal on {machine} "
+                    f"(`{command} remote-control`). Stop that one first (Ctrl+C in its terminal), then press Start "
+                    "Remote Control again.")
+        elif kind == "token" and claude_auth(env) == "token":
             text = (f"{agent} signs in with a long-lived token (claude setup-token). Remote Control needs a full "
                     f"login: run \"{command} auth login\" on {machine}.")
         elif kind == "token":
@@ -5097,6 +5867,8 @@ class RemoteControl:
                     "subscription login.")
         elif kind == "login":
             text = f"{agent} isn't signed in on {machine}. Run '{command} auth login' there once."
+        elif code is None:  # it printed an error before its address, and was still running
+            text = f"Remote Control didn't start on {machine}: Claude Code reported an error."
         else:
             seconds = round(time.monotonic() - entry["begun"])
             return (f"Remote Control stopped after {seconds} seconds (exit code {code}). Its last lines:\n"
@@ -5105,9 +5877,12 @@ class RemoteControl:
 
     # -- stop ----------------------------------------------------------------
     def stop(self, agent: str, project: str, why: str = "stopped") -> dict:
-        """Stop one server (always allowed, whatever runner.json says now)."""
+        """Stop one server (always allowed, whatever runner.json says now). It isn't started again when the
+        runner starts: a server stopped on purpose (or by its time limit) stays stopped."""
         with self.lock:
             entry = self.servers.get((agent, project))
+            if self.chosen.pop((agent, project), None) is not None:
+                self._save()
             if entry is None:
                 return {"status": "error", "error": f"Remote Control isn't running for {agent} in {project} here."}
             if entry["state"] not in ("starting", "running"):
@@ -5121,14 +5896,18 @@ class RemoteControl:
         entry["changed"].set()
         return {"status": "done", "result": f"Stopped Remote Control for {agent} in {project}."}
 
-    def stop_all(self, remember: bool = False, why: str = "stopped") -> None:
+    def stop_all(self, remember: bool = False, why: str = "stopped", forget: bool = False) -> None:
         """Stop every server, e.g. when the runner stops. `remember`: start them again when the
-        updated runner starts (within RC_RESTART_WITHIN seconds)."""
+        updated runner starts (within RC_RESTART_WITHIN seconds). The ones chosen to start again
+        when the runner starts stay chosen, unless `forget` (Remote Control turned off, the hub
+        refusing this machine)."""
         with self.lock:
             entries = [e for e in self.servers.values() if e["state"] in ("starting", "running")]
             if remember:
                 self.restart_after_update = [{"agent": e["agent"], "project": e["project"], "started": e["since"]}
                                              for e in entries]
+            if forget:
+                self.chosen.clear()
             for entry in entries:
                 entry.update(state="stopped", note=why, ended=self.clock())
             self._save()
@@ -5150,14 +5929,20 @@ class RemoteControl:
         if not rc_allowed(cfg):
             with self.lock:
                 running = any(e["state"] in ("starting", "running") for e in self.servers.values())
+                if not running and self.chosen:
+                    self.chosen.clear()
+                    self._save()
             if running:
-                self.stop_all(why="Remote Control was turned off in runner.json")
+                self.stop_all(why="Remote Control was turned off in runner.json", forget=True)
         hours = rc_max_hours(cfg)
         with self.lock:
             too_old = [e for e in self.servers.values()
                        if e["state"] in ("starting", "running") and now - e["since"] >= hours * 3600]
             for key, entry in list(self.servers.items()):
-                if entry["state"] in ("failed", "stopped") and entry["ended"] and now - entry["ended"] > RC_KEEP_ENDED:
+                # A server that didn't start again when the runner started stays on the page longer (until its
+                # time would have been up), so its owner can see why.
+                shown_until = max((entry["ended"] or 0) + RC_KEEP_ENDED, entry.get("shown_until") or 0)
+                if entry["state"] in ("failed", "stopped") and entry["ended"] and now > shown_until:
                     del self.servers[key]
         for entry in too_old:
             self.stop(entry["agent"], entry["project"], why=f"stopped after {hours_words(hours)}")
@@ -5168,18 +5953,23 @@ class RemoteControl:
         with self.lock:
             return [{"agent": e["agent"], "project": e["project"], "name": e["name"], "spawn": e["spawn"],
                      "state": e["state"], "since": e["since"], "stops_at": e["since"] + hours * 3600,
-                     "url": e["url"], "note": e["note"], "error": e["error"]}
+                     "url": e["url"], "note": e["note"], "error": e["error"],
+                     "start_with_runner": (e["agent"], e["project"]) in self.chosen}
                     for e in self.servers.values()]
 
     # -- the state file --------------------------------------------------------
     def _save(self) -> None:
-        """remote-control.json: the running servers' process ids (to clean up after a crash) and
-        the servers to start again after an update. Rewritten on every change."""
+        """remote-control.json: the running servers' process ids (to clean up after a crash), the
+        servers to start again after an update, and the ones to start again whenever the runner
+        starts. Rewritten on every change."""
         with self.lock:
             data = {"servers": [{"agent": e["agent"], "project": e["project"], "pid": e["proc"].pid,
                                  "started": e["since"]}
                                 for e in self.servers.values() if e["state"] in ("starting", "running")],
-                    "restart_after_update": list(self.restart_after_update), "at": self.clock()}
+                    "restart_after_update": list(self.restart_after_update),
+                    "start_with_runner": [{"agent": a, "project": p, "started": since}
+                                          for (a, p), since in sorted(self.chosen.items())],
+                    "at": self.clock()}
             try:
                 self.state_file.parent.mkdir(parents=True, exist_ok=True)
                 write_private(self.state_file, json.dumps(data, indent=2) + "\n")
@@ -5187,8 +5977,9 @@ class RemoteControl:
                 log.warning("remote control: couldn't save %s (%s)", self.state_file, err)
 
     def restore(self) -> None:
-        """At start-up: stop servers a crashed runner left behind, and start again the ones an
-        update stopped (if that was under 10 minutes ago and Remote Control is still allowed)."""
+        """At start-up: stop servers a crashed runner left behind, start again the ones an update
+        stopped (if that was under 10 minutes ago and Remote Control is still allowed), and read the
+        ones chosen to start with the runner (start_chosen starts them)."""
         try:
             data = json.loads(read_private(self.state_file))
         except FileNotFoundError:
@@ -5221,6 +6012,14 @@ class RemoteControl:
         at = _num(data.get("at")) or 0
         with self.lock:
             self.restart_after_update = []
+            # Kept in memory first, or this save would drop them: start_chosen starts them once the runner has
+            # checked in with the hub.
+            for item in data.get("start_with_runner") or []:
+                if not isinstance(item, dict):
+                    continue
+                agent, project, started = item.get("agent"), item.get("project"), _num(item.get("started"))
+                if isinstance(agent, str) and isinstance(project, str) and started is not None:
+                    self.chosen[(agent, project)] = started
             self._save()
         if not again or self.clock() - at > RC_RESTART_WITHIN or not rc_allowed(self.runner.cfg):
             return
@@ -5228,8 +6027,87 @@ class RemoteControl:
             agent, project, started = item.get("agent"), item.get("project"), _num(item.get("started"))
             if isinstance(agent, str) and isinstance(project, str):
                 log.info("remote control: starting %s in %s again after the update", agent, project)
-                threading.Thread(target=self.start, args=(agent, project), kwargs={"started": started},
+                with self.lock:
+                    self.restarting.add((agent, project))
+                threading.Thread(target=self._start_again, args=(agent, project, started, "after the update"),
                                  daemon=True).start()
+
+    def start_chosen(self, paused: bool = False) -> None:
+        """Once per runner, after its first check-in with the hub (so the network is up, and the hub can show
+        and stop them): start again the servers chosen to start when the runner starts. Each one is tried
+        once; if it can't start, the choice is cleared and the machine page says why. Not on a machine that
+        no longer allows Remote Control, or that is paused on the hub: the choices are cleared, and the log
+        says why."""
+        with self.lock:
+            if self.chosen_started:
+                return
+            self.chosen_started = True
+            if not self.chosen:
+                return
+            cfg = self.runner.cfg
+            why = ("this machine no longer allows Remote Control (allow_remote_control in its runner.json)"
+                   if not rc_allowed(cfg) else "this machine is paused on the hub" if paused else "")
+            if why:
+                log.warning("remote control: not starting %s again: %s",
+                            ", ".join(f"{a} in {p}" for a, p in sorted(self.chosen)), why)
+                self.chosen.clear()
+                self._save()
+                return
+            hours = rc_max_hours(cfg)
+            now = self.clock()
+            todo = []
+            for (agent, project), started in sorted(self.chosen.items()):
+                current = self.servers.get((agent, project))
+                if (agent, project) in self.restarting or (current and current["state"] in ("starting", "running")):
+                    continue  # already running, or being started again after an update
+                if now - started >= hours * 3600:
+                    log.info("remote control: not starting %s in %s again: its %s are up", agent, project,
+                             hours_words(hours))
+                    del self.chosen[(agent, project)]
+                    continue
+                self.restarting.add((agent, project))
+                todo.append((agent, project, started))
+            self._save()
+        for agent, project, started in todo:
+            log.info("remote control: starting %s in %s again now that the runner has started", agent, project)
+            threading.Thread(target=self._start_again, args=(agent, project, started, "when the runner started"),
+                             daemon=True).start()
+
+    def _start_again(self, agent: str, project: str, started: float | None, when: str) -> None:
+        """Start a server again (after an update, or when the runner starts), keeping its first start time
+        and its choice. A start that fails is logged, shown on the machine page, and not tried again."""
+        try:
+            with self.lock:
+                keep = (agent, project) in self.chosen
+            try:
+                out = self.start(agent, project, started=started, keep=keep)
+            except Exception as err:  # never take the runner down for this
+                log.exception("remote control: starting %s in %s again failed", agent, project)
+                out = {"status": "error", "error": f"Remote Control couldn't start: {err}"}
+            if out.get("status") == "done":
+                return
+            error = str(out.get("error") or "Remote Control didn't start.")
+            hours = rc_max_hours(self.runner.cfg)
+            with self.lock:
+                entry = self.servers.get((agent, project))
+                if entry is not None and entry["state"] in ("starting", "running", "stopped"):
+                    return  # started from the dashboard meanwhile, or stopped while it started: that decided it
+                log.warning("remote control: %s in %s didn't start again %s: %s", agent, project, when,
+                            error.splitlines()[0] if error.strip() else error)
+                self.chosen.pop((agent, project), None)
+                if entry is None:
+                    # Refused before anything ran (the project is gone, too many servers ...): a row of its own.
+                    machine = self._machine()
+                    entry = {"agent": agent, "project": project, "spawn": "", "url": None, "note": "",
+                             "name": f"{machine} {project}" if agent == "claude" else f"{machine} {project} ({agent})",
+                             "since": started if started is not None else self.clock(), "ended": self.clock()}
+                    self.servers[(agent, project)] = entry
+                entry.update(state="failed", error=f"Didn't start again {when}. {error}",
+                             shown_until=(started if started is not None else self.clock()) + hours * 3600)
+                self._save()
+        finally:
+            with self.lock:
+                self.restarting.discard((agent, project))
 
 
 HEARTBEAT_SOON = 3  # seconds: the soonest an extra check-in follows the last one
@@ -5254,9 +6132,12 @@ class Runner:
         self.stop = threading.Event()
         self.restart_pending = False
         self.conflict_warned = -1e9
+        # Read once: an id that changed while the runner runs would look like a second computer on the hub.
+        self.install_id = install_id()
         self.limits = LimitStore()  # the newest plan-limit figures per agent (limits.json)
         self.last_beat = 0.0
         self.rc = RemoteControl(self)  # Remote Control servers started from the dashboard
+        self.sign_in = SignInStore()  # each Claude agent's sign-in, from its CLI's "auth status"
         self.refused = 0  # check-ins answered 401 in a row
 
     def name(self) -> str:
@@ -5297,14 +6178,21 @@ class Runner:
         cfg = self.cfg
         limits = getattr(self, "limits", None)
         rc = getattr(self, "rc", None)
+        sign_in = getattr(self, "sign_in", None)
         agents = []
         for name in cfg["agents"]:
-            status = agent_status(cfg, name)
+            seen = None
+            if sign_in is not None:
+                spec = agent_spec(cfg, name)
+                seen = sign_in.view(name, sign_in.key(spec, build_env(spec)))
+            status = agent_status(cfg, name, sign_in=seen)
             if limits is not None and "limits" in status.get("features", []):
                 status["limits"] = limits.view(name)  # the newest figures, for the dashboard only
             agents.append(status)
         return {
             "name": self.name(), "hostname": socket.gethostname(),
+            # Tells this computer apart from another one under the same name, even when its host name changes.
+            "install_id": getattr(self, "install_id", ""),
             "os": os_description(), "version": VERSION,
             "agents": agents,
             "projects": sorted(cfg["projects"]),
@@ -5324,8 +6212,11 @@ class Runner:
                 "platform": PLATFORM,
                 "accept_delegated_tasks": cfg.get("accept_delegated_tasks") is True,
                 "allow_remote_control": rc_allowed(cfg),
+                "allow_remote_sign_out": sign_out_allowed(cfg),
                 "remote_control_max_hours": rc_max_hours(cfg),
                 "remote_control": rc.view() if rc is not None else [],
+                # This runner understands "Start again when the runner starts" (rc.start's start_with_runner).
+                "remote_control_start_with_runner": True,
                 # The agent the hub may use for background work paid by platform credits (only one that
                 # signs in with an API key; see credits_agent).
                 "credits_agent": credits_agent(cfg)[0],
@@ -5338,11 +6229,27 @@ class Runner:
         """Bring this machine's shared context up to date: pinned notes now,
         and (see wire_agents) each agent's memory file and MCP servers."""
         with self.sync_lock:
-            # What this runner understands: hub-routed servers, and on-demand ones (left out of the machine-wide
-            # setup, given only to the jobs that pick them).
-            status, body = self.hub.call("/api/runner/context", {"features": ["hub-route", "on-demand"]}, timeout=30)
-            if status != 200 or not body:
-                return {"status": "error", "error": f"couldn't fetch shared context from the hub ({status})"}
+            # What this runner understands: hub-routed servers, on-demand ones (left out of the machine-wide
+            # setup, given only to the jobs that pick them), and an MCP token of this machine's own, which it
+            # sends back so the hub keeps it (see machine_mcp_token).
+            # Across processes too (the service and a `runner.py sync` typed at the same time): reading the
+            # kept token, asking the hub and keeping its answer happen as one step, so two of them can't each
+            # be given a new token and leave the agents' settings with the one the hub no longer accepts.
+            token_lock = FileLock(MCP_TOKEN_LOCK)
+            if not token_lock.acquire(timeout=60):
+                return {"status": "error", "error": "another sync was still asking the hub after a minute; "
+                                                    "try again"}
+            try:
+                held = read_machine_mcp_token(self.cfg)
+                ask: dict = {"features": ["hub-route", "on-demand", "machine-mcp-token"]}
+                if held:
+                    ask["mcp_token"] = held
+                status, body = self.hub.call("/api/runner/context", ask, timeout=30)
+                if status != 200 or not body:
+                    return {"status": "error", "error": f"couldn't fetch shared context from the hub ({status})"}
+                keep_machine_mcp_token(self.cfg, body, held)
+            finally:
+                token_lock.release()
             self.last_context = {k: body[k] for k in ("servers", "mcp_enabled", "mcp_token", "platforms") if k in body}
             CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
             wanted = set()
@@ -5385,6 +6292,9 @@ class Runner:
             limits = getattr(self, "limits", None)
             if limits is not None:
                 limits.changed.clear()  # this check-in carries them; a change from now on asks for another
+            sign_in = getattr(self, "sign_in", None)
+            if sign_in is not None:
+                sign_in.changed.clear()
             self.last_beat = time.monotonic()
             try:
                 status, body = self.hub.call("/api/runner/heartbeat", self.heartbeat_payload(), timeout=20)
@@ -5396,7 +6306,7 @@ class Runner:
             rc = getattr(self, "rc", None)
             if self.refused == RC_HEARTBEATS_REFUSED and rc is not None:
                 # The machine was forgotten or its token revoked: nobody can stop them from the hub now.
-                rc.stop_all(why="the hub no longer accepts this machine")
+                rc.stop_all(why="the hub no longer accepts this machine", forget=True)
         elif status == 200:
             self.refused = 0
         if status == 200 and body:
@@ -5407,6 +6317,22 @@ class Runner:
                     job.cancel.set()
             if body.get("context_version") is not None and body["context_version"] != self.context_version:
                 threading.Thread(target=self._background_sync, daemon=True).start()
+            # Paused on the dashboard: the hub hands this machine no new tasks (machine actions still come).
+            # Said once each way; a hub from before pausing sends no "paused", which leaves things as they are.
+            paused = body.get("paused")
+            if isinstance(paused, bool) and paused != getattr(self, "hub_paused", False):
+                self.hub_paused = paused
+                if paused:
+                    log.info("this machine is paused on the hub: it gets no new tasks until you resume it on its "
+                             "page (machine actions such as updates and syncs still run)")
+                else:
+                    log.info("this machine was resumed on the hub: it takes new tasks again")
+            rc = getattr(self, "rc", None)
+            if rc is not None:
+                try:  # once per runner: the servers chosen to start with it (not while the machine is paused)
+                    rc.start_chosen(paused=getattr(self, "hub_paused", False))
+                except Exception:  # keep checking in whatever happens
+                    log.exception("remote control: starting the chosen servers failed")
             other = body.get("name_conflict")
             if other and time.monotonic() - self.conflict_warned > 600:
                 self.conflict_warned = time.monotonic()
@@ -5440,13 +6366,24 @@ class Runner:
                 self.rc.enforce()  # Remote Control's time limit, and the setting turned off
             except Exception:  # keep checking in whatever happens
                 log.exception("remote control check failed")
+            try:
+                self.sign_in.refresh_due(self.cfg, self.busy_agents())
+            except Exception:
+                log.exception("sign-in check failed")
             ok = self.send_heartbeat()
             # Retry sooner while the hub is unreachable. New plan-limit figures (from a job that is still
             # running) are sent within a few seconds rather than at the next regular check-in.
             deadline = time.monotonic() + (15 if ok else 5)
             while not self.stop.wait(1) and time.monotonic() < deadline:
-                if ok and self.limits.changed.is_set() and time.monotonic() - self.last_beat >= HEARTBEAT_SOON:
+                if ok and (self.limits.changed.is_set() or self.sign_in.changed.is_set()) \
+                        and time.monotonic() - self.last_beat >= HEARTBEAT_SOON:
                     break
+
+    def busy_agents(self) -> set:
+        """The agents with a job running here now (a sign-in check waits for them)."""
+        with self.jobs_lock:
+            return {str(j.data.get("agent")) for j in self.jobs.values()
+                    if j.data.get("kind") != "admin" and j.data.get("agent")}
 
     def start_job(self, data: dict) -> None:
         job = Job(self, data)
@@ -5469,9 +6406,10 @@ class Runner:
         self.rc.stop_all(remember=True, why="the runner is updating")
         with self.sync_lock:  # never cut a sync off halfway
             log.info("restarting to load the updated runner")
-            argv = [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+            python = stable_python()
+            argv = [python, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
             if not IS_WINDOWS:
-                os.execv(sys.executable, argv)  # same process, so systemd keeps tracking it
+                os.execv(python, argv)  # same process, so systemd and launchd keep tracking it
             flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000  # no window
             task = "Agent Bullpen Runner"
             started_by_task = subprocess.run(["schtasks", "/Query", "/TN", task], capture_output=True,
@@ -5529,11 +6467,22 @@ class Runner:
 
 
 # ================================================================ commands
+LAUNCHD_LABEL = "bullpen.runner"  # the launchd agent the setup script makes on macOS
+
+
+def under_launchd(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Started by the setup's launchd agent. Its stderr is ~/.bullpen/launchd.log, which nothing rotates,
+    so log lines go only to the rotated runner.log there. BULLPEN_SERVICE comes from the plist; launchd
+    itself sets XPC_SERVICE_NAME to the label, which covers agents made by older setups."""
+    env = os.environ if env is None else env
+    return env.get("BULLPEN_SERVICE") == "launchd" or env.get("XPC_SERVICE_NAME") == LAUNCHD_LABEL
+
+
 def setup_logging(to_console: bool = True) -> None:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     handlers: list[logging.Handler] = [logging.handlers.RotatingFileHandler(
         BASE_DIR / "runner.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")]
-    if to_console and sys.stderr is not None:
+    if to_console and sys.stderr is not None and not under_launchd():
         handlers.append(logging.StreamHandler())
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -5645,7 +6594,8 @@ def looks_like_code(value: str) -> bool:
 def enroll_with_code(cfg: dict, hub_url: str, code: str, name: str = "") -> tuple[bool, str]:
     """Trade a one-time code for this machine's own token and put it in cfg. (ok, message)."""
     try:
-        payload = {"code": code.strip(), "name": name, "hostname": socket.gethostname(), "os": os_description()}
+        payload = {"code": code.strip(), "name": name, "hostname": socket.gethostname(), "os": os_description(),
+                   "install_id": install_id()}
         if cfg.get("token") and clean_hub_url(cfg.get("hub_url", "")) == clean_hub_url(hub_url):
             # Reconnecting: prove this is the same machine, and keep its name unless another is asked for.
             payload["current_token"] = cfg["token"]
@@ -6406,6 +7356,470 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "done" else 1
 
 
+# ================================================================= uninstall
+# `runner.py uninstall` undoes the machine setup (guides 5 and 6): the runner's service, its folder
+# (~/.bullpen), the bullpen command, the commands made for extra Claude accounts, and what the settings sync
+# wrote into the agents' own settings. It takes away only what it can tell is ours: a file with our marker or
+# our name, a block between our markers, an MCP server the sync recorded in wired.json (or the hub's own
+# 'bullpen'), a service that runs the runner from this folder. The agents' logins, credentials and sessions
+# are never touched.
+SYSTEMD_UNIT = "bullpen-runner.service"
+WINDOWS_TASK = "Agent Bullpen Runner"
+SETUP_WRAPPER_RE = re.compile(r"made by the bullpen setup|Claude Code signed in to account")
+WRAPPER_DIR_RES = (re.compile(r'export CLAUDE_CONFIG_DIR="([^"\r\n]+)"'),
+                   re.compile(r'set "CLAUDE_CONFIG_DIR=([^"\r\n]+)"'))
+SMALL_FILE = 64 * 1024  # our commands and add-ons are far smaller (Claude Code itself lives in ~/.local/bin too)
+PATH_LINE_MARK = "# added by bullpen setup"
+TASK_QUERY = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
+              f"$t = Get-ScheduledTask -TaskName '{WINDOWS_TASK}' -ErrorAction SilentlyContinue; "
+              "if (-not $t) { exit 3 }; $t.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments }")
+TASK_REMOVE = (f"Stop-ScheduledTask -TaskName '{WINDOWS_TASK}' -ErrorAction SilentlyContinue; "
+               f"Unregister-ScheduledTask -TaskName '{WINDOWS_TASK}' -Confirm:$false -ErrorAction Stop")
+
+Run = Callable[..., "tuple[int, str]"]
+
+
+def run_quiet(argv: list[str], env: Optional[dict] = None, timeout: float = 90) -> tuple[int, str]:
+    """Run a program for the uninstaller: (exit code, what it printed). 127 when it isn't there."""
+    try:
+        res = subprocess.run(argv, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=timeout, stdin=subprocess.DEVNULL, creationflags=0x08000000 if IS_WINDOWS else 0)
+    except FileNotFoundError:
+        return 127, f"{argv[0]} not found"
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return 1, str(err)
+    return res.returncode, ((res.stdout or "") + (res.stderr or "")).strip()
+
+
+class UninstallPlan:
+    """What `uninstall` takes away (each with the step that does it), and what it leaves, with why."""
+
+    def __init__(self, home: Path) -> None:
+        self.steps: list[tuple[str, Callable[[], None]]] = []
+        self.kept: list[str] = []
+        # Paths in the home folder are shown as ~/... (~\... on Windows), which reads more easily.
+        self._home_re = re.compile(re.escape(str(home)) + r"(?=[\\/]|$|[\s,:.)])")
+
+    def short(self, text: str) -> str:
+        return self._home_re.sub("~", text)
+
+    def remove(self, what: str, action: Callable[[], None]) -> None:
+        self.steps.append((self.short(what), action))
+
+    def keep(self, what: str) -> None:
+        what = self.short(what)
+        if what not in self.kept:
+            self.kept.append(what)
+
+    def describe(self) -> str:
+        lines = []
+        if self.steps:
+            lines += ["This removes:"] + [f"  - {what}" for what, _ in self.steps]
+        if self.kept:
+            lines += ["This leaves alone:"] + [f"  - {what}" for what in self.kept]
+        return "\n".join(lines)
+
+    def run(self, say: Callable[[str], Any] = print) -> list[str]:
+        """Take each step in order; one that fails doesn't stop the others. Returns what failed."""
+        failed = []
+        for what, action in self.steps:
+            try:
+                action()
+            except Exception as err:  # say what is left and go on: running uninstall again finishes it
+                failed.append(what)
+                say(f"  NOT removed: {what} ({self.short(str(err))})")
+            else:
+                say(f"  removed: {what}")
+        return failed
+
+
+def without_block(text: str) -> str | None:
+    """`text` without our managed block and the blank line set_block put before it; None when it has none."""
+    found = BLOCK_RE.search(text)
+    if not found:
+        return None
+    before, after = text[:found.start()].rstrip("\r\n"), text[found.end():].lstrip("\r\n")
+    if before.strip() and after.strip():
+        return before + "\n\n" + after
+    rest = before if before.strip() else after
+    return rest.rstrip("\r\n") + "\n" if rest.strip() else ""
+
+
+def _small_text(path: Path) -> str | None:
+    """A small plain file's text (never a link); None for anything else."""
+    if not _plain_file(path):
+        return None
+    try:
+        if path.stat().st_size > SMALL_FILE:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def made_by_runner(path: Path) -> bool:
+    """A file the settings sync wrote: it carries our marker, or is an add-on file from the first release."""
+    text = _small_text(path)
+    return text is not None and (MARKER in text or hashlib.sha256(text.encode()).hexdigest() in LEGACY_KIT_SHA256)
+
+
+def remove_folder(path: Path) -> None:
+    """Delete a folder and everything in it; read-only files (git makes some) are made writable first."""
+    def writable_then_retry(func: Callable, name: str, _err: Any) -> None:
+        os.chmod(name, stat.S_IRWXU)
+        func(name)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable_then_retry)
+    else:
+        shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def _plan_block(plan: UninstallPlan, path: Path, label: str) -> None:
+    try:
+        rest = without_block(path.read_text(encoding="utf-8", errors="replace")) if _plain_file(path) else None
+    except OSError:
+        rest = None
+    if rest is None:
+        return
+
+    def remove() -> None:
+        now = without_block(path.read_text(encoding="utf-8", errors="replace"))
+        if now is None:
+            return
+        if now.strip():
+            write_if_changed(path, now)
+        else:
+            path.unlink()
+
+    plan.remove(f"{label}: the Agent Bullpen block in {path}"
+                + ("" if rest.strip() else " (the file holds nothing else, so it goes too)"), remove)
+
+
+def _plan_kit(plan: UninstallPlan, folder: Path, label: str) -> None:
+    """The add-on files in `folder` that carry our marker, and the folders they leave empty."""
+    if not folder.is_dir() or folder.is_symlink():
+        return
+    files = sorted(p for p in folder.rglob("*") if made_by_runner(p))
+    if not files:
+        return
+
+    def remove() -> None:
+        for file in files:
+            file.unlink(missing_ok=True)
+            parent = file.parent
+            while parent != folder and _inside(parent, folder):
+                try:
+                    parent.rmdir()  # only when it is empty: a file of your own keeps it
+                except OSError:
+                    break
+                parent = parent.parent
+
+    names = sorted({f.relative_to(folder).parts[0] for f in files})
+    plan.remove(f"{label}: the Agent Bullpen add-ons in {folder} ({', '.join(names)})", remove)
+
+
+def _plan_mcp_file(plan: UninstallPlan, path: Path, ours: set, label: str) -> None:
+    """Our MCP servers in a JSON settings file (Gemini CLI's settings.json, Antigravity's mcp_config.json)."""
+    if not path.exists():
+        return
+    try:
+        data, _ = load_jsonc(path)
+    except (OSError, ValueError):
+        plan.keep(f"{path}: it couldn't be read, so its MCP servers stay as they are")
+        return
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    found = sorted(n for n in ours if isinstance(servers, dict) and n in servers)
+    if not found:
+        return
+
+    def remove() -> None:
+        data, had_comments = load_jsonc(path)
+        current = data.get("mcpServers") or {}
+        for name in found:
+            current.pop(name, None)
+        if current:
+            data["mcpServers"] = current
+        else:
+            data.pop("mcpServers", None)
+        if had_comments:  # the file is written back as plain JSON, so keep a copy with your comments
+            shutil.copy2(path, path.with_name(path.name + ".bak-bullpen-uninstall"))
+        write_if_changed(path, json.dumps(data, indent=2) + "\n", private=True)
+
+    plan.remove(f"{label}: the MCP server{'s' if len(found) > 1 else ''} {', '.join(found)} in {path}", remove)
+
+
+def _claude_folders(cfg: dict, home: Path, state: dict) -> list[tuple[Path, bool, dict | None]]:
+    """Each Claude Code settings folder the sync may have written to: (folder, its own CLAUDE_CONFIG_DIR?,
+    the spec of an agent that uses it, if any). The same folders Wiring.claude picks, and those it recorded."""
+    found: dict[str, tuple[Path, bool, dict | None]] = {}
+    for agent in cfg.get("agents") or {}:
+        try:
+            spec = agent_spec(cfg, agent)
+        except (KeyError, TypeError, AttributeError):
+            continue
+        if spec.get("preset") != "claude":
+            continue
+        custom = build_env(spec).get("CLAUDE_CONFIG_DIR")
+        folder = Path(custom) if custom else home / ".claude"
+        found.setdefault(str(folder), (folder, bool(custom), spec))
+    for key in state:
+        if key.startswith("claude:"):
+            folder = Path(key[len("claude:"):])
+            found.setdefault(str(folder), (folder, folder != home / ".claude", None))
+    found.setdefault(str(home / ".claude"), (home / ".claude", False, None))
+    return list(found.values())
+
+
+def _plan_claude_servers(plan: UninstallPlan, folder: Path, custom: bool, spec: dict | None, home: Path,
+                         state: dict, run: Run) -> None:
+    """Our MCP servers in one Claude Code account, taken out with Claude Code's own CLI (as the sync adds them)."""
+    claude_json = folder / ".claude.json" if custom else home / ".claude.json"
+    try:
+        servers = json.loads(claude_json.read_text(encoding="utf-8")).get("mcpServers") if claude_json.exists() else {}
+    except (OSError, ValueError, AttributeError):
+        plan.keep(f"{claude_json}: it couldn't be read, so its MCP servers stay as they are")
+        return
+    names = sorted((set(state.get(f"claude:{folder}", [])) | RESERVED_SERVERS) & set(servers or {}))
+    if not names:
+        return
+    exe = (resolve_command(spec) if spec else None) or shutil.which("claude")
+    if not exe:
+        plan.keep(f"the MCP servers {', '.join(names)} in {claude_json}: Claude Code wasn't found to take them out "
+                  "(with Claude Code: claude mcp remove -s user NAME)")
+        return
+    env = build_env(spec) if spec else dict(os.environ)
+    env.pop("CLAUDECODE", None)
+    if custom:
+        env["CLAUDE_CONFIG_DIR"] = str(folder)
+    else:
+        env.pop("CLAUDE_CONFIG_DIR", None)
+
+    def remove() -> None:
+        for name in names:
+            code, said = run([exe, "mcp", "remove", "-s", "user", name], env)
+            if code:
+                raise RuntimeError(f"'claude mcp remove' for {name} exited {code}: {redact(said[-300:])}")
+
+    plan.remove(f"Claude Code: the MCP server{'s' if len(names) > 1 else ''} {', '.join(names)} in {claude_json}",
+                remove)
+
+
+def _plan_service(plan: UninstallPlan, home: Path, base_dir: Path, system: str, run: Run) -> None:
+    """The service that starts the runner: only one that runs the runner from `base_dir`."""
+    if system == "windows":
+        code, said = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", TASK_QUERY], None)
+        if code == 3:
+            return
+        if code:
+            plan.keep(f"the scheduled task '{WINDOWS_TASK}': couldn't look at it ({said[-200:] or code}). Remove it "
+                      "in Task Scheduler if it is there")
+        elif str(base_dir).lower() in said.lower():
+            def remove_task() -> None:
+                code, said = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", TASK_REMOVE], None)
+                if code:
+                    raise RuntimeError(said[-300:] or f"PowerShell exited {code}")
+
+            plan.remove(f"the scheduled task '{WINDOWS_TASK}' that starts the runner (stopped first)", remove_task)
+        else:
+            plan.keep(f"the scheduled task '{WINDOWS_TASK}': it starts a runner in another folder, not {base_dir}")
+        return
+    if system == "macos":
+        plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+        text = _small_text(plist)
+        if text is None:
+            return
+        escaped = str(base_dir).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if escaped not in text:
+            plan.keep(f"{plist}: it starts a runner in another folder, not {base_dir}")
+            return
+
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+
+        def remove_agent() -> None:
+            run(["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"], None)  # fails when it isn't loaded: fine
+            plist.unlink(missing_ok=True)
+
+        plan.remove(f"the launchd agent {LAUNCHD_LABEL} that starts the runner (stopped first), {plist}", remove_agent)
+        return
+    unit = home / ".config" / "systemd" / "user" / SYSTEMD_UNIT
+    text = _small_text(unit)
+    if text is None:
+        return
+    if str(base_dir) not in text:
+        plan.keep(f"{unit}: it starts a runner in another folder, not {base_dir}")
+        return
+
+    def remove_unit() -> None:
+        code, said = run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT], None)
+        wanted = unit.parent / "default.target.wants" / SYSTEMD_UNIT
+        if wanted.is_symlink():
+            wanted.unlink()
+        unit.unlink(missing_ok=True)
+        run(["systemctl", "--user", "daemon-reload"], None)
+        if code and code != 127:
+            raise RuntimeError(f"systemctl couldn't stop it ({said[-200:]}); its file is gone, so it won't start "
+                               "again. Log in as this user and run uninstall again, or restart the computer")
+
+    plan.remove(f"the systemd user service bullpen-runner (stopped first), {unit}", remove_unit)
+
+
+def _plan_commands(plan: UninstallPlan, home: Path) -> None:
+    """The bullpen command, and the commands the setup made for extra Claude accounts (claude-work, ...)."""
+    bin_dir = home / ".local" / "bin"
+    for name in ("bullpen", "bullpen.cmd"):
+        path = bin_dir / name
+        text = _small_text(path)
+        if text is not None and MARKER in text:
+            plan.remove(f"the bullpen command, {path}", lambda path=path: path.unlink(missing_ok=True))
+        elif path.exists() or path.is_symlink():
+            plan.keep(f"{path}: Agent Bullpen didn't make it")
+    if not bin_dir.is_dir():
+        return
+    for path in sorted(bin_dir.iterdir()):
+        if path.name in ("bullpen", "bullpen.cmd"):
+            continue
+        text = _small_text(path)
+        if text is None or "CLAUDE_CONFIG_DIR" not in text or not SETUP_WRAPPER_RE.search(text):
+            continue
+        plan.remove(f"the command {path.stem} for an extra Claude account, {path}",
+                    lambda path=path: path.unlink(missing_ok=True))
+        for pattern in WRAPPER_DIR_RES:
+            login = pattern.search(text)
+            if login:
+                plan.keep(f"{os.path.expandvars(login.group(1))}: the login and settings of the {path.stem} account")
+                break
+
+
+def _base_dir_problem(base_dir: Path, home: Path) -> str:
+    """'' when the runner's folder can be deleted as a whole, else why not."""
+    base, own_home = Path(os.path.realpath(base_dir)), Path(os.path.realpath(home))
+    if base == Path(base.anchor) or base == own_home or _inside(own_home, base):
+        return "it is your home folder, or holds it"
+    if base.name != ".bullpen" and not (base / "runner.json").exists():
+        return "it has no runner.json, so it may not be the runner's folder"
+    return ""
+
+
+def _plan_base_dir(plan: UninstallPlan, cfg: dict, base_dir: Path, home: Path) -> None:
+    if not base_dir.is_dir():
+        return
+    problem = _base_dir_problem(base_dir, home)
+    if problem:
+        plan.keep(f"{base_dir}, BULLPEN_HOME: {problem}. Delete what the runner put there yourself")
+        return
+    inside = sorted(name for name, folder in (cfg.get("projects") or {}).items()
+                    if name != "chat" and isinstance(folder, str) and _inside(Path(expand_path(folder)), base_dir))
+
+    def remove() -> None:
+        lock_file = base_dir / "runner.lock"
+        if lock_file.exists():
+            lock = FileLock(lock_file)  # the runner holds it while it runs; the service was stopped above
+            if not lock.acquire(timeout=20):
+                raise RuntimeError("a runner is still running on this machine. Stop it, then run uninstall again")
+            lock.release()
+        remove_folder(base_dir)
+
+    plan.remove(f"{base_dir}: the runner, its settings and runner token, its logs and the chat workspace"
+                + (f". It also holds the project folders {', '.join(inside)}" if inside else ""), remove)
+
+
+def plan_uninstall(cfg: dict, home: Optional[Path] = None, base_dir: Optional[Path] = None,
+                   system: str = PLATFORM, run: Run = run_quiet) -> UninstallPlan:
+    """Everything `uninstall` would take away from this machine, in the order it does it: the service
+    first (so no runner writes again), the agents' settings, the commands, and the runner's folder last."""
+    home = HOME if home is None else home
+    base_dir = BASE_DIR if base_dir is None else base_dir
+    plan = UninstallPlan(home)
+    try:
+        state = json.loads((base_dir / "wired.json").read_text(encoding="utf-8"))
+        state = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        state = {}
+
+    _plan_service(plan, home, base_dir, system, run)
+
+    folders = _claude_folders(cfg, home, state)
+    for folder, custom, spec in folders:
+        if not folder.is_dir():
+            continue
+        _plan_block(plan, folder / "CLAUDE.md", "Claude Code")
+        _plan_kit(plan, folder / "skills", "Claude Code")
+        _plan_claude_servers(plan, folder, custom, spec, home, state, run)
+
+    _plan_kit(plan, home / ".agents" / "skills", "Shared skills folder")
+
+    gemini = Path(os.environ.get("GEMINI_CLI_HOME") or home) / ".gemini"
+    if gemini.is_dir():
+        _plan_block(plan, gemini / "GEMINI.md", "Gemini CLI")
+        shared = gemini / "bullpen-shared.md"
+        if _plain_file(shared):
+            plan.remove(f"Gemini CLI: the copy of the shared notes, {shared}", lambda: shared.unlink(missing_ok=True))
+        _plan_kit(plan, gemini / "commands", "Gemini CLI")
+        _plan_kit(plan, gemini / "skills", "Gemini CLI")
+        _plan_mcp_file(plan, gemini / "settings.json", set(state.get("gemini") or []) | RESERVED_SERVERS, "Gemini CLI")
+        _plan_kit(plan, gemini / "config" / "skills", "Antigravity")
+        _plan_kit(plan, gemini / "antigravity-cli" / "skills", "Antigravity CLI")
+        _plan_mcp_file(plan, gemini / "config" / "mcp_config.json",
+                       set(state.get("antigravity") or []) | RESERVED_SERVERS, "Antigravity")
+
+    _plan_commands(plan, home)
+    _plan_base_dir(plan, cfg, base_dir, home)
+
+    # What stays, and why.
+    logins = [str(f) for f, _, _ in folders if f.is_dir()] + ([str(gemini)] if gemini.is_dir() else [])
+    if logins:
+        plan.keep(f"the agents' own logins, sessions and settings: {', '.join(logins)}. Only what Agent Bullpen "
+                  "added to them is taken out")
+    if (gemini / ".env").exists():
+        plan.keep(f"{gemini / '.env'}, which holds the Gemini API key")
+    for backup in (gemini / "settings.json.bak-bullpen", gemini / "config" / "mcp_config.json.bak-bullpen"):
+        if backup.exists():
+            plan.keep(f"{backup}, a copy of your settings from before the first sync")
+    rc_files = [str(rc) for rc in (home / ".bashrc", home / ".zshrc") if PATH_LINE_MARK in (_small_text(rc) or "")]
+    if rc_files:
+        plan.keep(f"the PATH line the setup added to {' and '.join(rc_files)}: Claude Code and Gemini CLI use it too")
+    projects_root = Path(expand_path(str(cfg.get("projects_root") or home / "projects")))
+    if projects_root.is_dir() and not _inside(projects_root, base_dir):
+        plan.keep(f"your projects in {projects_root}")
+    plan.keep("Claude Code, Gemini CLI, Python and Git themselves")
+    return plan
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Remove Agent Bullpen from this machine: say what goes and what stays, ask, then do it."""
+    path = Path(args.config)
+    cfg: dict = {"agents": {}, "projects": {}}
+    if path.exists():
+        try:
+            cfg = load_config(path)
+        except (OSError, ValueError) as err:
+            print(f"Couldn't read {path} ({err}); going on without it.")
+    name = cfg.get("name") or default_machine_name()
+    print(f"\nRemoving Agent Bullpen from this machine ('{name}' on the dashboard).\n")
+    plan = plan_uninstall(cfg)
+    print(plan.describe())
+    if not plan.steps:
+        print("\nNothing of Agent Bullpen's was found here.")
+        return 0
+    if args.dry_run:
+        print("\nDry run: nothing was changed.")
+        return 0
+    if not args.yes and not ask_yes("\nRemove all of this?", False):
+        print("Nothing was changed.")
+        return 1
+    print()
+    failed = plan.run()
+    if failed:
+        print("\nSome of it is still there (see above). Run uninstall again once that is fixed: it takes away "
+              "only what is left.")
+    else:
+        print("\nAgent Bullpen is removed from this machine.")
+    print(f"On the hub's dashboard, click Forget this machine on the card for '{name}' once it shows as offline. "
+          "That cancels its runner token and its MCP token.")
+    return 1 if failed else 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     setup_logging()
     path = Path(args.config)
@@ -6475,11 +7889,14 @@ def main() -> int:
     p.add_argument("--scope", default="")
     p.add_argument("--limit", type=int, default=15)
     sub.add_parser("sync", help="update shared notes and agent settings from the hub now")
+    p = sub.add_parser("uninstall", help="remove Agent Bullpen from this machine (shows what goes, then asks)")
+    p.add_argument("--yes", action="store_true", help="don't ask before removing")
+    p.add_argument("--dry-run", action="store_true", help="only show what would be removed and what stays")
     args = parser.parse_args()
     commands = {"init": cmd_init, "enroll": cmd_enroll, "claude-accounts": cmd_claude_accounts,
                 "list": cmd_list, "limits": cmd_limits, "test": cmd_test, "add-project": cmd_add_project,
                 "remove-project": cmd_remove_project, "remember": cmd_remember, "recall": cmd_recall,
-                "sync": cmd_sync, "run": cmd_run, None: cmd_run}
+                "sync": cmd_sync, "uninstall": cmd_uninstall, "run": cmd_run, None: cmd_run}
     return commands[args.command](args)
 
 

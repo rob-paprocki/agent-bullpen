@@ -5,6 +5,130 @@ All notable changes to Agent Bullpen are listed here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The hub and the runner always share one
 version number, because the hub hands its own copy of the runner to every machine.
 
+## [1.1.0] - 2026-11-22
+
+**Upgrading:** on a Mac that uses Apple's own Python, run the setup again to get the Python fix below
+(**Update now** replaces only the runner, not its launchd agent). On any Mac you can delete
+`~/.bullpen/launchd.log` once the runner is updated. For the fixes to the false "same name" warning and to
+**Start Remote Control**, and for **Start again when the runner starts**, press **Update now** on each
+
+machine's page. For per-machine MCP tokens, press **Update all runners**. Machines with their own runner token
+
+then get an MCP token of their own at their next sync. Once every such machine's page says
+
+**own MCP token**, press **Rotate** next to the shared token on the MCP page, because they all held a copy of
+
+it. After that, update any client you set up by hand with the shared token, such as a claude.ai connector.
+
+**Start Remote Control**, for **Start again when the runner starts** and for the shared skills folder, press
+
+**Update now** on each machine's page.
+
+### Added
+
+- **An MCP token for each machine.** A machine added with **Add a machine** now gets an MCP token of its own
+  for its agents' settings, in place of the hub's shared one. **Forget** stops it at once, so a lost machine
+  no longer means changing the token on every machine. **New MCP token**, on the machine's page, replaces it;
+  the machine picks up the new one at its next sync. The hub keeps only a fingerprint of it. Machines on the
+  shared runner token, and older runners, keep the shared token. Set `HUB_MCP_SHARED_TOKEN='0'` in `hub.env`
+  to turn the shared token off once nothing needs it
+  ([guide 10](docs/10-shared-memory-and-mcp.md#the-mcp-token-each-machine-uses)).
+- **Allow for this job** on an approval card, next to **Allow** and **Deny**. Later requests in the same job
+  with the same tool and exactly the same input run without asking, until the job ends. There are no
+  prefixes or patterns, and follow-ups, subtasks and other jobs still ask. It isn't offered on a card that
+  warns about hidden characters or blank lines. Requests it lets through are listed under **Approvals** as
+  "allowed automatically" ([guide 8](docs/08-daily-use.md#a-jobs-page)).
+- **Sign-in on the machine page.** Each Claude agent shows what its own Claude Code says about its sign-in
+  (`claude auth status`), such as "Signed in (Pro, subscription)" or "Signed out". When an agent is signed out,
+  or its sign-in ends within a week, the page shows the command to run on that machine, with a **Copy**
+  button. A Mac's Keychain login now shows too. The runner keeps only the sign-in state, method, API provider,
+  plan and end date, never the account's email.
+- **Sign out…** on the machine page runs an agent's own `claude auth logout`. It's off unless the machine's
+  `runner.json` sets `allow_remote_sign_out` to `true`, needs the dashboard password, and is refused while
+  the agent runs a job. Signing in again happens on the machine itself.
+- **Continue on another machine**, on a finished task's page. **Carry the conversation** starts a new task on
+  any agent, with the conversation so far in its prompt. **Move the exact session** resumes the same Claude
+  Code session on another machine signed in to the same account. You always choose the move yourself. After a
+  usage limit, the conversation can continue only on the same account. Files the job changed stay on the first
+  machine, and the form lists them. The new job links back to the first one, and the first one to it. An
+  exact move needs this runner version on both machines (**Update now** on each machine's page).
+- **Pause** on a machine's page takes it out of service, for example while you fix it. A paused machine gets
+  no new tasks, council steps or subtasks. Work sent to it waits, and tasks for its tags go to other machines.
+  Updates, syncs, git actions and Check limits still run. You choose whether the jobs it is running finish
+  or are cancelled.
+- **Start again when the runner starts**, a box next to **Start Remote Control**. Tick it and the server
+  comes back after the computer or the runner restarts. The runner starts it once it has checked in with
+  the hub. Its hours still count from the first start, so it stops at the same time as before. It stays off
+  after **Stop**, once its time is up, when `allow_remote_control` is off and while the machine is paused.
+  If it can't start, the machine's page says why and the runner doesn't try again.
+- Sync every machine with a tag, or update their runners, in one step. Pick the tag next to **Sync all** on
+  the Overview, or click a tag on a machine's page. Only machines where the tag counts for tasks are reached,
+  and the message says why the others were skipped.
+- **An uninstaller.** `runner.py uninstall` removes Agent Bullpen from a machine. That covers the service that
+  starts the runner, `~/.bullpen`, the `bullpen` command, the commands for extra Claude accounts, and what
+  the hub added to the agents' own settings: the notes block, the add-ons and the hub's MCP servers. It
+  shows the list first and asks. `--dry-run` only shows it. Only what carries Agent Bullpen's mark goes; the
+  agents' logins stay. On the hub, `scripts/linux/uninstall-hub.sh` removes the service and `/opt/bullpen`,
+  and asks separately before it deletes the data. A hub in a Proxmox container can simply be deleted with
+  its container. Guides 4, 5 and 6 explain each one.
+- **Add a machine** takes the new machine's tags and account labels. They count as soon as the machine
+  reports them, without an **Accept** on its page. Anything else it reports still waits for **Accept**, and
+  you can withdraw these later like any other. The list of unused codes shows what each code accepts.
+- **The shared skills folder.** The runner now also puts the `remember` skill in `~/.agents/skills`. Codex,
+  OpenCode, Copilot CLI, Cursor, Qwen Code, Kimi, Mistral Vibe and Amp read that folder, so they can save and
+  look up shared notes too. A skill of your own there is left alone, and `runner.py uninstall` removes the
+  runner's copy ([guide 10](docs/10-shared-memory-and-mcp.md#the-shared-skills-folder)).
+
+### Changed
+
+- Gemini CLI 0.28 and later reads the `remember` skill from `~/.agents/skills`, so the runner no longer puts a
+  second copy in `~/.gemini/skills` and removes the one it put there before. Two copies made Gemini CLI warn
+  about a "skill conflict". The `/remember` and `/recall` commands stay where they were.
+- The Linux and macOS setup gives the runner's service the folders where it found Claude Code and Gemini
+  CLI, as it already did for Node.js.
+- On a Mac, the setup warns when Terminal runs under Rosetta, because Python and Claude Code would then be
+  installed as Intel programs.
+- A Claude agent whose `command` in `runner.json` is a command of its own, such as `claude-work`, now shows
+  that command in **Continue in a terminal** and in the messages that say what to run on the machine.
+  Before, they named plain `claude`.
+
+### Fixed
+
+- On a Mac, the runner wrote every log line twice: to `runner.log`, which is rotated, and to
+  `launchd.log`, which grew without limit. `launchd.log` now holds only errors from before the runner's
+  log opens.
+- On a Mac, running the setup again could fail to restart the runner with "Bootstrap failed: 5". The setup
+  now waits for the old copy to stop and tries again, and prints the reason each time a try fails. If it
+  still can't start the runner, it says why.
+- On a Mac that uses Apple's own Python, the setup made the runner start the copy inside Xcode or the
+  Command Line Tools, such as `/Applications/Xcode.app/Contents/Developer/usr/bin/python3`. Moving or
+  switching Xcode could then stop the runner from starting. The setup now uses `/usr/bin/python3`, which
+  follows `xcode-select`. The runner now uses it too, for the `bullpen` command and when it restarts after
+  an update.
+- On a Mac whose own Python is older than 3.9, the setup installed a newer one with Homebrew and then still
+  used the old one, and stopped.
+- The guides said a Mac's Claude login could be checked over SSH. Over SSH the Mac's login Keychain is
+  locked, so `claude auth status` says the agent is signed out when it isn't. Guides 5, 8 and 9 now say to
+  check the login, and sign in, in Terminal on the Mac itself.
+- A machine whose host name changed by itself got a warning that two computers check in under its name. A
+  Mac can change its host name when its network changes, and one did so during fast user switching. While
+  the warning showed, the hub also stopped marking that machine's lost jobs. The runner now makes a random
+  install id once, in `~/.bullpen/install-id`, and sends it with each check-in. The hub compares those ids
+  instead of host names, and uses host names only for runners that send no id. The same id lets a machine
+  move from the shared token to its own token after its host name changed. The fix needs the new runner on
+  each machine (**Update now** on its page). If you copy `~/.bullpen` to another computer, delete
+  `install-id` there.
+- A job sent to a machine just after its runner restarted could get stuck at "running" until the hub marked
+  it lost. The old runner's last request for work was still open on the hub, which gave the job to it. The
+  hub now checks that the runner is still connected before it hands out a job.
+- **Start Remote Control** said "Remote Control is running" when Claude Code had refused to start. It
+  happened when `claude remote-control` was already running in a terminal in the same folder: Claude Code
+  printed "Error: This folder is already served by a terminal", waited about a minute, then exited, and the
+  runner took it for a server that hadn't shown its address yet. Now a line starting with "Error:" before
+  the address fails the start, and the runner stops the server. In this case the message says to stop the
+  copy in the terminal with Ctrl+C, then press **Start** again. The fix needs the new runner (**Update now**
+  on the machine's page).
+
 ## [1.0.1] - 2026-11-15
 
 **Upgrading:** nothing to do.
@@ -179,5 +303,6 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
   but not save them.
 - The installers download a release and check it against its `SHA256SUMS` before installing it.
 
+[1.1.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.0
 [1.0.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.0

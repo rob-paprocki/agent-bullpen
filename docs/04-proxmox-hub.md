@@ -275,10 +275,12 @@ changed.
 | `HUB_LITELLM_UI_URL` | link to your LiteLLM dashboard on the Usage page |
 | `HUB_LINKS` | extra links for the Usage page: `Name=https://…;Other=https://…` |
 | `HUB_MCP_PROXY_TIMEOUT` | seconds one tool call through the hub may take (default 120) |
+| `HUB_MCP_SHARED_TOKEN` | `0` turns the shared MCP token off, once every machine has an MCP token of its own (default `1`; [guide 10](10-shared-memory-and-mcp.md#turning-the-shared-mcp-token-off)) |
 | `HUB_APPROVAL_TIMEOUT_MIN` | minutes a job's question waits for **Allow** or **Deny** before it counts as no (default 10) |
 | `HUB_DELEGATE_MAX_AUTONOMY` | the most any subtask may do, whatever its task may do: `readonly` (the default), `edits`, `ask` or `full`. Raise it only on purpose ([guide 2](02-architecture.md#agents-handing-work-to-other-machines-and-machine-tags)) |
 | `HUB_DELEGATE_MAX_CHILDREN` | subtasks one task may hand out in all (default 5, 1-20) |
 | `HUB_DELEGATE_MAX_ACTIVE` | subtasks of one task queued or running at once (default 3, 1-10) |
+| `HUB_SESSION_MOVE_MAX_MB` | the largest Claude Code session **Move the exact session** copies, in MB (default 32, 1-256; [guide 8](08-daily-use.md#continue-on-another-machine)) |
 | `HUB_NOTIFY_URL` | where to send notifications: an ntfy topic such as `https://ntfy.sh/<topic>`, or any address that takes a JSON POST. Off when blank ([guide 8](08-daily-use.md#notifications-on-your-phone)) |
 | `HUB_NOTIFY_FORMAT` | `ntfy` or `json` (default: `ntfy` when the address's host name contains "ntfy", otherwise `json`) |
 | `HUB_NOTIFY_EVENTS` | which events to send: `done`, `error`, `approval` (default all three, comma-separated) |
@@ -303,9 +305,12 @@ changed.
 
 ## Uninstall
 
-1. In the dashboard, **Forget** each machine, so their tokens stop working.
-2. On each machine, remove the runner ([guide 5](05-linux-and-macos-machines.md), [guide 6](06-windows-machines.md)).
-3. On the Proxmox host, stop and remove the container. In the web interface: **container → More → Remove**.
+The hub's container holds nothing else, so the simplest way is to delete the whole container.
+
+1. On each machine, remove the runner with its own command
+   ([guide 5](05-linux-and-macos-machines.md#removing-a-machine),
+   [guide 6](06-windows-machines.md#removing-a-pc)). Their tokens stop working when the hub is gone.
+2. On the Proxmox host, stop and remove the container. In the web interface: **container → More → Remove**.
    Or in the host's shell:
 
    ```bash
@@ -316,8 +321,12 @@ changed.
    pct destroy <container-id>
    ```
 
-4. Optional: remove My Defaults from the host with `rm -rf /usr/local/bullpen`.
-5. If you used a tunnel, delete it and its Access application in Cloudflare.
+3. Optional: remove My Defaults from the host with `rm -rf /usr/local/bullpen`.
+4. If you used a tunnel, delete it and its Access application in Cloudflare.
+
+To keep the container and remove only the hub from it, run the uninstall script inside the container, as on
+[any Debian or Ubuntu machine](#any-debian-or-ubuntu-machine). It also removes the `update` command and
+the container's login message.
 
 ## Troubleshooting
 
@@ -395,6 +404,35 @@ sudo bash /opt/bullpen/src/ct/bullpen.sh
 
 **Uninstall:**
 
+1. On each machine, remove the runner with its own command
+   ([guide 5](05-linux-and-macos-machines.md#removing-a-machine),
+   [guide 6](06-windows-machines.md#removing-a-pc)).
+2. See what the uninstall script would remove. This changes nothing:
+
+   ```bash
+   sudo bash /opt/bullpen/src/scripts/linux/uninstall-hub.sh --dry-run
+   ```
+
+3. Remove the hub:
+
+   ```bash
+   sudo bash /opt/bullpen/src/scripts/linux/uninstall-hub.sh
+   ```
+
+   It asks first. Then it stops and removes the `bullpen` service, deletes `/opt/bullpen`, and removes the
+   Cloudflare Tunnel connector if the installer set one up. Next it asks, separately, whether to delete the
+   data (`/var/lib/bullpen`), the settings (`/etc/bullpen`, with the password and tokens) and the service user
+   `bullpen`. Unless you answer `y`, they stay, and installing the hub again later picks them up.
+
+   `--yes` skips the first question. `--delete-data` deletes the data without asking; without it, `--yes`
+   keeps the data.
+
+The script leaves the `cloudflared` package installed (`sudo apt-get remove cloudflared` removes it). If you
+used a tunnel, delete it and its Access application in Cloudflare too.
+
+If `/opt/bullpen/src/scripts/linux/uninstall-hub.sh` is missing, the hub is older than the script. Update it
+first, or remove it by hand:
+
 ```bash
 sudo systemctl disable --now bullpen
 ```
@@ -422,6 +460,7 @@ For contributors, and anyone who wants to check what it does before running it.
 | `misc/install.func` | the container | OS update, login message, autologin, clean-up |
 | `misc/core.func` | both | messages, the error report, the download and checksum check |
 | `install/bullpen-install.sh` | the container | installs the hub, using `scripts/linux/install-hub.sh` |
+| `scripts/linux/uninstall-hub.sh` | the container, or any Debian or Ubuntu machine | removes the hub again |
 | `scripts/proxmox/create-hub-lxc.sh`, `upgrade-hub-lxc.sh` | the host | the same installer, with the code in your checkout instead of a download |
 | `tests/proxmox/` | any Linux machine | runs all of the above with stand-in commands; changes nothing on the machine |
 

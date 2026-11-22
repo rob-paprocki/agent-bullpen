@@ -145,6 +145,12 @@ if [[ $OS_KIND == linux && $PM != apt ]]; then
   warn "This script is written first for Debian, Ubuntu and Kali. Here it uses ${PM:-no package manager it knows},"
   warn "on a best-effort basis: if a step fails, install that piece yourself and run the script again."
 fi
+# On Apple silicon, a Terminal opened "using Rosetta" makes installers pick Intel programs, which run slower.
+if [[ $OS_KIND == macos && "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" == 1 ]]; then
+  warn "This terminal runs under Rosetta (Intel emulation), so Python and Claude Code would be installed as"
+  warn "Intel programs. Unless you want that, quit Terminal, turn off \"Open using Rosetta\" in its Get Info"
+  warn "window, and run this again."
+fi
 if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
   warn "ANTHROPIC_API_KEY is set in your shell. Claude Code would bill that API key instead of your"
   warn "subscription. Remove it from your shell profile unless that's what you want."
@@ -159,7 +165,13 @@ if [[ $OS_KIND == macos ]]; then
     if ask_yes "Open the Command Line Tools installer now?" y; then xcode-select --install 2>/dev/null || true; fi
     die "When the Command Line Tools have finished installing, run this script again."
   fi
-  if ! python_ok && [[ $PM == brew ]]; then info "installing Python with Homebrew"; pkg_install python3; fi
+  if ! python_ok && [[ $PM == brew ]]; then
+    info "installing Python with Homebrew"
+    pkg_install python3
+    # Put Homebrew's folder first, or python3 is still Apple's older one in /usr/bin.
+    PATH="$(brew --prefix)/bin:$PATH"
+    hash -r
+  fi
 else
   need_pkgs=()
   for p in git curl python3; do command -v "$p" >/dev/null 2>&1 || need_pkgs+=("$p"); done
@@ -199,6 +211,17 @@ else
   ok "runner $(runner_version "$RUNNER_SRC") copied to $BULLPEN_DIR/runner"
 fi
 PY=$(python3 -c 'import sys; print(sys.executable)')
+if [[ $OS_KIND == macos ]]; then
+  case "$PY" in
+    */Xcode*.app/Contents/Developer/*|/Library/Developer/CommandLineTools/*)
+      # Apple's python3 really lives inside Xcode or the Command Line Tools, and moving Xcode or
+      # switching with xcode-select would leave that path behind. /usr/bin/python3 follows xcode-select.
+      if [[ -x /usr/bin/python3 ]] &&
+        /usr/bin/python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+        PY=/usr/bin/python3
+      fi ;;
+  esac
+fi
 runner() { "$PY" "$RUNNER" --config "$CONFIG" "$@"; }
 
 HUB_DONE=0
@@ -398,15 +421,28 @@ while IFS= read -r agent <&3; do
 done 3< <("$PY" -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["agents"]))' "$CONFIG")
 
 SERVICE_PATH="$BIN:$NPM_PREFIX/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-# The service doesn't read your shell's settings: give it the Node.js this setup found (for example
-# one from nvm, which lives in a version-specific folder; after switching versions, run this again).
-if command -v node >/dev/null 2>&1; then SERVICE_PATH="$(dirname "$(command -v node)"):$SERVICE_PATH"; fi
+# The service doesn't read your shell's settings: give it the folders of the Node.js, Claude Code and
+# Gemini CLI this setup found (for example a Node.js from nvm, which lives in a version-specific
+# folder; after switching versions, run this again).
+for tool in gemini claude node; do
+  tool_path=$(command -v "$tool" 2>/dev/null || true)
+  [[ $tool_path == /* ]] || continue
+  tool_dir=$(dirname "$tool_path")
+  case ":$SERVICE_PATH:" in
+    *":$tool_dir:"*) ;;
+    *) SERVICE_PATH="$tool_dir:$SERVICE_PATH" ;;
+  esac
+done
+xml_text() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 SERVICE=""   # set to launchd or systemd once the runner is set up to start by itself
 if [[ $OS_KIND == macos ]]; then
   if ask_yes "Start the runner now and whenever you log in (launchd agent)?" y; then
     label=bullpen.runner
+    domain="gui/$(id -u)"
     plist="$HOME/Library/LaunchAgents/$label.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
+    # BULLPEN_SERVICE tells the runner its stderr is launchd.log, which nothing rotates, so it logs only
+    # to runner.log. launchd.log then holds only errors from before the runner's log is open.
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -415,23 +451,48 @@ if [[ $OS_KIND == macos ]]; then
   <!-- Agent Bullpen runner: takes jobs from the hub. Made by the bullpen setup. -->
   <key>Label</key><string>$label</string>
   <key>ProgramArguments</key>
-  <array><string>$PY</string><string>$RUNNER</string><string>--config</string><string>$CONFIG</string><string>run</string></array>
+  <array><string>$(xml_text "$PY")</string><string>$(xml_text "$RUNNER")</string><string>--config</string><string>$(xml_text "$CONFIG")</string><string>run</string></array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>$SERVICE_PATH</string></dict>
-  <key>WorkingDirectory</key><string>$BULLPEN_DIR</string>
+  <dict>
+    <key>PATH</key><string>$(xml_text "$SERVICE_PATH")</string>
+    <key>BULLPEN_SERVICE</key><string>launchd</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$(xml_text "$BULLPEN_DIR")</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$BULLPEN_DIR/launchd.log</string>
-  <key>StandardErrorPath</key><string>$BULLPEN_DIR/launchd.log</string>
+  <key>StandardOutPath</key><string>$(xml_text "$BULLPEN_DIR")/launchd.log</string>
+  <key>StandardErrorPath</key><string>$(xml_text "$BULLPEN_DIR")/launchd.log</string>
 </dict>
 </plist>
 EOF
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    if launchctl bootstrap "gui/$(id -u)" "$plist"; then SERVICE=launchd; else warn "launchctl couldn't load $plist"; fi
-    sleep 2
-    if launchctl print "gui/$(id -u)/$label" 2>/dev/null | grep -q 'state = running'; then ok "runner is running"
-    else warn "runner didn't start; see ~/.bullpen/runner.log and ~/.bullpen/launchd.log"; fi
+    if ! plutil -lint "$plist" >/dev/null 2>&1; then warn "$plist doesn't read as a valid property list (plutil -lint)"; fi
+    # Stop the copy from an earlier run first. Loading again before launchd has let go of it fails
+    # with "Bootstrap failed: 5", so wait (up to 10 seconds) until it is gone.
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      launchctl print "$domain/$label" >/dev/null 2>&1 || break
+      sleep 1
+    done
+    # Undo an earlier "launchctl disable", which would make loading fail.
+    launchctl enable "$domain/$label" 2>/dev/null || true
+    load_error=""
+    for attempt in 1 2 3; do
+      if load_error=$(launchctl bootstrap "$domain" "$plist" 2>&1); then SERVICE=launchd; break; fi
+      if [[ $attempt != 3 ]]; then
+        warn "launchctl bootstrap failed (attempt $attempt): $(printf '%s' "${load_error:-no reason given}" | tr '\n' ' '); trying again"
+        sleep 2
+      fi
+    done
+    if [[ $SERVICE == launchd ]]; then
+      sleep 2
+      if launchctl print "$domain/$label" 2>/dev/null | grep -q 'state = running'; then ok "runner is running"
+      else warn "runner didn't start; see ~/.bullpen/runner.log and ~/.bullpen/launchd.log"; fi
+    else
+      warn "launchctl couldn't start the runner: ${load_error:-no reason given}"
+      warn "If you're connected over SSH, log in at the Mac itself first: the runner starts with that login."
+      warn "Otherwise it starts the next time you log in, or run:  launchctl bootstrap $domain $plist"
+    fi
     info "it runs while you're logged in to this Mac (see docs/05 to log in automatically)"
     # macOS 15 and later ask before a background program may reach devices on the local network.
     info "macOS may ask whether Python can find devices on your local network: click Allow, or the runner"

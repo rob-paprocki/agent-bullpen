@@ -33,6 +33,8 @@ MACHINE_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z
 PLATFORM_TAGS = {"linux", "macos", "windows"}
 # Tags kept per machine.
 MAX_TAGS = 16
+# A runner's install id (runner.py install_id): random hex, made once per install.
+INSTALL_ID_RE = re.compile(r"[0-9a-f]{16,64}")
 
 # The tools at /mcp/job that let a job hand work to other machines.
 DELEGATION_TOOLS = ["list_machines", "delegate_task", "task_status", "cancel_task"]
@@ -59,6 +61,13 @@ def clean_tags(raw: Any) -> list[str]:
     return sorted(t for t in words if TAG_RE.fullmatch(t))[:MAX_TAGS]
 
 
+def clean_install_id(raw: Any) -> str:
+    """A runner's install id as it may be stored and compared, or '' (none, or not one: the hub then
+    tells computers apart by host name, as it does for runners from before install ids)."""
+    raw = raw.strip().lower() if isinstance(raw, str) else ""
+    return raw if INSTALL_ID_RE.fullmatch(raw) else ""
+
+
 def accepted_of(runner: dict | None) -> dict:
     """What the owner accepted for a machine: {"tags": [...], "accounts": {agent: label}}."""
     acc = (runner or {}).get("accepted")
@@ -69,6 +78,14 @@ def accepted_of(runner: dict | None) -> dict:
         "accounts": ({k: v for k, v in accounts.items() if isinstance(k, str) and isinstance(v, str)}
                      if isinstance(accounts, dict) else {}),
     }
+
+
+def merge_accepted(before: dict, add: dict) -> dict:
+    """What the owner accepted (accepted_of's shape) with `add` added, as an enrollment code's tags and labels
+    are: every tag of both, and each agent's label from `add` where it has one. Nothing is withdrawn."""
+    accounts = {**before.get("accounts", {}), **add.get("accounts", {})}
+    return {"tags": sorted(set(before.get("tags", [])) | set(add.get("tags", []))),
+            "accounts": dict(sorted(accounts.items()))}
 
 
 def reported_tags(runner: dict | None) -> list[str]:
@@ -148,6 +165,18 @@ def permission_flags(runner: dict | None, agent: str) -> list[str]:
 def own_token(runner: dict | None) -> bool:
     """Did the machine's last check-in use its own runner token (not the shared one)?"""
     return (runner or {}).get("auth") == "machine"
+
+
+def tag_group_reason(runner: dict | None, tag: str) -> str | None:
+    """Is this machine (a database row) in the group of machines tagged `tag`, the one a sync or an
+    update for a tag reaches? '' when it is: the tag counts there (accepted, or its platform tag) and
+    it has its own runner token, as for a task aimed at a tag. Otherwise why not, for a machine that
+    reports the tag, or None for one that doesn't (it has nothing to do with the tag)."""
+    if tag not in reported_tags(runner):
+        return None
+    if tag not in effective_tags(runner):
+        return "tag not accepted yet"
+    return "" if own_token(runner) else "uses the shared runner token"
 
 
 def takes_subtasks(runner: dict | None) -> bool:

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub for userdel: forgets a user the useradd stub made.
+echo "userdel [${BULLPEN_TEST_ROOT:-host}] $*" >>"$BULLPEN_TEST_STATE/calls.log"
+rm -f "${BULLPEN_TEST_ROOT:?}/.stub-users/${*: -1}"

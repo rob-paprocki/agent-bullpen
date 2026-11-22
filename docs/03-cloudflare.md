@@ -17,7 +17,8 @@ The hub serves plain HTTP. Without one of the options below, these cross your ne
 
 - the dashboard password when you log in, and the session cookie after that;
 - each machine's runner token, sent with every check-in (every few seconds);
-- the hub's MCP token, sent by every agent that uses the shared memory or a server through the hub;
+- the MCP tokens (each machine's own, or the hub's shared one), sent by every agent that uses the shared memory
+  or a server through the hub;
 - every prompt, answer and log line.
 
 Anyone who can watch your network traffic can read them, and with the password or the cookie they can control

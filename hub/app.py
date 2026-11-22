@@ -38,15 +38,17 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from approvals import HIDDEN_RE, Approvals, Refused as ApprovalRefused
-from common import ACCOUNT_RE, LOST_JOB_GRACE, MODEL_RE, NAME_RE, ONLINE_WINDOW, TAG_RE, Autonomy, TargetError, \
-    accepted_of, account_key, agent_features, effective_tags, job_tools_for, own_token, permission_flags, public_job, \
-    reported_tags, runner_projects, summary_refusal, tag_job_fits, tag_target, takes_subtasks, to_accept, \
-    valid_account_key, vtuple
+from approvals import HIDDEN_RE, Approvals, Refused as ApprovalRefused, for_job_ok
+from common import ACCOUNT_RE, LOST_JOB_GRACE, MAX_TAGS, MODEL_RE, NAME_RE, ONLINE_WINDOW, PLATFORM_TAGS, TAG_RE, \
+    Autonomy, TargetError, \
+    accepted_of, account_key, agent_features, clean_install_id, effective_tags, job_tools_for, own_token, permission_flags, public_job, \
+    reported_tags, runner_projects, summary_refusal, tag_group_reason, tag_job_fits, tag_target, takes_subtasks, \
+    to_accept, valid_account_key, vtuple
 from council import MAX_DEBATE_PARTICIPANTS, MAX_REVIEWERS, MCP_PICK_KEYS, CouncilEngine
-from db import Database
+from db import SESSION_EXPORT, Database
 from delegation import Delegation
 import delegation
+import moves
 from memory import HANDOFF_SUMMARIES, MAX_SUMMARY_CHARS, SUMMARIZE_JOBS, Memory, summary_scope, without_handoff
 from notify import Notifier
 from redact import NO_URL_CREDENTIALS, redact, url_has_userinfo
@@ -56,7 +58,7 @@ import limits
 import mcp_server
 import usage
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("hub")
 
@@ -107,6 +109,10 @@ PUBLIC_URL = _public_url(os.environ.get("HUB_PUBLIC_URL", ""))
 notifier = Notifier.from_env(os.environ, PUBLIC_URL)
 PROXY_TIMEOUT = float(os.environ.get("HUB_MCP_PROXY_TIMEOUT", "120"))  # one tool call through the hub
 SIGNIN_TIMEOUT = float(os.environ.get("HUB_OAUTH_SIGNIN_TIMEOUT", "600"))
+# The shared MCP token (the MCP page's Show and Rotate) works unless this is '0'. Machines with their own
+# runner token use an MCP token of their own (machine_mcp_token); with the shared one off, machines on the
+# shared runner token and older runners get no MCP token at all.
+SHARED_MCP = os.environ.get("HUB_MCP_SHARED_TOKEN", "1").strip() != "0"
 ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 
 
@@ -216,6 +222,8 @@ def retry_on_credits(job: dict, by_hand: bool = False) -> int:
         # And the job summaries: the retry writes the summary asked for, and its prompt (kept) has the handoff.
         keep = {k: opts[k] for k in ("timeout_min", "capture_diff", "needs", "title_typed", "git_account",
                                      "mcp_add", "mcp_only", "summarize", "handoff") if k in opts}
+        if isinstance(keep.get("needs"), list):  # an exact move's retry starts a new session: no copy to take
+            keep["needs"] = [n for n in keep["needs"] if n != "session_move"]
         new_id = db.create_job(
             kind="task", title=job["title"], runner=job["runner"], agent=agent, project=job["project"],
             autonomy=job["autonomy"], prompt=job["prompt"], model=job.get("model"), retry_of=job["id"],
@@ -262,7 +270,8 @@ KIT_DIGEST = hashlib.sha256(repr(sorted(KIT.items())).encode()).hexdigest()[:10]
 
 
 def mcp_token() -> str:
-    """The bearer token agents use for the hub's /mcp endpoint (created on first use)."""
+    """The shared bearer token for the hub's /mcp endpoint (created on first use): for machines on
+    the shared runner token, older runners, and clients set up by hand."""
     token = os.environ.get("HUB_MCP_TOKEN") or memory.get_setting("mcp_token")
     if not token:
         token = secrets.token_urlsafe(32)
@@ -270,16 +279,71 @@ def mcp_token() -> str:
     return token
 
 
+MACHINE_MCP_PREFIX = "bpm_"  # a machine's own MCP token: "bpm_" and secrets.token_urlsafe(32) (redact.py masks it)
+MACHINE_MCP_FEATURE = "machine-mcp-token"  # a runner that keeps an MCP token of its own says this when it syncs
+
+
+def mcp_caller(token: str) -> str | None:
+    """Who an MCP bearer token belongs to: "" for the shared token (while it is on), the machine's name
+    for a machine's own MCP token, None for anything else. The shared token is compared in constant
+    time; a machine's token is found by its sha256, as runner tokens are."""
+    supplied = token.encode("utf-8", "surrogateescape")
+    if SHARED_MCP and hmac.compare_digest(supplied, mcp_token().encode()):
+        return ""
+    if not token.startswith(MACHINE_MCP_PREFIX):
+        return None
+    return db.machine_for_mcp_token(hashlib.sha256(supplied).hexdigest())
+
+
+def machine_mcp_token(auth: "RunnerAuth", features: list[str], held: str) -> dict:
+    """The MCP token a runner writes into its agents' settings, for /api/runner/context:
+    {"mcp_token": ..., "mcp_token_kind": "machine" | "shared"}.
+
+    A machine with its own runner token whose runner understands MCP tokens of its own gets one: the
+    one it already holds (`held`, checked against the stored sha256), or else a new one, which
+    replaces any earlier one. The hub keeps only the sha256, so the token goes to that runner alone,
+    over its own authenticated channel. Once a machine has had its own, its runner token never gets
+    the shared one again, so a stolen runner token can't fetch the shared token by posing as an older
+    runner. Everyone else gets the shared token, unless HUB_MCP_SHARED_TOKEN=0 turned it off."""
+    if auth.kind == "machine" and auth.name:
+        if MACHINE_MCP_FEATURE in features:
+            with db.lock:
+                stored = db.machine_mcp_hash(auth.name)
+                if held and stored and hmac.compare_digest(
+                        hashlib.sha256(held.encode("utf-8", "surrogateescape")).hexdigest(), stored):
+                    return {"mcp_token": held, "mcp_token_kind": "machine"}
+                token = MACHINE_MCP_PREFIX + secrets.token_urlsafe(32)
+                if not db.set_machine_mcp_hash(auth.name, hashlib.sha256(token.encode()).hexdigest()):
+                    raise HTTPException(401, "Bad runner token")  # forgotten a moment ago
+            log.info("issued a new MCP token for %s", auth.name)
+            return {"mcp_token": token, "mcp_token_kind": "machine"}
+        state = db.machine_mcp_state(auth.name)
+        if state is not None and state["at"] is not None:
+            return {"mcp_token": "", "mcp_token_kind": "machine"}  # never the shared one again (see above)
+    return {"mcp_token": mcp_token() if SHARED_MCP else "", "mcp_token_kind": "shared"}
+
+
 WIRING = "w2"
 
 
-def context_token() -> str:
+def context_token(machine: str | None = None) -> str:
     """Changes whenever runners should re-sync: notes, MCP list, add-ons, the MCP token,
-    or whether the hub's MCP endpoint is available."""
-    tok = hashlib.sha256(mcp_token().encode()).hexdigest()[:6]
+    or whether the hub's MCP endpoint is available. For a machine with its own runner token
+    (`machine`), also when its own MCP token is issued or rotated; until it has had one, the
+    value is the same as for everyone else."""
+    tok = hashlib.sha256(mcp_token().encode()).hexdigest()[:6] if SHARED_MCP else "off"
     # WIRING: bump when what runners get changes shape, so every runner re-syncs after a hub update
     # (w2: servers relayed by the hub, only for runners that can wire them).
-    return f"{memory.context_version()}-{KIT_DIGEST}-{tok}-{'m' if hub_mcp is not None else 'x'}-{WIRING}"
+    base = f"{memory.context_version()}-{KIT_DIGEST}-{tok}-{'m' if hub_mcp is not None else 'x'}-{WIRING}"
+    state = db.machine_mcp_state(machine) if machine else None
+    if state is None or state["at"] is None:
+        return base
+    return base + "-" + hashlib.sha256(repr(state["at"]).encode()).hexdigest()[:6]
+
+
+def runner_context_token(auth: "RunnerAuth") -> str:
+    """context_token for the machine a runner token acts for (the shared token names none)."""
+    return context_token(auth.name if auth.kind == "machine" else None)
 
 
 hub_mcp, hub_mcp_app = mcp_server.build(memory)
@@ -437,8 +501,8 @@ app.add_middleware(SameOriginWrites)
 app.add_middleware(NoFraming)
 if hub_mcp_app is not None:
     ACCESS = mcp_server.access_verifier_from_env(os.environ)
-    # /mcp/job checks a job token of its own, so the shared MCP token check leaves it alone.
-    app.add_middleware(mcp_server.McpAuth, get_token=mcp_token, access=ACCESS,
+    # /mcp/job checks a job token of its own, so the MCP token check leaves it alone.
+    app.add_middleware(mcp_server.McpAuth, check=mcp_caller, access=ACCESS,
                        exempt=(job_mcp.PATH,) if job_mcp is not None else ())
     app.router.routes.extend(hub_mcp_app.routes)  # exactly /mcp, guarded by McpAuth above
     if proxy is not None:
@@ -514,8 +578,16 @@ def runner_view(r: dict) -> dict:
     row = r
     r = dict(r)
     r["online"] = (time.time() - (r.get("last_seen") or 0)) < ONLINE_WINDOW
+    # Paused on the dashboard: no new tasks, council steps or subtasks (machine actions still run).
+    r["paused"] = bool(r.get("paused"))
     # 'machine': it checks in with its own token; 'shared': with the hub's shared runner token.
     r["auth"] = r.get("auth") or "shared"
+    # Its agents' MCP token: 'own' (the machine's own), 'waiting' (rotated; a new one comes with its next
+    # sync) or 'shared' (the hub's shared one, or none while that is off). Never the token or its hash.
+    mcp = db.machine_mcp_state(r["name"])
+    r["mcp_auth"] = "shared" if mcp is None or mcp["at"] is None else "own" if mcp["has_token"] else "waiting"
+    # The context version this machine should have synced (its own MCP token is part of it).
+    r["context_token"] = context_token(r["name"])
     # The tags the machine reports; only the accepted ones (and its platform tag) count for routing.
     r["tags"] = reported_tags(row)
     r["accepted_tags"] = effective_tags(row)
@@ -531,6 +603,7 @@ def runner_view(r: dict) -> dict:
     skew = r.pop("clock_skew", None)
     r["agents"] = [{**a, "limits": limits.agent_limits(a["limits"], skew)}
                    if isinstance(a, dict) and "limits" in a else a for a in (r.get("agents") or [])]
+    r.pop("install_id", None)  # only for telling computers apart (name_conflict); never shown
     other, at = r.pop("conflict_host", None), r.pop("conflict_at", None)
     if other and at and time.time() - at < NAME_CONFLICT_WINDOW:
         # Two computers are checking in under this one name: say which other one it is.
@@ -740,15 +813,17 @@ def check_tag_target(tag: str, agent: str, project: str | None, account: str | N
 
 
 def tag_candidates(job: dict) -> dict:
-    """For a queued tag job: how many machines could take it under the claim rule, and how many
-    of them are online now."""
+    """For a queued tag job: how many machines could take it under the claim rule, how many of them
+    are online now and not paused, and how many are paused."""
     opts = job["options"] if isinstance(job.get("options"), dict) else {}
     account = opts.get("account") if isinstance(opts.get("account"), str) else ""
     needs = opts.get("needs") if isinstance(opts.get("needs"), list) else []
     match = [r for r in db.runners()
              if tag_job_fits(r, job["target_tag"], job["agent"], job["project"], account, needs,
                              delegated=bool(opts.get("delegated")))]
-    return {"match": len(match), "online": sum(1 for r in match if runner_view(r)["online"])}
+    paused = [r for r in match if r.get("paused")]
+    return {"match": len(match), "online": sum(1 for r in match if runner_view(r)["online"] and not r.get("paused")),
+            "paused": len(paused)}
 
 
 # How many entries the owner's subtask scope may list (New task).
@@ -979,7 +1054,15 @@ class NewTask(BaseModel):
 
 @app.post("/api/tasks", dependencies=[Depends(require_user)])
 def create_task(body: NewTask) -> dict:
-    resume = None
+    return {"id": new_task_job(body)}
+
+
+def new_task_job(body: NewTask, resume: str | None = None, title: str | None = None, move: dict | None = None,
+                 continued_from: int | None = None) -> int:
+    """Check a new task or follow-up and queue it; returns its id. "Continue on another machine" (move_job) makes its
+    task here too, with the same checks: `title` instead of one from the prompt, `move` for options.move (an exact
+    move also gets `resume`, the session it continues, and needs its agent to take the copy), and `continued_from`,
+    the job it continues."""
     model = check_model(body.model)
     tag = None
     if not body.follow_up_of:
@@ -1028,7 +1111,8 @@ def create_task(body: NewTask) -> dict:
         raise HTTPException(400, MCP_ONLY_NO_SUBTASKS)
     # What the machine's agent must support, for claiming the job (and for a retry on credits).
     needs = ((["approvals"] if body.autonomy == "ask" else []) + (["live"] if body.live else [])
-             + (["job_mcp"] if body.delegate else []) + (["mcp_pick"] if picking else []))
+             + (["job_mcp"] if body.delegate else []) + (["mcp_pick"] if picking else [])
+             + (["session_move"] if move and move.get("mode") == "exact" else []))
     summarize = memory.flag(SUMMARIZE_JOBS) if body.summarize is None else body.summarize
     handoff = not body.follow_up_of and (memory.flag(HANDOFF_SUMMARIES) if body.handoff is None else body.handoff)
     options: dict[str, Any] = {"timeout_min": body.timeout_min, "capture_diff": body.capture_diff}
@@ -1068,9 +1152,11 @@ def create_task(body: NewTask) -> dict:
     if not prompt.strip():
         raise HTTPException(400, "Write a prompt.")
     typed = (body.title or "").strip()
-    title = typed or prompt.strip().splitlines()[0][:80]
+    title = typed or title or prompt.strip().splitlines()[0][:80]
     if typed:
         options["title_typed"] = True  # the owner typed it, so a notification may show it
+    if move:
+        options["move"] = move
     if body.live:
         options.update(live=True, idle_min=body.idle_min)
     if mcp_add:
@@ -1084,12 +1170,11 @@ def create_task(body: NewTask) -> dict:
         prompt = memory.handoff(summary_scope(body.project), prompt)
     if needs:
         options["needs"] = needs
-    job_id = db.create_job(
+    return db.create_job(
         kind="task", title=title, runner=None if tag else body.runner, target_tag=tag, agent=body.agent,
         project=body.project, autonomy=body.autonomy, prompt=prompt, resume_session=resume, model=model,
-        follow_up_of=body.follow_up_of, options=options,
+        follow_up_of=body.follow_up_of, options=options, continued_from=continued_from,
     )
-    return {"id": job_id}
 
 
 class Seat(BaseModel):
@@ -1361,10 +1446,20 @@ def get_job(job_id: int, since: int = 0, messages_since: int = 0) -> dict:
     if job is None:
         raise HTTPException(404, "No such job")
     out: dict[str, Any] = {"job": public_job(job), "logs": db.logs(job_id, since)}
+    # Paused machines among those this page names (the job's, its council steps' and its subtasks'), read on
+    # every refresh, so "Waiting: <machine> is paused" goes away once the machine is resumed.
+    paused = db.paused_runners()
+    named = {job.get("runner")}
     if job["kind"] == "council":
         out["steps"] = [public_job(step) for step in db.children(job_id)]
+        named |= {step.get("runner") for step in out["steps"]}
     if job["kind"] == "task":
         out["thread_len"] = len(thread_ids(job))
+        # "Continue on another machine": the jobs that carried this conversation on (hub/moves.py).
+        out["continued_on"] = [{"id": r["id"], "runner": r["runner"], "agent": r["agent"], "status": r["status"],
+                                "mode": moves.move_of(r).get("mode")}
+                               for r in db.query("SELECT id, runner, agent, status, options FROM jobs "
+                                                 "WHERE continued_from=? ORDER BY id", (job_id,))]
         # Live sessions: the messages after `messages_since`, like `since` for log lines.
         out["messages"] = db.messages(job_id, messages_since)
         out["continue_command"] = continue_command(job)
@@ -1375,6 +1470,7 @@ def get_job(job_id: int, since: int = 0, messages_since: int = 0) -> dict:
         # The subtasks this job handed out, and for a queued job aimed at a tag, how many machines
         # could take it (and how many of those are online).
         out["subtasks"] = [subtask_view(s) for s in db.subtasks(job_id)]
+        named |= {s.get("runner") for s in out["subtasks"]}
         if job["status"] == "queued" and job.get("target_tag"):
             out["tag_candidates"] = tag_candidates(job)
         # Platform credits: the retry of this job on credits, if there is one; otherwise, for a job
@@ -1385,6 +1481,7 @@ def get_job(job_id: int, since: int = 0, messages_since: int = 0) -> dict:
             agent, org, why = credits.retry_target(job, db.runner(job.get("runner") or ""), usage.org_names(),
                                                    credit_states(), by_hand=True)
             out["credits_retry"] = {"agent": agent, "org": org, "why": why}
+    out["paused_machines"] = sorted(n for n in named if n and n in paused)
     return out
 
 
@@ -1399,14 +1496,17 @@ def subtask_view(job: dict) -> dict:
 
 
 def approval_view(a: dict) -> dict:
-    """One question for the job page, its input parsed (masked once the job has ended)."""
+    """One question for the job page, its input parsed (masked once the job has ended). A pending one says
+    whether "Allow for this job" may be offered (approvals.for_job_ok)."""
     try:
         tool_input = json.loads(a["tool_input"]) if a["tool_input"] else None
     except ValueError:
         tool_input = a["tool_input"]
     return {"id": a["id"], "tool_name": a["tool_name"], "tool_input": tool_input, "status": a["status"],
             "message": a["message"], "created_at": a["created_at"], "expires_at": a["expires_at"],
-            "decided_at": a["decided_at"]}
+            "decided_at": a["decided_at"], "for_job": bool(a.get("for_job")), "same_as": a.get("same_as"),
+            "can_allow_for_job": (a["status"] == "pending" and bool(a.get("match_key"))
+                                  and for_job_ok(a["tool_name"], tool_input))}
 
 
 def _clip(text: str | None, limit: int) -> str | None:
@@ -1434,6 +1534,165 @@ def job_thread(job_id: int) -> dict:
                          for m in db.messages(tid)],
         })
     return {"current": job_id, "turns": turns}
+
+
+# ------------------------------------------------- continue on another machine
+# The owner's own choice, from a finished task's page (hub/moves.py): carry the conversation to any agent, or move
+# the exact Claude Code session to an agent on the same account. Never automatic, and never offered because of a
+# usage limit: after one, the conversation may continue only on the account that hit it (delegation.limit_accounts).
+transfers = moves.TransferStore()
+FINISHED = ("done", "error", "cancelled")
+
+
+class MoveIn(BaseModel):
+    mode: Literal["carry", "exact"]
+    runner: str = Field(min_length=1, max_length=64)
+    agent: str = Field(min_length=1, max_length=64)
+    project: str = "chat"
+    prompt: str = Field(min_length=1)
+    autonomy: Autonomy = "readonly"
+    model: Optional[str] = None
+    timeout_min: int = Field(default=60, ge=1, le=24 * 60)
+    capture_diff: bool = False
+
+
+def move_source(job_id: int) -> dict:
+    job = db.job(job_id)
+    if job is None:
+        raise HTTPException(404, "No such job")
+    if job["kind"] != "task":
+        raise HTTPException(400, "Only a task can continue on another machine.")
+    if job["status"] not in FINISHED:
+        raise HTTPException(409, "That job is still running. Wait until it finishes.")
+    return job
+
+
+def limit_refusal(source: dict, target_key: str) -> str:
+    """Why the conversation can't continue on this account: it hit a usage limit on another one. '' when it may."""
+    hit = delegation.limit_accounts(db, source, account_key)
+    if not hit or target_key in hit:
+        return ""
+    return (f"This conversation hit a usage limit on {hit[0]}, so it can continue only on that account. "
+            + delegation.OWN_ACCOUNT_LIMIT)
+
+
+def exact_refusal(source: dict, runner: dict | None, agent: str) -> str:
+    """Why the exact session can't move to this agent; '' when it can (hub/moves.py)."""
+    session = source.get("session_id") or ""
+    if not moves.SESSION_UUID_RE.fullmatch(session):
+        return "This job has no Claude Code session to move."
+    src = db.runner(source.get("runner") or "")
+    if src is None or runner is None:
+        return "The machine that ran this job, or the one you picked, isn't on the hub any more."
+    mine, theirs = find_agent(src, source["agent"]) or {}, find_agent(runner, agent) or {}
+    if mine.get("preset") not in ("claude", "selftest") or theirs.get("preset") != mine.get("preset"):
+        return "Only a Claude Code session can move, and only to another Claude Code agent."
+    if runner["name"] == src["name"] and agent == source["agent"]:
+        return "The session is already there: use Follow up."
+    for row, name in ((src, source["agent"]), (runner, agent)):
+        if not agent_has(row, name, "session_move"):
+            return f"{name} on {row['name']} can't move sessions yet: update the runner on {row['name']}."
+    own, target = delegation.job_account(db, source, account_key), account_key(runner, agent)
+    if own != target:
+        return (f"An exact move stays on one account: this session belongs to {own}, and {agent} on "
+                f"{runner['name']} is {target}.")
+    if source.get("project") not in runner_projects(runner):
+        return f"{runner['name']} has no project called '{source.get('project')}'."
+    if not runner_view(src)["online"]:
+        return f"{src['name']} is offline, and the session has to be copied from there."
+    later = db.query_one("SELECT id FROM jobs WHERE id != ? AND (session_id=? OR resume_session=?) "
+                         "AND (id > ? OR status IN ('queued', 'running')) ORDER BY id DESC LIMIT 1",
+                         (source["id"], session, session, source["id"]))
+    if later:
+        return f"Job #{later['id']} continues this session: move it from there, once it has finished."
+    return ""
+
+
+@app.get("/api/jobs/{job_id}/move", dependencies=[Depends(require_user)])
+def move_options(job_id: int) -> dict:
+    """What "Continue on another machine" can offer for a finished task: the files it changed (they stay where they
+    are), the accounts that hit a usage limit in its conversation, and for every agent on every machine whether the
+    conversation can be carried there and whether the exact session can move there (each '' or why not)."""
+    source = move_source(job_id)
+    machines = []
+    for row in db.runners():
+        agents = []
+        for a in row.get("agents") or []:
+            if not isinstance(a, dict) or not isinstance(a.get("name"), str):
+                continue
+            key = account_key(row, a["name"])
+            agents.append({"name": a["name"], "label": a.get("label") or a["name"], "account": key,
+                           "preset": a.get("preset") or "", "carry": limit_refusal(source, key),
+                           "exact": exact_refusal(source, row, a["name"])})
+        machines.append({"name": row["name"], "online": runner_view(row)["online"], "projects": runner_projects(row),
+                         "agents": agents})
+    jobs = moves.chain(db, source)
+    return {"source": {"id": source["id"], "runner": source.get("runner"), "agent": source.get("agent"),
+                       "project": source.get("project"),
+                       "account": delegation.job_account(db, source, account_key)},
+            "files": moves.changed_files([j.get("diff") for j in jobs]),
+            "limit_accounts": delegation.limit_accounts(db, source, account_key),
+            "max_mb": moves.COPY_MAX_BYTES // (1024 * 1024), "machines": machines}
+
+
+def move_title(source: dict, message: str) -> str:
+    return f"Continued from #{source['id']}: {message.strip().splitlines()[0][:60]}"
+
+
+@app.post("/api/jobs/{job_id}/move", dependencies=[Depends(require_user)])
+def move_job(job_id: int, body: MoveIn) -> dict:
+    """Continue a finished task on another machine (hub/moves.py), as the owner picked: returns the new task's id."""
+    source = move_source(job_id)
+    body.runner, body.agent = body.runner.strip(), body.agent.strip()
+    runner = db.runner(body.runner)
+    if runner is None:
+        raise HTTPException(400, f"Unknown machine '{body.runner}'. Has its runner checked in yet?")
+    if find_agent(runner, body.agent) is None:
+        raise HTTPException(400, f"Machine '{body.runner}' has no agent called '{body.agent}'.")
+    task = NewTask(runner=body.runner, agent=body.agent, project=body.project, prompt=body.prompt,
+                   autonomy=body.autonomy, model=body.model, timeout_min=body.timeout_min,
+                   capture_diff=body.capture_diff, handoff=False)
+    move = {"mode": body.mode, "from_job": source["id"], "from_runner": source.get("runner"),
+            "from_agent": source.get("agent"), "message": body.prompt}
+    title = move_title(source, body.prompt)
+    if body.mode == "carry":
+        why = limit_refusal(source, account_key(runner, body.agent))
+        if why:
+            raise HTTPException(409, why)
+        jobs = moves.chain(db, source)
+        files = moves.changed_files([j.get("diff") for j in jobs])
+
+        def clean(text: str) -> str:
+            # What an agent wrote becomes another agent's prompt: without hidden characters, secrets masked.
+            return redact(HIDDEN_RE.sub(lambda m: m.group() if m.group() in "\n\t" else "", text or ""))
+
+        kept, omitted = moves.fit(moves.conversation(db, jobs, without_handoff, clean))
+        task.prompt = moves.carried_prompt(kept, omitted, source, body.prompt, files)
+        move.update(carried=len(kept), omitted=omitted, files=files[:moves.FILES_SHOWN])
+        new_id = new_task_job(task, title=title, move=move, continued_from=source["id"])
+        log.info("job %s carried on as job %s on %s (%s)", source["id"], new_id, body.runner, body.agent)
+        return {"id": new_id}
+    # The exact session: the same project, the source machine sends it, the target waits for it (db._named_job).
+    task.project = source.get("project") or "chat"
+    if body.project != task.project:
+        raise HTTPException(400, f"An exact move continues in the same project ({task.project}).")
+    with db.lock:
+        why = exact_refusal(source, runner, body.agent)
+        if why:
+            raise HTTPException(409, why)
+        copy_id = secrets.token_urlsafe(24)
+        move.update(copy=copy_id, waiting=True)
+        new_id = new_task_job(task, resume=source["session_id"], title=title, move=move, continued_from=source["id"])
+        transfers.open(copy_id, source["runner"], body.runner, new_id, source["session_id"])
+        export_id = db.create_job(
+            kind="admin", title=f"Send a session to {body.runner} (job #{new_id})", runner=source["runner"],
+            project=task.project,
+            options={"action": SESSION_EXPORT, "timeout_min": 5, "expires_at": time.time() + moves.EXPORT_PICKUP_S,
+                     "params": {"copy": copy_id, "target_job": new_id, "session_id": source["session_id"],
+                                "agent": source["agent"], "project": task.project, "max_bytes": moves.COPY_MAX_BYTES}})
+        db.update_job(new_id, options={**db.job(new_id)["options"], "move": {**move, "export_job": export_id}})
+    log.info("job %s's session moves to %s (%s) as job %s", source["id"], body.runner, body.agent, new_id)
+    return {"id": new_id}
 
 
 def cancel_one(job: dict) -> None:
@@ -1569,7 +1828,8 @@ def end_session(job_id: int) -> dict:
 
 # ---------------------------------------------------------------- approvals
 class ApprovalAnswer(BaseModel):
-    decision: Literal["allow", "deny"]
+    # allow_job: "Allow for this job", which also allows the same request again in this job (hub/approvals.py)
+    decision: Literal["allow", "allow_job", "deny"]
     message: str = Field(default="", max_length=10_000)  # the reason sent with Deny (the first 2,000 characters)
 
 
@@ -1598,6 +1858,7 @@ ADMIN_ACTIONS = {
     "usage.check": "Check Claude plan limits",
     "rc.start": "Start Remote Control",
     "rc.stop": "Stop Remote Control",
+    "auth.logout": "Sign out",
 }
 GIT_URL_RE = re.compile(r"^(?:(?:https|ssh)://|git@)[^/\s'\"`$;|&<>][^\s'\"`$;|&<>]*$")
 
@@ -1608,6 +1869,9 @@ USAGE_CHECK_EVERY = 300
 COMMAND_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Start Remote Control is dropped when its machine hasn't picked it up within this many seconds.
 RC_START_EXPIRES = 120
+# So is Sign out: signing an agent out much later, when the machine comes back, would surprise.
+SIGN_OUT_EXPIRES = 120
+PAUSED_RC_REFUSAL = "{name} is paused. Resume it on its page to start Remote Control."
 
 
 class AdminAction(BaseModel):
@@ -1768,6 +2032,8 @@ def remote_control_params(runner: dict, action: str, params: dict[str, str]) -> 
         return {"agent": agent, "project": project}
     if not runner_view(runner)["online"]:
         raise HTTPException(409, f"{name} is offline. Start Remote Control when it is back.")
+    if runner.get("paused"):
+        raise HTTPException(409, PAUSED_RC_REFUSAL.format(name=name))
     if find_agent(runner, agent) is None:
         raise HTTPException(400, f"Machine '{name}' has no agent called '{agent}'.")
     if not agent_has(runner, agent, "remote_control"):
@@ -1786,7 +2052,53 @@ def remote_control_params(runner: dict, action: str, params: dict[str, str]) -> 
         started = opts.get("params") if isinstance(opts.get("params"), dict) else {}
         if opts.get("action") == "rc.start" and started.get("agent") == agent and started.get("project") == project:
             raise HTTPException(409, f"Remote Control for {agent} in {project} on {name} is already starting.")
+    # "Start again when the runner starts": only sent when ticked, and only to a runner that reports it can
+    # (an older one would ignore it and say nothing).
+    again = params.get("start_with_runner", "")
+    if again not in ("", "0", "1"):
+        raise HTTPException(400, "start_with_runner is 1 or 0.")
+    if again == "1":
+        if info.get("remote_control_start_with_runner") is not True:
+            raise HTTPException(400, f"{name} can't start Remote Control again when its runner starts yet: update "
+                                     f"the runner on {name} (it runs {runner.get('version') or '?'}).")
+        return {"agent": agent, "project": project, "start_with_runner": "1"}
     return {"agent": agent, "project": project}
+
+
+def sign_out_params(runner: dict, params: dict[str, str]) -> dict:
+    """Check a Sign out request (an agent's own "auth logout" on its machine); returns the job's params. It
+    needs the dashboard password, the machine's allow_remote_sign_out, a full claude.ai login, and no job of
+    that agent running. Signing in again is done on the machine itself, never through the hub."""
+    name = runner["name"]
+    agent = params.get("agent", "")
+    if not UI_PASSWORD:
+        raise HTTPException(400, "Signing an agent out from the dashboard needs a dashboard password: set "
+                                 "HUB_UI_PASSWORD on the hub.")
+    found = find_agent(runner, agent) if agent else None
+    if found is None:
+        raise HTTPException(400, f"Machine '{name}' has no agent called '{agent}'.")
+    if not agent_has(runner, agent, "sign_out"):
+        if found.get("preset") in ("claude", "selftest") and found.get("auth") in (None, "login"):
+            raise HTTPException(400, f"{agent} on {name} can't be signed out from the dashboard yet: update the "
+                                     f"runner on {name} (it runs {runner.get('version') or '?'}).")
+        raise HTTPException(400, f"{agent} on {name} has no claude.ai login to sign out of.")
+    info = runner.get("info") if isinstance(runner.get("info"), dict) else {}
+    if info.get("allow_remote_sign_out") is not True:
+        raise HTTPException(400, f"{name} doesn't allow signing agents out from the dashboard "
+                                 "(allow_remote_sign_out in its runner.json).")
+    if not runner_view(runner)["online"]:
+        raise HTTPException(409, f"{name} is offline. Sign {agent} out when it is back.")
+    if db.query_one("SELECT 1 AS x FROM jobs WHERE runner=? AND agent=? AND kind='task' AND status='running'",
+                    (name, agent)):
+        raise HTTPException(409, f"{agent} is running a job on {name}. Sign it out once the job has finished, or "
+                                 "cancel the job first.")
+    for job in db.query("SELECT options FROM jobs WHERE runner=? AND kind='admin' AND status IN ('queued', 'running') "
+                        "AND options LIKE '%auth.logout%'", (name,)):
+        opts = job["options"] if isinstance(job.get("options"), dict) else {}
+        asked = opts.get("params") if isinstance(opts.get("params"), dict) else {}
+        if opts.get("action") == "auth.logout" and asked.get("agent") == agent:
+            raise HTTPException(409, f"{agent} on {name} is already being signed out.")
+    return {"agent": agent}
 
 
 def queue_admin(runner: dict, action: str, params: dict[str, str]) -> int:
@@ -1850,6 +2162,10 @@ def queue_admin(runner: dict, action: str, params: dict[str, str]) -> int:
         if action == "rc.start":
             # Not picked up in time (the machine went offline): dropped, not started much later.
             options["expires_at"] = time.time() + RC_START_EXPIRES
+    elif action == "auth.logout":
+        params = sign_out_params(runner, params)
+        label = params["agent"]
+        options["expires_at"] = time.time() + SIGN_OUT_EXPIRES
     else:
         label = params.get("name") or params.get("version") or ""
     job_id = db.create_job(kind="admin", title=f"{ADMIN_ACTIONS[action]}: {label}".rstrip(": "),
@@ -1912,6 +2228,40 @@ def accept_runner(name: str, body: AcceptIn) -> dict:
     return {"ok": True, "runner": runner_view(db.runner(name))}
 
 
+class PauseIn(BaseModel):
+    # What happens to the jobs the machine is running: they finish (the default), or they are cancelled.
+    cancel_running: bool = False
+
+
+@app.post("/api/runners/{name}/pause", dependencies=[Depends(require_user)])
+def pause_runner(name: str, body: PauseIn) -> dict:
+    """Take a machine out of service: it gets no new tasks, council steps or subtasks (Database.claim_next_job),
+    while machine actions (update, sync, clone and pull, Check limits, Stop Remote Control) still run, so it can be
+    fixed. Jobs queued for it by name wait; tasks for one of its tags go to other machines. With cancel_running,
+    the tasks it is running are cancelled as Cancel does (their subtasks and councils follow); machine actions
+    running there are left alone. Remote Control servers already running are left alone too."""
+    if not db.set_paused(name, True):
+        raise HTTPException(404, f"No machine called '{name}'.")
+    running = db.query("SELECT * FROM jobs WHERE runner=? AND kind='task' AND status='running' "
+                       "AND cancel_requested=0 ORDER BY id", (name,))
+    cancelled = 0
+    if body.cancel_running:
+        for job in running:
+            cancel_one(job)
+            cancelled += 1
+    log.info("paused %s%s", name, f"; cancelled {cancelled} running job(s)" if cancelled else "")
+    return {"ok": True, "running": len(running), "cancelled": cancelled, "runner": runner_view(db.runner(name))}
+
+
+@app.post("/api/runners/{name}/resume", dependencies=[Depends(require_user)])
+def resume_runner(name: str) -> dict:
+    """Put a paused machine back in service: it takes the jobs that waited for it at its next poll."""
+    if not db.set_paused(name, False):
+        raise HTTPException(404, f"No machine called '{name}'.")
+    log.info("resumed %s", name)
+    return {"ok": True, "runner": runner_view(db.runner(name))}
+
+
 def admin_pending(action: str) -> set[str]:
     """The machines that already have an `action` job (e.g. "sync") waiting or running."""
     return {j["runner"] for j in db.query(
@@ -1919,14 +2269,37 @@ def admin_pending(action: str) -> set[str]:
         if isinstance(j.get("options"), dict) and j["options"].get("action") == action}
 
 
-def queue_for_all(action: str, skip_reason) -> dict:
-    """Queue `action` on every machine that skip_reason(machine) doesn't skip. Returns the job ids,
-    the machines they went to, and each skipped machine with the reason."""
+class FleetIn(BaseModel):
+    # Sync all and Update all runners; with a tag, only the machines tagged so (tag_group_reason).
+    tag: str = ""
+
+
+def fleet_tag(body: Optional[FleetIn]) -> str:
+    """The tag a Sync all or Update all is for, or '' for every machine. 400 for a malformed tag, 404
+    when no machine reports it."""
+    tag = (body.tag if body else "").strip().lower()
+    if not tag:
+        return ""
+    if not TAG_RE.fullmatch(tag):
+        raise HTTPException(400, f"'{tag}' isn't a tag: tags are lowercase letters, digits, '.', '_' and '-'.")
+    if not any(tag in reported_tags(r) for r in db.runners()):
+        raise HTTPException(404, f"No machine reports the tag '{tag}'.")
+    return tag
+
+
+def queue_for_all(action: str, skip_reason, tag: str = "") -> dict:
+    """Queue `action` on every machine that skip_reason(machine) doesn't skip, or, with a tag, on every
+    machine of that tag's group. Returns the job ids, the machines they went to, and each skipped
+    machine with the reason. A machine with nothing to do (skip_reason gives None) isn't mentioned,
+    and neither is one without the tag; one that reports the tag but isn't in the group is skipped
+    with tag_group_reason's reason."""
     queued, machines, skipped, reasons = [], [], [], {}
     for r in db.runners():
-        why = skip_reason(r)
+        group = tag_group_reason(r, tag) if tag else ""
+        why = None if group is None else skip_reason(r)
         if why is None:
             continue  # nothing to do there (say, already up to date): not worth a mention
+        why = group or why
         if not why:
             try:
                 queued.append(queue_admin(r, action, {}))
@@ -1936,13 +2309,15 @@ def queue_for_all(action: str, skip_reason) -> dict:
                 why = str(err.detail)
         skipped.append(r["name"])
         reasons[r["name"]] = why
-    return {"queued": queued, "machines": machines, "skipped": skipped, "reasons": reasons}
+    return {"queued": queued, "machines": machines, "skipped": skipped, "reasons": reasons, "tag": tag}
 
 
 @app.post("/api/runners-update-all", dependencies=[Depends(require_user)])
-def update_all() -> dict:
-    """Update every online machine whose runner is older than the hub's. Offline machines are
-    skipped (and named): an update waiting for days would surprise whoever starts the machine."""
+def update_all(body: Optional[FleetIn] = None) -> dict:
+    """Update every online machine whose runner is older than the hub's, or only those tagged
+    body.tag. Offline machines are skipped (and named): an update waiting for days would surprise
+    whoever starts the machine."""
+    tag = fleet_tag(body)
     latest = latest_runner_version()
     updating = admin_pending("runner.update")
 
@@ -1957,7 +2332,24 @@ def update_all() -> dict:
             return "too old to update itself"
         return "an update is already on its way" if r["name"] in updating else ""
 
-    return {**queue_for_all("runner.update", skip), "version": latest}
+    return {**queue_for_all("runner.update", skip, tag), "version": latest}
+
+
+@app.post("/api/runners/{name}/mcp-token/rotate", dependencies=[Depends(require_user)])
+def rotate_machine_mcp_token(name: str) -> dict:
+    """Stop one machine's own MCP token now. Its runner gets a new one at its next sync (the machine's
+    context version changes, so its next check-in asks for one); no other machine is affected."""
+    state = db.machine_mcp_state(name)
+    if state is None:
+        raise HTTPException(400, f"'{name}' has no runner token of its own, so it uses the hub's shared MCP token. "
+                                 "Give it its own with 'Make a setup command' on its page.")
+    if state["at"] is None:
+        raise HTTPException(400, f"'{name}' still uses the hub's shared MCP token. Press Update now on its page: "
+                                 "its runner then gets an MCP token of its own.")
+    if not db.rotate_machine_mcp(name):
+        raise HTTPException(400, f"'{name}' has no runner token of its own any more.")
+    log.info("rotated the MCP token of %s", name)
+    return {"ok": True}
 
 
 @app.delete("/api/runners/{name}", dependencies=[Depends(require_user)])
@@ -1974,7 +2366,8 @@ def forget_runner(name: str) -> dict:
     for parent in parents:
         councils.advance(parent)
     db.delete_runner(name)
-    # A machine with its own token can't come back with it: adding it again needs a new code.
+    # A machine with its own token can't come back with it: adding it again needs a new code. Its own
+    # MCP token stops working with it.
     revoked = db.revoke_machine_token(name)
     return {"ok": True, "token_revoked": revoked}
 
@@ -2051,9 +2444,11 @@ def preview_context() -> dict:
 
 
 @app.post("/api/runners-sync-all", dependencies=[Depends(require_user)])
-def sync_all() -> dict:
-    """Ask every online machine to sync now. A machine that already has a sync waiting or running
-    is skipped, so pressing the button twice doesn't queue every machine twice."""
+def sync_all(body: Optional[FleetIn] = None) -> dict:
+    """Ask every online machine to sync now, or only those tagged body.tag. A machine that already
+    has a sync waiting or running is skipped, so pressing the button twice doesn't queue every
+    machine twice."""
+    tag = fleet_tag(body)
     syncing = admin_pending("sync")
 
     def skip(r: dict) -> str:
@@ -2063,7 +2458,7 @@ def sync_all() -> dict:
             return "too old to sync from the dashboard"
         return "already syncing" if r["name"] in syncing else ""
 
-    return queue_for_all("sync", skip)
+    return queue_for_all("sync", skip, tag)
 
 
 # ------------------------------------------------------------ central MCP list
@@ -2101,21 +2496,29 @@ def server_view(s: dict) -> dict:
 # (pending sign-ins, token engines, connection pools) on the event loop, not in worker threads.
 @app.get("/api/mcp", dependencies=[Depends(require_user)])
 async def list_mcp() -> dict:
-    token = mcp_token()
+    token = mcp_token() if SHARED_MCP else ""
     return {"servers": [server_view(s) for s in registry.list()],
-            "hub": {"enabled": hub_mcp is not None, "path": "/mcp", "token_hint": token[:4] + "…" + token[-4:],
+            "hub": {"enabled": hub_mcp is not None, "path": "/mcp",
+                    "token_hint": token[:4] + "…" + token[-4:] if token else "", "shared_token": SHARED_MCP,
                     "trust_access": hub_mcp is not None and ACCESS is not None,
                     "proxy": proxy is not None, "public_url": PUBLIC_URL, "public_url_problem": PUBLIC_URL_PROBLEM},
             "context_token": context_token()}
 
 
+SHARED_MCP_OFF = "The shared MCP token is off (HUB_MCP_SHARED_TOKEN=0 in hub.env)."
+
+
 @app.get("/api/mcp/token", dependencies=[Depends(require_user)])
 def reveal_mcp_token() -> dict:
+    if not SHARED_MCP:
+        raise HTTPException(400, SHARED_MCP_OFF)
     return {"token": mcp_token()}
 
 
 @app.post("/api/mcp/token/rotate", dependencies=[Depends(require_user)])
 def rotate_mcp_token() -> dict:
+    if not SHARED_MCP:
+        raise HTTPException(400, SHARED_MCP_OFF)
     if os.environ.get("HUB_MCP_TOKEN"):
         raise HTTPException(400, "The token is set by HUB_MCP_TOKEN in hub.env; change it there.")
     memory.set_setting("mcp_token", secrets.token_urlsafe(32))
@@ -2455,7 +2858,9 @@ def lookup_code(raw: str, request: Request) -> tuple[dict | None, int, str]:
 
 def code_view(row: dict, code: str | None = None) -> dict:
     out = {"code_hint": row["code_hint"], "name": row["name"], "hub_url": row["hub_url"],
-           "expires_in": max(0, int(row["expires_at"] - time.time())), "created_at": row["created_at"]}
+           "expires_in": max(0, int(row["expires_at"] - time.time())), "created_at": row["created_at"],
+           # The tags and account labels accepted up front for the machine ({"tags": [], "accounts": {}}: none).
+           "accepted": accepted_of({"accepted": row.get("preaccepted")})}
     if code:  # only when it is made: the hub keeps no copy of the code itself
         pretty = enroll.pretty_code(code)
         out.update(code=pretty, linux=f"curl -fsSL '{row['hub_url']}/enroll/{pretty}/install.sh' | bash",
@@ -2466,6 +2871,42 @@ def code_view(row: dict, code: str | None = None) -> dict:
 class EnrollCodeIn(BaseModel):
     name: Optional[str] = None
     hub_url: Optional[str] = None
+    # Accepted up front for the machine: they count once it reports them, without a separate Accept.
+    tags: list[str] = []
+    accounts: dict[str, str] = {}  # agent name -> account label
+
+
+# Account labels one enrollment code may accept up front.
+MAX_CODE_LABELS = 20
+
+
+def code_preaccepted(body: EnrollCodeIn) -> dict | None:
+    """The tags and account labels a new code accepts up front, checked with the rules Accept uses on a
+    machine's page (400 for one that breaks them), or None for none. A platform tag counts anyway, so it
+    is left out."""
+    if len(body.tags) > MAX_TAGS:
+        raise HTTPException(400, f"Give at most {MAX_TAGS} tags.")
+    if len(body.accounts) > MAX_CODE_LABELS:
+        raise HTTPException(400, f"Give at most {MAX_CODE_LABELS} account labels.")
+    tags = set()
+    for raw in body.tags:
+        tag = (raw or "").strip().lower()
+        if not TAG_RE.fullmatch(tag):
+            raise HTTPException(400, f"'{raw}' isn't a tag: tags are lowercase letters, digits, '.', '_' and '-'.")
+        if tag not in PLATFORM_TAGS:
+            tags.add(tag)
+    accounts = {}
+    for raw_agent, raw in body.accounts.items():
+        agent, label = (raw_agent or "").strip(), (raw or "").strip()
+        if not NAME_RE.fullmatch(agent):
+            raise HTTPException(400, f"'{raw_agent}' isn't an agent name: use letters, digits, '.', '_' and '-'.")
+        if not ACCOUNT_RE.fullmatch(label):
+            raise HTTPException(400, f"'{raw}' isn't an account label: use letters, digits, spaces, '.', '_' and '-' "
+                                     "(max 40).")
+        accounts[agent] = label
+    if not tags and not accounts:
+        return None
+    return {"tags": sorted(tags), "accounts": dict(sorted(accounts.items()))}
 
 
 @app.post("/api/enroll-codes", dependencies=[Depends(require_user)])
@@ -2473,6 +2914,7 @@ def create_enroll_code(body: EnrollCodeIn, request: Request) -> dict:
     name = (body.name or "").strip() or None
     if name and not NAME_RE.match(name):
         raise HTTPException(400, "Machine names may use letters, digits, '.', '_' and '-' (max 64).")
+    preaccepted = code_preaccepted(body)
     raw_url = (body.hub_url or "").strip() or RUNNER_URL or str(request.base_url)
     hub_url = enroll.clean_hub_url(raw_url)
     if hub_url is None:
@@ -2481,7 +2923,8 @@ def create_enroll_code(body: EnrollCodeIn, request: Request) -> dict:
     code = enroll.normalize_code(enroll.new_code())
     while enroll.code_hint(code) in active:  # keep hints unique, so a code can be withdrawn by its hint
         code = enroll.normalize_code(enroll.new_code())
-    row = db.add_enroll_code(enroll.hash_secret(code), enroll.code_hint(code), name, hub_url, enroll.CODE_TTL)
+    row = db.add_enroll_code(enroll.hash_secret(code), enroll.code_hint(code), name, hub_url, enroll.CODE_TTL,
+                             preaccepted)
     out = code_view(row, code)
     out["expires_in"] = enroll.CODE_TTL
     return out
@@ -2542,6 +2985,7 @@ class EnrollIn(BaseModel):
     os: str = Field(default="", max_length=200)
     current_token: str = Field(default="", max_length=200)  # a re-install: this machine's token so far
     current_name: str = Field(default="", max_length=64)    # ...and its name, kept when it holds that name's token
+    install_id: str = ""  # the runner's install id (runner.py install_id); older runners send none
 
 
 @app.post("/api/enroll")
@@ -2581,14 +3025,21 @@ def enroll_machine(body: EnrollIn, request: Request) -> dict:
                                      f"another name, or Forget '{name}' first.")
         if not holder and code_name != name:
             # A machine still on the shared token: only the same computer may move to its own token
-            # without a code made for its name.
-            known = enroll.short_host((db.runner(name) or {}).get("hostname"))
-            if known and enroll.short_host(body.hostname) != known:
+            # without a code made for its name. The same install id says so even when the host name
+            # changed (a Mac's can change with the network); without ids on both sides, the host name.
+            seen = db.runner(name) or {}
+            known = enroll.short_host(seen.get("hostname"))
+            ids = clean_install_id(seen.get("install_id")), clean_install_id(body.install_id)
+            same_id = all(ids) and hmac.compare_digest(*ids)
+            if known and not same_id and enroll.short_host(body.hostname) != known:
                 raise HTTPException(409, f"Another computer ({known}) is already on the hub as '{name}'. Give this "
                                          f"one another name, or Forget '{name}' on the dashboard first.")
         if not db.use_enroll_code(row["code_hash"], name):
             raise HTTPException(410, "This code was used a moment ago. Create a new one with Add a machine.")
-        db.set_machine_token(name, enroll.hash_secret(token), body.hostname.strip()[:255], body.os.strip()[:200])
+        # What the code accepted up front joins the machine's accepted set at its first check-in with
+        # this token (Database.apply_preaccepted, from heartbeat), when the machine has a row to hold it.
+        db.set_machine_token(name, enroll.hash_secret(token), body.hostname.strip()[:255], body.os.strip()[:200],
+                             row.get("preaccepted") or None)
     log.info("machine %s (%s) enrolled with its own token", name, body.hostname)
     return {"name": name, "token": token, "hub_url": row["hub_url"]}
 
@@ -2607,19 +3058,32 @@ def runner_whoami(body: WhoAmI = WhoAmI(), auth: RunnerAuth = Depends(require_ru
     return {"auth": auth.kind, "name": auth.name, "hub_version": VERSION}
 
 
-def name_conflict(prev: dict | None, hostname: str) -> str | None:
-    """Another computer that checked in under this name within the online window, if any."""
-    if prev is None or not prev.get("hostname") or not hostname:
+def name_conflict(prev: dict | None, hostname: str, install_id: str = "") -> str | None:
+    """Another computer that checked in under this name within the online window, if any (its host
+    name). When both check-ins carry an install id, the ids decide: a host name can change by itself
+    (a Mac's changes with the network), and two clones can share one. Otherwise the host names do,
+    as for runners from before install ids."""
+    if prev is None or time.time() - (prev.get("last_seen") or 0) >= ONLINE_WINDOW:
+        return None
+    known, current = clean_install_id(prev.get("install_id")), clean_install_id(install_id)
+    if known and current:
+        if hmac.compare_digest(known, current):
+            return None  # the same install, whatever its host name says today
+        return prev.get("hostname") or "another computer"
+    if not prev.get("hostname") or not hostname:
         return None
     if enroll.short_host(prev["hostname"]) == enroll.short_host(hostname):
         return None  # the same computer, perhaps with another domain suffix today
-    return prev["hostname"] if time.time() - (prev.get("last_seen") or 0) < ONLINE_WINDOW else None
+    return prev["hostname"]
 
 
 # =================================================================== runners
 class Heartbeat(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     hostname: str = ""
+    # Made once per install (runner.py install_id); none from older runners. Accepted loosely, like
+    # the tags: one the hub can't use is ignored (clean_install_id), and the host names decide.
+    install_id: str = ""
     os: str = ""
     version: str = ""
     agents: list[dict] = []
@@ -2665,14 +3129,16 @@ def runner_search_notes(body: RunnerSearch) -> dict:
 
 class ContextAsk(BaseModel):
     # What the runner understands: "hub-route", servers relayed by the hub; "on-demand", servers only for the
-    # jobs that pick them.
+    # jobs that pick them; "machine-mcp-token", an MCP token of the machine's own (machine_mcp_token).
     features: list[str] = []
+    # The machine's own MCP token as the runner holds it ("" for none), so it keeps it (machine_mcp_token).
+    mcp_token: str = Field(default="", max_length=200)
 
 
-@app.post("/api/runner/context", dependencies=[Depends(require_runner)])
-def runner_context(body: ContextAsk = ContextAsk()) -> dict:
+@app.post("/api/runner/context")
+def runner_context(body: ContextAsk = ContextAsk(), auth: RunnerAuth = Depends(require_runner)) -> dict:
     """Everything a runner wires into its agents: pinned notes, the hub's memory MCP
-    server, the central MCP list and the agent add-ons."""
+    server and the MCP token for it, the central MCP list and the agent add-ons."""
     # Servers relayed by the hub have no address of their own in this list; a runner that doesn't
     # know that would write them with an empty URL, so it doesn't get them (until it updates).
     # In the same way, a runner that doesn't know on-demand servers would wire them into every
@@ -2681,8 +3147,9 @@ def runner_context(body: ContextAsk = ContextAsk()) -> dict:
     on_demand = "on-demand" in body.features
     servers = [s for s in registry.for_runners()
                if (s["route"] != "hub" or relay) and (not s["on_demand"] or on_demand)]
-    return {"version": context_token(), "files": memory.context_files(),
-            "mcp_enabled": hub_mcp is not None, "mcp_token": mcp_token(),
+    token = machine_mcp_token(auth, body.features, body.mcp_token)
+    return {"version": runner_context_token(auth), "files": memory.context_files(),
+            "mcp_enabled": hub_mcp is not None, **token,
             "servers": servers, "kit": KIT,
             # The platform names servers use. A runner on a Mac matches "macos" only when the hub
             # lists it here; otherwise it takes the "linux" servers.
@@ -2699,8 +3166,14 @@ def bundle() -> dict:
 def heartbeat(body: Heartbeat, auth: RunnerAuth = Depends(require_runner)) -> dict:
     check_runner_name(auth, body.name)
     prev = db.runner(body.name)
-    clash = name_conflict(prev, body.hostname)
+    clash = name_conflict(prev, body.hostname, body.install_id)
     db.upsert_runner(body.model_dump(), auth=auth.kind)
+    if auth.kind == "machine":
+        added = db.apply_preaccepted(body.name)
+        if added:
+            log.info("accepted for %s from its enrollment code: tags %s, account labels %s", body.name,
+                     ", ".join(added["tags"]) or "none",
+                     ", ".join(f"{a}={label}" for a, label in added["accounts"].items()) or "none")
     if clash:
         db.note_name_conflict(body.name, clash)
         log.warning("two computers check in as %s: %s and %s", body.name, clash, body.hostname)
@@ -2711,8 +3184,9 @@ def heartbeat(body: Heartbeat, auth: RunnerAuth = Depends(require_runner)) -> di
         mark_lost_jobs(body.name, body.running)
     cancel = [j["id"] for j in db.query(
         "SELECT id FROM jobs WHERE runner=? AND status='running' AND cancel_requested=1", (body.name,))]
-    return {"ok": True, "cancel": cancel, "hub_version": VERSION, "context_version": context_token(),
-            "auth": auth.kind, "name_conflict": recent_clash or None}
+    # Paused on the dashboard (older runners ignore the key; the claim holds the work back either way).
+    return {"ok": True, "cancel": cancel, "hub_version": VERSION, "context_version": runner_context_token(auth),
+            "auth": auth.kind, "name_conflict": recent_clash or None, "paused": bool(prev and prev.get("paused"))}
 
 
 class Poll(BaseModel):
@@ -2739,11 +3213,15 @@ def claim_offer(name: str, auth: RunnerAuth) -> dict:
 
 
 @app.post("/api/runner/poll")
-async def poll(body: Poll, auth: RunnerAuth = Depends(require_runner)) -> Response:
+async def poll(body: Poll, request: Request, auth: RunnerAuth = Depends(require_runner)) -> Response:
     check_runner_name(auth, body.name)
     deadline = time.monotonic() + LONG_POLL_SECONDS
     updating_seen = False
     while True:
+        # A runner that stopped (an update, a reboot, a crash) leaves its last poll open here. Claiming a job
+        # for it would hand the job to nobody, and it would sit "running" until marked lost.
+        if await request.is_disconnected():
+            return Response(status_code=204)
         # While the runner installs an update it gets no new work, and as soon as the
         # update finishes we answer right away so it can restart without losing a job.
         if db.update_in_progress(body.name):
@@ -2944,6 +3422,69 @@ def runner_finish(job_id: int, body: Finish, auth: RunnerAuth = Depends(require_
     return {"ok": True}
 
 
+COPY_CHUNK = 1024 * 1024
+
+
+@app.post("/api/runner/session-copies/{copy_id}")
+async def runner_put_session_copy(copy_id: str, request: Request, auth: RunnerAuth = Depends(require_runner)) -> dict:
+    """An exact move (hub/moves.py): the source machine sends the session's transcript, as the raw bytes of the file
+    with their sha256 in X-Bullpen-Sha256, while the machine action that asked for it runs there and the task
+    waiting for it is still queued. Kept in memory (TransferStore), never logged and never masked. The task may
+    then start."""
+    entry = transfers.entry(copy_id) if moves.COPY_ID_RE.fullmatch(copy_id) else None
+    if entry is None:
+        raise HTTPException(410, "The hub isn't waiting for this copy any more.")
+    check_runner_name(auth, entry["source"])
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > transfers.max_bytes:
+        raise HTTPException(413, f"The session is larger than {transfers.max_bytes // (1024 * 1024)} MB.")
+    data = bytearray()
+    async for chunk in request.stream():  # read with the cap, whatever the header said
+        data += chunk
+        if len(data) > transfers.max_bytes:
+            raise HTTPException(413, f"The session is larger than {transfers.max_bytes // (1024 * 1024)} MB.")
+    with db.lock:
+        export = db.query_one("SELECT id, options FROM jobs WHERE kind='admin' AND status='running' AND runner=? "
+                              "AND options LIKE ?", (entry["source"], f"%{copy_id}%"))
+        params = (export or {}).get("options", {}).get("params") if export else None
+        if not isinstance(params, dict) or params.get("copy") != copy_id:
+            raise HTTPException(409, "No machine action on this machine is sending this copy.")
+        target = db.job(entry["target_job"])
+        move = moves.move_of(target)
+        if target is None or target["status"] != "queued" or move.get("copy") != copy_id or not move.get("waiting"):
+            raise HTTPException(409, "The job waiting for this session has ended.")
+        try:
+            digest = transfers.put(copy_id, entry["source"], bytes(data), request.headers.get("x-bullpen-sha256"))
+        except moves.CopyError as err:
+            raise HTTPException(err.status, str(err))
+        db.update_job(target["id"], options={**target["options"],
+                                             "move": {**move, "waiting": False, "size": len(data), "sha256": digest}})
+    log.info("session copy for job %s received from %s (%d bytes)", entry["target_job"], entry["source"], len(data))
+    return {"ok": True, "size": len(data), "sha256": digest}
+
+
+class TakeCopy(BaseModel):
+    job_id: int
+
+
+@app.post("/api/runner/session-copies/{copy_id}/take")
+def runner_take_session_copy(copy_id: str, body: TakeCopy, auth: RunnerAuth = Depends(require_runner)) -> Response:
+    """An exact move: the target machine takes the session's transcript, once, for the task it is running. The hub
+    keeps no copy after this."""
+    job = db.job(body.job_id)
+    if job is None:
+        raise HTTPException(404, "No such job")
+    check_runner_job(auth, job)
+    move = moves.move_of(job)
+    if job["kind"] != "task" or job["status"] != "running" or move.get("mode") != "exact" or move.get("copy") != copy_id:
+        raise HTTPException(409, "This job isn't waiting for that session.")
+    try:
+        data, digest = transfers.take(copy_id, job["runner"], job["id"])
+    except moves.CopyError as err:
+        raise HTTPException(err.status, str(err))
+    return Response(content=data, media_type="application/octet-stream", headers={"X-Bullpen-Sha256": digest})
+
+
 @app.get("/healthz", include_in_schema=False)
 def healthz() -> dict:
     return {"ok": True, "version": VERSION}
@@ -2956,7 +3497,12 @@ hub_approvals = Approvals(db, notifier)
 # Questions still pending were asked of the hub process before this one: nobody waits for them.
 hub_approvals.expire_leftovers()
 # A job that ends or is being cancelled wakes its waiting questions at once ("The job ended.").
-db.on_job_ended = hub_approvals.wake_job
+def job_ended(job_id: int) -> None:
+    hub_approvals.wake_job(job_id)
+    transfers.drop_job(job_id)  # an exact move's session copy nobody will take now
+
+
+db.on_job_ended = job_ended
 hub_delegation = None
 if hub_mcp is not None and job_mcp is not None:
     hub_delegation = Delegation(db, runner_view, check_target, check_tag_target, cancel_one,

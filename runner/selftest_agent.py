@@ -23,7 +23,9 @@ never). Otherwise it says on stderr that it skipped the file, as Gemini CLI does
 --input-format stream-json it keeps its input open like Claude Code in a live session: every
 user message on it (one JSON line each) is one turn, answered "Self-test reply <n>: <first
 line>", until its input closes. With remote-control as the first argument it pretends to be
-"claude remote-control": it prints an address and waits until it is stopped.
+"claude remote-control": it prints an address and waits until it is stopped. With --version it
+prints its version, and with auth it pretends to be "claude auth status --json", "auth logout" or
+"auth login": a logout is kept per agent (BULLPEN_AGENT) in $BULLPEN_HOME/selftest/ until a login.
 
 Environment knobs (for testing):
   SELFTEST_DELAY     seconds to "think" before answering (default 1)
@@ -34,8 +36,13 @@ Environment knobs (for testing):
   SELFTEST_USAGE     what "/usage" prints: "text" (no structured report), "none" (a login that
                      can't read plan usage); unset for both the report and the text
   SELFTEST_RC        how remote-control behaves: "untrusted", "apikey" or "token" (it fails the
-                     way Claude Code does), "nourl" (it starts but never shows an address); unset
-                     for a server that shows its address
+                     way Claude Code does), "busy" (it says "Error: This folder is already served
+                     by a terminal ..." and stays up 52 seconds before it exits, as Claude Code
+                     does), "error" (the same with another Error: line), "nourl" (it starts but
+                     never shows an address); unset for a server that shows its address
+  SELFTEST_AUTH      how auth and --version behave: "out" (status says signed out), "soon" (the
+                     sign-in ends in 2 days), "text" (status prints plain text, not JSON), "old"
+                     (--version says 2.1.40, older than the runner asks); unset for signed in
   SELFTEST_GEMINI_DEFAULTS  set to "trusted" to read the --gemini settings file whoever owns it (for
                      tests that pretend the runner runs as root)
   SELFTEST_SUMMARY   the answer to the runner's summary prompt (SUMMARY_PROMPT): unset for SUMMARY_ANSWER,
@@ -58,6 +65,8 @@ more. Their answer lines come first in the answer, before the usual text.
   SELFTEST: delegate-many 4 machine=beta agent=three prompt=...
                             hand that many subtasks over at once, without waiting
   SELFTEST: status 12       one of this job's subtasks: its status
+  SELFTEST: transcript      how many earlier turns the transcript of the resumed session holds (see
+                            find_transcript), and the first one's first line
   SELFTEST: limit-rejected  fail the way Claude Code does at a usage limit (signed in with a subscription;
                             with ANTHROPIC_API_KEY set there is no plan limit, and it answers as usual)
   SELFTEST: credits-low     with ANTHROPIC_API_KEY set, fail the way Claude Code does when the Console
@@ -111,6 +120,14 @@ RC_FAILURES = {
               "setup-token` or CLAUDE_CODE_OAUTH_TOKEN) are limited to inference-only for security reasons. "
               "Run `claude auth login` to use Remote Control."),
 }
+# The same, but it stays up for a while before it exits (as Claude Code 2.1.328 does when `claude remote-control`
+# already runs in a terminal in that folder), until then stopped like a running server.
+RC_LINGERING = {
+    "busy": ("Error: This folder is already served by a terminal `claude remote-control` on this device. "
+             "Stop it first.\nExiting in about 52 seconds."),
+    "error": "Error: Something went wrong while starting Remote Control.\nExiting in about 52 seconds.",
+}
+RC_LINGER = 52  # seconds those stay up
 APPROVE_TIMEOUT = 900  # seconds an approval may wait for the owner
 # Gemini mode: Gemini CLI's lowest settings layer, where the runner puts a job's tools.
 GEMINI_DEFAULTS_VAR = "GEMINI_CLI_SYSTEM_DEFAULTS_PATH"
@@ -265,10 +282,22 @@ def job_token(config) -> str:
     return auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
 
 
+# A conversation carried from another machine (hub/moves.py carried_prompt) sits between these lines. The prompt
+# tells the agent to treat it as context, so its SELFTEST: lines (the earlier prompts) aren't followed again.
+CARRIED_START = "--- The conversation so far ---"
+CARRIED_END = "--- End of the conversation so far ---"
+
+
 def directive_texts(prompt: str) -> list:
-    """The SELFTEST: lines in the prompt, without "SELFTEST:", in order."""
-    return [raw.strip()[len("SELFTEST:"):].strip() for raw in prompt.splitlines()
-            if raw.strip().startswith("SELFTEST:")]
+    """The SELFTEST: lines in the prompt, without "SELFTEST:", in order; none from a carried conversation."""
+    texts, carried = [], False
+    for raw in prompt.splitlines():
+        line = raw.strip()
+        if line in (CARRIED_START, CARRIED_END):
+            carried = line == CARRIED_START
+        elif line.startswith("SELFTEST:") and not carried:
+            texts.append(line[len("SELFTEST:"):].strip())
+    return texts
 
 
 def directives(prompt: str) -> list:
@@ -439,9 +468,9 @@ def mcp_flags(args, config) -> str:
     return f"mcp-flags: {' '.join(got)}{servers}"
 
 
-def run_directives(prompt: str, config, prompt_tool=None, args=()) -> list:
+def run_directives(prompt: str, config, prompt_tool=None, args=(), earlier=None) -> list:
     """Answer lines for the SELFTEST: lines in the prompt, in order. `args` is the agent's command line, for
-    mcp-flags."""
+    mcp-flags; `earlier`, the prompts in the transcript the session was resumed from, for transcript."""
     lines = []
     for text in directive_texts(prompt):
         words = text.split() or [""]
@@ -480,6 +509,12 @@ def run_directives(prompt: str, config, prompt_tool=None, args=()) -> list:
             lines.append(git_env())
         elif what == "mcp-flags":
             lines.append(mcp_flags(args, config))
+        elif what == "transcript":
+            if earlier:
+                lines.append(f"transcript: {len(earlier)} earlier turn{'s' if len(earlier) != 1 else ''}, "
+                             f"the first: {first_line(earlier[0])}")
+            else:
+                lines.append("transcript: none")
     return lines
 
 
@@ -512,6 +547,78 @@ def save_totals(session: str, totals: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(totals), encoding="utf-8")
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------ transcripts (Claude Code's layout)
+# Like Claude Code, each session's turns go to <config folder>/projects/<project folder>/<session id>.jsonl, the
+# project folder being the working folder's path with every character other than a letter or digit made "-". The
+# config folder is CLAUDE_CONFIG_DIR, else $BULLPEN_HOME/selftest/claude (the runner's session_config_dir); with
+# neither set, nothing is kept. --resume looks in the working folder's project folder first, then in every other one,
+# where exactly one may hold the session; with CLAUDE_CONFIG_DIR set, a session found nowhere fails the run as
+# Claude Code does ("No conversation found with session ID: ..."). The lines are this agent's own, not Claude Code's.
+def transcript_root():
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects"
+    if os.environ.get("BULLPEN_HOME"):
+        return home() / "selftest" / "claude" / "projects"
+    return None
+
+
+def project_dir_name(path: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def find_transcript(session: str):
+    """The session's transcript file, as Claude Code finds it for --resume, or None."""
+    root = transcript_root()
+    if root is None or not SESSION_RE.match(session):
+        return None
+    here = root / project_dir_name(os.getcwd()) / f"{session}.jsonl"
+    if here.is_file():
+        return here
+    try:
+        others = [d / f"{session}.jsonl" for d in root.iterdir() if (d / f"{session}.jsonl").is_file()]
+    except OSError:
+        return None
+    return others[0] if len(others) == 1 else None
+
+
+def transcript_turns(path) -> list:
+    """The user prompts recorded in a transcript, oldest first."""
+    turns = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path else []
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "user":
+            turns.append(str((entry.get("message") or {}).get("content") or ""))
+    return turns
+
+
+def record_turn(ctx: dict, prompt: str, answer: str) -> None:
+    """Add one turn to the session's transcript (the one it was resumed from, else a new one here)."""
+    path = ctx.get("transcript")
+    if path is None:
+        root = transcript_root()
+        if root is None:
+            return
+        path = root / project_dir_name(os.getcwd()) / f"{ctx['session']}.jsonl"
+        ctx["transcript"] = path
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    common_fields = {"sessionId": ctx["session"], "cwd": os.getcwd(), "timestamp": now}
+    lines = [{"type": "user", **common_fields, "message": {"role": "user", "content": prompt}},
+             {"type": "assistant", **common_fields, "message": {"role": "assistant", "content": answer}}]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("".join(json.dumps(line) + "\n" for line in lines))
     except OSError:
         pass
 
@@ -770,7 +877,7 @@ def take_turn(prompt: str, ctx: dict, reply_no=None) -> int:
               "model_usage_since_last_result": model_usage(zero)})
         return 1
 
-    directive_lines = run_directives(prompt, ctx["mcp_config"], ctx["prompt_tool"], ctx["args"])
+    directive_lines = run_directives(prompt, ctx["mcp_config"], ctx["prompt_tool"], ctx["args"], ctx.get("earlier"))
 
     if ctx["mode"] in ("acceptEdits", "auto", "bypassPermissions"):
         with open("selftest-output.txt", "a", encoding="utf-8") as fh:
@@ -786,6 +893,7 @@ def take_turn(prompt: str, ctx: dict, reply_no=None) -> int:
         answer += f"Self-test reply {reply_no}: {first_line(prompt)}"
     add_turn(totals, model)
     emit(result_event(answer, session, totals, model))
+    record_turn(ctx, prompt, answer)
     return 0
 
 
@@ -808,10 +916,15 @@ def claude_main(args: list, prompt) -> int:
     session = resumed or str(uuid.uuid4())
     model = flag(args, "--model", "selftest-1")
     mcp_config = flag(args, "--mcp-config")
+    transcript = find_transcript(resumed) if resumed else None
+    if resumed and transcript is None and os.environ.get("CLAUDE_CONFIG_DIR"):
+        print(f"No conversation found with session ID: {resumed}", file=sys.stderr, flush=True)
+        return 1
     ctx = {"session": session, "model": model, "mcp_config": mcp_config, "args": args,
            "mode": flag(args, "--permission-mode", "default"),
            "prompt_tool": flag(args, "--permission-prompt-tool"),
-           "totals": load_totals(session) if resumed else {}}
+           "totals": load_totals(session) if resumed else {},
+           "transcript": transcript, "earlier": transcript_turns(transcript)}
 
     init = {"type": "system", "subtype": "init", "session_id": session, "model": model,
             "claude_code_version": CLI_VERSION}
@@ -877,6 +990,14 @@ def remote_control_main(args: list) -> int:
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
+    if what in RC_LINGERING:
+        print(RC_LINGERING[what], flush=True)
+        time.sleep(RC_LINGER)
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        return 1
     if what == "nourl":
         print("Starting Remote Control…", flush=True)
     else:
@@ -885,8 +1006,57 @@ def remote_control_main(args: list) -> int:
         time.sleep(3600)
 
 
+# ------------------------------------------------------------ auth
+def sign_out_file() -> Path:
+    """Where it notes that this agent (BULLPEN_AGENT, set by the runner) was signed out."""
+    return home() / "selftest" / f"signed-out-{rc_slug(os.environ.get('BULLPEN_AGENT') or 'selftest')}"
+
+
+def auth_main(args: list) -> int:
+    """`claude auth status --json`, `auth logout` and `auth login`, pretended (SELFTEST_AUTH). Status prints
+    the same fields as Claude Code 2.1.326, with made-up values: the runner must keep only some of them."""
+    what = os.environ.get("SELFTEST_AUTH", "")
+    marker = sign_out_file()
+    if args[:1] == ["logout"]:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("signed out\n", encoding="utf-8")
+        print("Successfully logged out from your Anthropic account.", flush=True)
+        return 0
+    if args[:1] == ["login"]:  # the real one signs in through a browser; this one only forgets the logout
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        print("Login successful.", flush=True)
+        return 0
+    if args[:1] != ["status"]:
+        print(f"error: unknown command 'auth {' '.join(args)}'", file=sys.stderr, flush=True)
+        return 1
+    if what == "text":
+        print("Logged in using Claude.ai (Pro)", flush=True)  # what --text prints, not JSON
+        return 0
+    if what == "out" or marker.exists():
+        print(json.dumps({"loggedIn": False, "authMethod": "none", "apiProvider": "firstParty"}, indent=2), flush=True)
+        return 1
+    days = 2 if what == "soon" else 30
+    ends = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
+    print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty",
+                      "analyticsDisabled": False, "projectsDirectory": str(home() / "selftest" / "projects"),
+                      "configDirectory": str(home() / "selftest"),
+                      "loginExpiresAt": ends.strftime("%Y-%m-%dT%H:%M:%S.000Z"), "consoleProfileSignInOffered": True,
+                      "email": "someone@example.com", "orgId": "00000000-0000-4000-8000-000000000000",
+                      "orgName": "Example Org", "subscriptionType": "pro", "storedClaudeAiLogin": True,
+                      "planTier": "pro"}, indent=2), flush=True)
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
+    if args == ["--version"]:
+        print(f"{'2.1.40' if os.environ.get('SELFTEST_AUTH') == 'old' else CLI_VERSION} (Claude Code)", flush=True)
+        return 0
+    if args and args[0] == "auth":
+        return auth_main(args[1:])
     if args and args[0] == "remote-control":
         return remote_control_main(args[1:])
     if args and args[0] == "--gemini":

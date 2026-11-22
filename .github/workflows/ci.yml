@@ -47,7 +47,9 @@ jobs:
 
   compile:
     name: Compile and run the runner (${{ matrix.os }}, Python ${{ matrix.python }})
-    runs-on: ${{ matrix.os }}
+    # macOS: in a private repo, use the owner's own Mac (a self-hosted runner labelled bullpen-mac);
+    # anywhere else, such as the public repo, GitHub's macOS runner.
+    runs-on: ${{ (matrix.os == 'macos-latest' && github.event.repository.private) && fromJSON('["self-hosted", "macOS", "ARM64", "bullpen-mac"]') || matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -60,10 +62,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
+        if: runner.environment != 'self-hosted'
         with:
           python-version: ${{ matrix.python }}
+      - name: Use the Mac's own python3 (self-hosted; setup-python needs sudo there)
+        # Apple's python3 (3.9) is what a Mac user's runner gets. The hub, which needs 3.11, is
+        # compiled on the other jobs.
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/py"
+          # A wrapper, not a link: Apple's /usr/bin/python3 is a shim that goes by the name it is run as.
+          printf '#!/bin/sh\nexec /usr/bin/python3 "$@"\n' > "$RUNNER_TEMP/py/python"
+          chmod +x "$RUNNER_TEMP/py/python"
+          echo "$RUNNER_TEMP/py" >> "$GITHUB_PATH"
       - name: Compile the hub (hub/*.py and its sub-folders)
-        if: matrix.hub
+        if: matrix.hub && runner.environment != 'self-hosted'
         run: python -c "import glob, py_compile; [py_compile.compile(f, doraise=True) for f in glob.glob('hub/**/*.py', recursive=True)]"
       - name: Compile the runner
         run: python -c "import glob, py_compile; [py_compile.compile(f, doraise=True) for f in glob.glob('runner/*.py')]"

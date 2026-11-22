@@ -17,7 +17,8 @@ Rules kept here, whatever the scope says:
     (read only unless the owner raises it on purpose).
   * Subtasks go only to machines that check in with their own runner token, that take subtasks
     (accept_delegated_tasks in their runner.json), and only to agents whose autonomy levels the hub
-    can check (the `levels` feature).
+    can check (the `levels` feature). A machine the owner paused is listed as paused and gets none:
+    by name the hub refuses, and for a tag only machines that aren't paused count.
   * At most HUB_DELEGATE_MAX_CHILDREN subtasks per job, HUB_DELEGATE_MAX_ACTIVE queued or running
     at once. The checks and the new job are one step under the database lock, so parallel calls
     can't both slip under a cap, nor past the owner's Cancel.
@@ -85,6 +86,9 @@ AUTONOMY_WORDS = {"readonly": "read", "edits": "read and edit files",
                   "ask": "edit files and run commands you approve", "full": "do anything"}
 
 NOT_YOURS = "Job #{id} isn't one of your subtasks."
+PAUSED = "{machine} is paused: the user took it out of service. Hand the subtask to another machine."
+ALL_PAUSED = ("Every machine tagged '{tag}' that could take this subtask is paused: the user took them out of "
+              "service. Hand it to another machine or tag.")
 OWN_ACCOUNT_LIMIT = ("Usage limits aren't a reason to switch accounts; wait for the reset (guide 1).")
 
 
@@ -122,6 +126,66 @@ def _target_words(entry: str) -> str:
     return f"any machine tagged {name}" if kind == "tag" else name
 
 
+def job_account(db: Any, job: dict, key_of: Callable[[dict | None, str], str] = account_key) -> str:
+    """The account a job ran under: the one it was made for when it was aimed at a tag, else its agent's account on
+    the machine that ran it (common.account_key, passed in as key_of)."""
+    account = _opts(job).get("account")
+    if job.get("target_tag") and isinstance(account, str) and account:
+        return account
+    return key_of(db.runner(job.get("runner") or ""), job.get("agent") or "")
+
+
+def earlier_turns(db: Any, job: dict, across_moves: bool = False) -> list[dict]:
+    """The jobs this one continues, newest first, at most THREAD_MAX: back along follow_up_of and, with
+    across_moves, also along continued_from (a conversation continued on another machine, hub/moves.py). Each is
+    {"id", "follow_up_of", "continued_from", "error_kind", "finished_at", "runner", "agent", "target_tag",
+    "options"}."""
+    turns: list[dict] = []
+    seen = {job["id"]}
+    prev = job.get("follow_up_of") or (job.get("continued_from") if across_moves else None)
+    while prev and prev not in seen and len(seen) <= THREAD_MAX:
+        seen.add(prev)
+        row = db.query_one("SELECT id, follow_up_of, continued_from, error_kind, finished_at, runner, agent, "
+                           "target_tag, options FROM jobs WHERE id=?", (prev,))
+        if row is None:
+            break
+        turns.append(row)
+        prev = row["follow_up_of"] or (row["continued_from"] if across_moves else None)
+    return turns
+
+
+def limit_accounts(db: Any, job: dict, key_of: Callable[[dict | None, str], str] = account_key,
+                   now: float | None = None) -> list[str]:
+    """The accounts that hit a usage limit (error_kind claude_limit or quota) in a job's conversation, for moving it
+    to another machine: the job itself (at any age), the turns it continues on this machine and on the machines it
+    was moved from (earlier_turns with across_moves), and the subtasks of all of them. Earlier turns and their
+    subtasks count for LIMIT_MEMORY_S, as for subtasks (Delegation._limit_keys). Each with the account it ran
+    under (job_account), the job's own first."""
+    since = (time.time() if now is None else now) - LIMIT_MEMORY_S
+    keys: list[str] = []
+
+    def add(key: Any) -> None:
+        if isinstance(key, str) and key and key not in keys:
+            keys.append(key)
+
+    if job.get("error_kind") in LIMIT_KINDS:
+        add(job_account(db, job, key_of))
+    earlier = earlier_turns(db, job, across_moves=True)
+    for row in earlier:
+        if _recent_limit(row, since):
+            add(job_account(db, row, key_of))
+    for child in db.subtasks(job["id"]):
+        if child.get("error_kind") in LIMIT_KINDS:
+            add(_opts(child).get("account"))
+    if earlier:
+        ids = [row["id"] for row in earlier]
+        for child in db.query(f"SELECT options, error_kind, finished_at FROM jobs WHERE delegated_by IN "
+                              f"({','.join('?' * len(ids))}) ORDER BY id", tuple(ids)):
+            if _recent_limit(child, since):
+                add(_opts(child).get("account"))
+    return keys
+
+
 class Delegation:
     """The subtask tools' logic. All methods are synchronous (JobMcp calls them in a worker thread).
 
@@ -154,10 +218,7 @@ class Delegation:
     def own_key(self, parent: dict) -> str:
         """The parent's own account key: the one it was made for when it was aimed at a tag, else
         its agent's account on the machine running it."""
-        account = _opts(parent).get("account")
-        if parent.get("target_tag") and isinstance(account, str) and account:
-            return account
-        return self.account_key(self.db.runner(parent.get("runner") or ""), parent.get("agent") or "")
+        return job_account(self.db, parent, self.account_key)
 
     def scope(self, parent: dict) -> dict:
         """The owner's scope for this task's subtasks, with the account rule worked out."""
@@ -204,17 +265,8 @@ class Delegation:
 
     def _earlier_turns(self, parent: dict) -> list[dict]:
         """The jobs this one continues (follow_up_of, newest first, at most THREAD_MAX): {"id",
-        "follow_up_of", "error_kind", "finished_at"} each."""
-        turns: list[dict] = []
-        prev, seen = parent.get("follow_up_of"), {parent["id"]}
-        while prev and prev not in seen and len(seen) <= THREAD_MAX:
-            seen.add(prev)
-            row = self.db.query_one("SELECT id, follow_up_of, error_kind, finished_at FROM jobs WHERE id=?", (prev,))
-            if row is None:
-                break
-            turns.append(row)
-            prev = row["follow_up_of"]
-        return turns
+        "follow_up_of", "error_kind", "finished_at", ...} each (earlier_turns)."""
+        return earlier_turns(self.db, parent)
 
     def _thread_hit_limit(self, parent: dict) -> bool:
         """Did an earlier turn of this conversation hit a usage limit, within LIMIT_MEMORY_S?"""
@@ -272,7 +324,8 @@ class Delegation:
                 continue
             view = self.runner_view(row)
             info = row.get("info") if isinstance(row.get("info"), dict) else {}
-            out.append({"name": row["name"], "online": bool(view.get("online")), "os": row.get("os") or "",
+            out.append({"name": row["name"], "online": bool(view.get("online")), "paused": bool(row.get("paused")),
+                        "os": row.get("os") or "",
                         "platform": info.get("platform") or "", "tags": effective_tags(row),
                         "busy": self._busy(row["name"]), "slots": int(row.get("max_parallel") or 1),
                         "agents": agents, "projects": projects})
@@ -371,6 +424,8 @@ class Delegation:
         if machine:
             self._call(self.check_target, machine, agent, project)
             row = self.db.runner(machine) or {}
+            if row.get("paused"):
+                raise DelegationError(PAUSED.format(machine=machine))
             if not own_token(row):
                 raise DelegationError(f"{machine} still uses the shared runner token, and subtasks only go to machines "
                                       "with their own token.")
@@ -415,8 +470,10 @@ class Delegation:
         if machine:
             candidates = [machine]
         else:
-            candidates = [r["name"] for r in self.db.runners()
-                          if tag_job_fits(r, tag, agent, project, key, needs, delegated=True)]
+            fits = [r for r in self.db.runners() if tag_job_fits(r, tag, agent, project, key, needs, delegated=True)]
+            candidates = [r["name"] for r in fits if not r.get("paused")]
+            if fits and not candidates:
+                raise DelegationError(ALL_PAUSED.format(tag=tag))
         home = parent.get("runner")
         if candidates and all(c == home for c in candidates):
             row = self.db.runner(home) or {}

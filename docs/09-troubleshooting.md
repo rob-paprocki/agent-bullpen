@@ -6,7 +6,7 @@ Start with the logs:
 |---|---|
 | Hub | on the hub (in a Proxmox container, after `pct enter <id>`): `journalctl -u bullpen -n 100` |
 | Runner on Linux | `journalctl --user -u bullpen-runner -n 100`, or `~/.bullpen/runner.log` |
-| Runner on macOS | `~/.bullpen/runner.log` |
+| Runner on macOS | `~/.bullpen/runner.log`; errors from before that log opens are in `~/.bullpen/launchd.log` |
 | Runner on Windows | `%USERPROFILE%\.bullpen\runner.log` |
 | A single job | the **Live log** section on its page in the dashboard |
 
@@ -39,8 +39,13 @@ lines. Remove passwords, tokens, API keys and enrollment codes from them first.
 |---|---|
 | Machine never appears | Check the runner log. "cannot reach the hub" means the `hub_url` in `runner.json` is wrong, or a firewall is in the way: try opening the hub address in that machine's browser. |
 | "the hub rejected this runner's token" | The machine was **forgotten** on the dashboard, or its token doesn't match. Click **Add a machine** with the same name and run the command on that machine again. |
+| A Mac shows offline, and its `runner.log` says "cannot reach the hub" with "No route to host", while the hub works from other machines | macOS hasn't let Python use the local network. Open **System Settings → Privacy & Security → Local Network** on the Mac and turn on **Python**. The runner tries again every minute ([guide 5](05-linux-and-macos-machines.md#keeping-a-mac-available)). |
 | Machine shows offline after a while | **Linux:** is linger on? Check with `loginctl show-user $USER -p Linger`. **macOS:** the runner only runs while you're logged in, and the Mac may have gone to sleep ([guide 5](05-linux-and-macos-machines.md#keeping-a-mac-available)). **Windows:** the runner only runs while you're signed in, and the PC may have gone to sleep ([guide 6](06-windows-machines.md#keeping-a-windows-machine-available)). |
-| Agent chip shows a warning, "no login found" | Run that account's command (`claude`, or `claude-<name>` for another account) in a terminal on that machine, type `/login`, then `/exit`. On a Mac the dashboard can't see the login (it's in the Keychain). To check that it works, run `python3 ~/.bullpen/runner/runner.py test <agent>`. |
+| Agent chip shows a warning, "no login found" or "signed out" | Run the command the machine's page shows (for example `claude auth login`, or `claude-work auth login` for another account) in a terminal on that machine, at its keyboard or over SSH, and sign in with the same account as before. On a Mac, use Terminal on the Mac itself: over SSH the login Keychain is locked. The page shows the new sign-in within a minute or so. To check that it works, run `python3 ~/.bullpen/runner/runner.py test <agent>` (on a Mac, also in Terminal on the Mac). |
+| An agent's sign-in shows "Unknown (CLI too old)" | That machine's Claude Code is older than 2.1.317, which the runner doesn't ask, because older versions could lose the login when asked during a token refresh ([Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md), last checked 17 November 2026). Update Claude Code there. |
+| An agent's sign-in shows "Unknown (couldn't check)" | `claude auth status --json` didn't answer with its usual JSON. Run it in a terminal on that machine, with the agent's command (for example `claude-work auth status --json`), and read what it says. On a Mac, run it in Terminal on the Mac itself: over SSH the login Keychain is locked, and it says `loggedIn` false even when the Mac is signed in. |
+| "doesn't allow signing agents out from the dashboard" | That machine's `runner.json` has `allow_remote_sign_out` set to `false`, the default ([guide 5](05-linux-and-macos-machines.md#signing-agents-out-from-the-dashboard)). Set it to `true` there. The runner picks the change up within 15 seconds. |
+| **Sign out…** says the agent "is running a job" | Signing out in the middle of a job would make it fail. Wait for the job to finish, or cancel it, then press **Sign out…** again. If it says Remote Control is running for that agent, press **Stop** under Remote Control first. |
 | Agent chip shows a warning, "not found on this machine" | The `command` path in `runner.json` is wrong (often after reinstalling). Re-run `runner.py init` to detect it again. |
 | Job stuck at "queued" | The target machine is offline, or busy with as many jobs as its "jobs at once" setting allows. |
 | Job ends with "Lost: the runner stopped reporting this job" | The runner restarted mid-job (reboot, crash or update). Run it again. |
@@ -64,6 +69,240 @@ lines. Remove passwords, tokens, API keys and enrollment codes from them first.
 | A subtask was cancelled with "Its parent's time limit ran out before it started" | A subtask's time ends with its task's. It was still waiting for a machine when the task's time ran out. Give the task a longer time limit, or check why no machine took the subtask. |
 | A cancelled job keeps running on Windows | The runner stops the whole process tree with `taskkill /T`. If something survives, end `claude.exe` or `node.exe` in Task Manager, and open an issue saying what was left. |
 
+### Manual check: a runner on a real Mac
+
+The Mac setup has been tested with stand-in commands, and CI starts the runner on macOS. Part of this
+list has also run on real Macs (see the table). Do this once on each kind of Mac you use
+(Apple silicon or Intel). It takes about half an hour, and a few steps use a little of the Claude account's
+quota. If a step fails, [open an issue](https://github.com/rob-paprocki/agent-bullpen/issues) with the
+step number, what you saw, and the last lines of `~/.bullpen/runner.log` and `~/.bullpen/launchd.log`.
+
+Checked on 17 November 2026 on two Macs, both with Apple's own Python 3.9.6: one Apple silicon Mac with
+macOS 27 and one Intel Mac with macOS 26. The checks ran over SSH. They used the setup's own launchd steps
+in a test folder, and no hub was running, so nothing that needs a hub or someone at the Mac was checked.
+The runner's unit tests passed on both Macs.
+
+On 18 and 19 November 2026 the Apple silicon Mac was checked again, this time with a test hub. The hub ran
+on a Windows 11 PC, which also had a runner of its own. Both machines were signed in to the same Claude
+account, with Claude Code 2.1.328 on the Mac and 2.1.326 on the PC. The Mac's runner was installed as a
+launchd agent by the setup's own launchd step.
+
+On 20 November 2026 the same Apple silicon Mac was checked at the keyboard, with a test hub on a Windows 11
+PC. The runner ran as the setup's launchd agent, and Claude Code was signed in with a claude.ai login.
+Later that day both Macs were checked with a test hub, the Intel Mac for the first time, and both
+reached the hub over the local network.
+
+| Check | Apple silicon (macOS 27) | Intel (macOS 26) |
+|---|---|---|
+| Setup, launchd agent, logs (steps 1 to 6) | partly: 1, 3, 4 and 5 pass; from 2, the local network question; 6 partly: the Mac comes online, its `macos` tag not checked | partly: 1, 3, 4 and 5 pass; 6 partly: the Mac comes online; 2 not checked |
+| Jobs, limits, sign-in, Remote Control (steps 7 to 10) | partly: both jobs in 7 pass (the self-test job during step 11), and 8, 9 and 10 pass; the `launchd.log` check in 7 not checked | partly: the Claude job in 7, and 9 and 10 pass; the self-test job and `launchd.log` check in 7, and 8, not checked |
+| Locked screen, sleep, update, restart, log out (steps 11 to 15) | 11, 13 and 14 pass; 12 and 15 pass on the Mac side (whether the dashboard showed the Mac offline wasn't noted) | not yet checked |
+| Setup again, older agents, background items, user switching (steps 16 to 19) | partly: the launchd part of 16 and 17 (no hub), and 19 passes; 18 not checked | partly: the launchd part of 16 and 17 (no hub); 18 and 19 not checked |
+
+What the checks found:
+
+- Step 3: the launchd agent started Apple's Python from inside Xcode. Moving or switching Xcode would
+  have stopped the runner, so the setup now writes `/usr/bin/python3` there (see step 3). With that
+  change, steps 3 and 4 were run again on both Macs and passed: the runner started through
+  `/usr/bin/python3` and kept running.
+- Step 16: loading the launchd agent a second time worked on the first try, with no "Bootstrap
+  failed: 5". It also worked from an SSH session while the same user was logged in at the Mac.
+- Step 17: with `BULLPEN_SERVICE` removed, `launchd.log` stayed empty while `runner.log` grew.
+- Steps 2 and 6, Apple silicon: the first time the runner tried to reach the hub, macOS asked whether
+  Python may find devices on the local network. Until **Allow** was clicked, `runner.log` showed
+  `WARNING cannot reach the hub (<urlopen error [Errno 65] No route to host>)` every minute, along with
+  "heartbeat failed: ... No route to host". After **Allow**, the Mac came online and took a job.
+- Step 7, Apple silicon: a **Read only** Claude job answered as asked. So Claude Code, started by
+  launchd, reads its claude.ai login from the Keychain.
+- Step 9, Apple silicon: the machine's page showed the Claude agent signed in, with its claude.ai login
+  and the Max plan. The Windows PC's page was right too.
+- Over SSH, the Mac's login Keychain is locked. `security` says "User interaction is not allowed", and
+  `claude auth status` run in an SSH session says `loggedIn` false and `authMethod` none, although the
+  Mac is signed in. The runner under launchd reported the agent signed in.
+- Step 11, Apple silicon: with the screen locked (Control-Command-Q), a **Read only** Claude job and a
+  self-test job both ran. Claude Code, started by launchd, reads its login from the Keychain while the
+  screen is locked.
+- Step 12, Apple silicon: the job ran for about 150 seconds, and the Mac was put to sleep with
+  `pmset sleepnow` instead of the Apple menu, for about three and a half minutes. Right after waking,
+  `runner.log` showed `Network is unreachable`. About 25 seconds later the same runner process was back
+  on the hub, and the job finished normally (`pong`). The job's own timer stopped while the Mac slept.
+  Whether the dashboard showed the Mac offline during the sleep wasn't written down.
+- Step 14, Apple silicon, restarted twice. With FileVault on, FileVault was unlocked over SSH at startup,
+  which this Mac allows. The Mac then sat at the login window with nobody logged in, and the runner stayed
+  offline. That is expected for a launchd agent: it waits for a login, at the keyboard or with Screen
+  Sharing. The owner's own system LaunchDaemons did start without a login. With FileVault off and
+  automatic login on, the Mac logged itself in. The runner was running about 20 seconds after the start,
+  the dashboard showed it online and signed in, and a real Claude job worked with nobody at the Mac. Guide 5
+  explains what automatic login costs.
+- Step 15, Apple silicon: while logged out, the runner wasn't running, because macOS removes the user's
+  launchd session at log out. After logging in it started by itself, as a new process, and a real Claude
+  job worked.
+- Step 19, Apple silicon: switched to a second, standard (not administrator) account, with the owner's
+  session still open. The runner kept running as the same process and stayed online, and a real Claude job
+  worked. While the accounts were switched, the Mac's host name changed by itself, and the runner logged a
+  false "another computer also checks in to the hub" warning. The hub now tells computers apart by an
+  install id instead of the host name, so that warning no longer appears.
+- Step 7, Intel: a **Read only** Claude job answered as asked, so the Intel Mac's launchd agent reads the
+  Keychain login too. Step 9: its page showed the agent signed in.
+- Step 8, Apple silicon: **Check limits** showed the account's real weekly use and reset time.
+- Step 10, both Macs: after one `claude remote-control` in Terminal on the Mac to answer its questions,
+  **Start Remote Control** showed the claude.ai/code link and **Stop** ended it, with no process left.
+  On the Apple silicon Mac the terminal session was still running the first time, and Claude Code refused
+  with "This folder is already served by a terminal `claude remote-control`", but the dashboard said
+  Remote Control was running. The runner now reports that as an error and stops the server.
+- Step 13, Apple silicon: **Update now** installed the new runner and restarted it in the same process,
+  and the Mac came back on the new version.
+
+Still open on the Apple silicon Mac: the rest of step 2, the `macos` tag in step 6, the `launchd.log` check
+in step 7, step 16 with the whole setup, the job in step 17, and step 18. Still open on the Intel Mac: steps
+2, 6 and 8, the self-test job and `launchd.log` check in step 7, steps 11 to 15, step 16 with the whole
+setup, the job in step 17, and steps 18 and 19. Also still open: Remote Control with a real login on Linux
+(see [Checks with the real Claude Code](#checks-with-the-real-claude-code)), and a subtask handed out by a
+real Gemini CLI (see [Manual check: subtasks with a real Gemini CLI](#manual-check-subtasks-with-a-real-gemini-cli)).
+
+Sit at the Mac itself for the setup, not an SSH session: macOS shows some questions only on its screen.
+Run `claude auth status` and `runner.py test` there too, or go by the machine's page: over SSH the login
+Keychain is locked, and Claude Code looks signed out.
+
+1. Open Terminal and check which kind of Mac this is. Apple silicon prints `arm64`, Intel prints `x86_64`:
+
+   ```bash
+   uname -m
+   ```
+
+   If an Apple silicon Mac prints `x86_64`, Terminal is running under Rosetta. Quit Terminal, select it in
+   Finder, choose **File → Get Info**, turn off **Open using Rosetta**, and start again.
+
+2. Add the Mac from the dashboard's **Add a machine** and paste the **Linux and macOS** command into
+   Terminal ([guide 5](05-linux-and-macos-machines.md#the-quick-way-add-a-machine)). Answer yes to
+   **Start the runner now and whenever you log in**. You should see `runner is running`, and then
+   `All done.` If macOS asks whether Python may find devices on your local network, click **Allow**. If the
+   setup prints a warning instead, write it down for the issue.
+3. See which Python the launchd agent starts, and its settings:
+
+   ```bash
+   plutil -p ~/Library/LaunchAgents/bullpen.runner.plist
+   ```
+
+   The first line under `ProgramArguments` is the Python. Write it down. If it contains `/Cellar/`, say so
+   in the issue: a Homebrew upgrade could then break the runner.
+
+   Apple's own Python lives inside Xcode (`/Applications/Xcode.app/…`) or inside the Command Line Tools
+   (`/Library/Developer/CommandLineTools/…`). For that Python the setup writes `/usr/bin/python3`
+   instead. It runs the Python from the Xcode or Command Line Tools that `xcode-select` points to
+   ([Apple's steps](https://developer.apple.com/documentation/xcode/configuring-command-line-tools-settings),
+   last checked 17 November 2026). If the line names a path inside Xcode or the Command Line Tools, say so
+   in the issue.
+
+   `EnvironmentVariables` should list `BULLPEN_SERVICE` as `launchd`, and a `PATH` that includes the
+   folder with `claude` in it.
+4. Check that launchd runs it:
+
+   ```bash
+   launchctl print gui/$(id -u)/bullpen.runner
+   ```
+
+   You should see `state = running` and a `pid = …` line. Write the number down for step 13. If the state is
+   anything else, look at `last exit code` in the same output, and at step 5's logs.
+5. Look at the logs. The runner's own log should end with a line like `runner <name> v… starting`:
+
+   ```bash
+   tail -n 20 ~/.bullpen/runner.log
+   ```
+
+   `launchd.log` should be empty, or hold only lines from a failed start:
+
+   ```bash
+   ls -l ~/.bullpen/launchd.log
+   ```
+
+6. Open the dashboard's **Overview**. The Mac is online, with its agents as chips, and it has the `macos`
+   tag. If it isn't online, look for "cannot reach the hub" in step 5's log, and check that Python is
+   allowed in **System Settings → Privacy & Security → Local Network**.
+7. On **New task**, send `Reply with pong` to the Mac's `selftest` agent. It should finish within a few
+   seconds with a self-test reply. Then send the same prompt to the Mac's `claude` agent, **Read only**. It
+   should answer. This shows that Claude Code, started by launchd, can read its login from the Keychain. If
+   it fails with a login error, run `claude` in Terminal on the Mac itself (not over SSH, where the
+   Keychain is locked), type `/status`, and say in the issue what it shows.
+   Run step 5's `ls` command again: `launchd.log` should not have grown.
+8. On the **Usage** page, press **Check limits**. The Mac's Claude agent should get plan-limit bars, unless
+   it signs in with an API key. If it doesn't, the **Check limits** job's page says why; copy that into
+   the issue.
+9. Look at the Mac's Claude agent chip on the Overview. It needs the sign-in check that reads
+   `claude auth status`, which may not be in your version yet. With it, the chip shows no warning about the
+   login. Without it, the chip says the login is in the Keychain and isn't checked. Either way, write down
+   what it says.
+10. Do the [manual checks for Remote Control](#checks-with-the-real-claude-code) on this Mac, using the
+    Linux and macOS steps, and fill in the macOS row of that table.
+11. Lock the screen (Control-Command-Q) and wait two minutes. From another computer, send `Reply with pong`
+    to the Mac's `claude` agent again. It should answer with the screen still locked. Unlock the Mac. If
+    the job failed with a login error, report it: it means Claude Code can't read the Keychain while the
+    screen is locked, and guide 5's table needs changing.
+12. Send this to the Mac's `claude` agent with **Full auto**, then put the Mac to sleep within 30 seconds
+    (**Apple menu → Sleep**):
+
+    ```text
+    Run the shell command sleep 120, then reply with the word done.
+    ```
+
+    While it sleeps, the dashboard should show the Mac offline after about a minute. Wake it after three
+    minutes. Within a minute the Mac is online again, and the job ends, as done or with a clear error. It
+    must not stay "running" for good. If it is still running five minutes after the Mac woke, cancel it
+    and report it with the job's log.
+13. On the Mac's page, press **Update now**. When the job says the runner was updated, run step 4's
+    command again. The state is `state = running`, and the `pid` is the same as in step 4, because the
+    runner restarts in place. Step 5's log should show the runner starting again with the hub's version.
+    If the state isn't running, or the `pid` changed, report it with step 5's logs.
+14. Restart the Mac and log in. Within a minute of logging in, the Mac shows online on the dashboard, and
+    step 4's command shows `state = running`. Before you log in, it should show offline. If it doesn't come
+    online, run steps 4 and 5 and report what they show.
+15. Log out (**Apple menu → Log Out**). Within a minute the dashboard shows the Mac offline. Log in again: it
+    comes back online. If it doesn't, run steps 4 and 5 and report what they show.
+16. Run the setup a second time, pressing Enter to keep each answer. Its step 7 should end with
+    `runner is running`, with no "Bootstrap failed" message:
+
+    ```bash
+    bash ~/.bullpen/setup/setup-workstation.sh
+    ```
+
+    If it prints `launchctl couldn't start the runner`, copy the reason it gives into the issue.
+17. Check that a launchd agent made by an older setup, without `BULLPEN_SERVICE`, also keeps
+    `launchd.log` small. Remove the setting:
+
+    ```bash
+    plutil -remove EnvironmentVariables.BULLPEN_SERVICE ~/Library/LaunchAgents/bullpen.runner.plist
+    ```
+
+    Stop the runner:
+
+    ```bash
+    launchctl bootout gui/$(id -u)/bullpen.runner
+    ```
+
+    Start it again:
+
+    ```bash
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/bullpen.runner.plist
+    ```
+
+    Note the size step 5's `ls` command shows, send `Reply with pong` to the `selftest` agent, and run the
+    `ls` command again. The size should not have changed. If it grew, report it: the runner doesn't
+    recognise launchd without that setting. Run the setup again (step 16) to put the setting back.
+18. Open **System Settings → General → Login Items & Extensions**. Write down the name the runner has
+    under **App Background Activity** (or **Allow in the Background** on older macOS), so guide 5 can name
+    it.
+19. Optional, if the Mac has a second user account: with your session open, switch to the other account
+    from the menu bar (fast user switching) and wait two minutes. Send `Reply with pong` to the `selftest`
+    agent. It should answer. If it doesn't, report it: guide 5's table needs changing.
+
+**Intel and Apple silicon.** Homebrew lives in `/opt/homebrew` on Apple silicon and in `/usr/local` on
+Intel. The setup looks in both. To see whether Claude Code is installed for the right kind of Mac, run
+this. It should say `arm64` on Apple silicon and `x86_64` on Intel:
+
+```bash
+file "$(command -v claude)"
+```
+
 ## Claude Code
 
 | Symptom | Fix |
@@ -72,6 +311,10 @@ lines. Remove passwords, tokens, API keys and enrollment codes from them first.
 | Jobs fail with `authentication_failed` after a Claude Code update | Run the agent's command in a terminal and `/login` again. Anthropic also says `--bare` "will become the default for `-p` in a future release", and bare mode doesn't read subscription logins. If that lands, check the [headless docs](https://code.claude.com/docs/en/headless) for the opt-out flag and add it to the agent's `"extra_args"` in `runner.json`. |
 | "cannot be launched inside another Claude Code session" | The runner was started from inside a Claude Code session. It already clears `CLAUDECODE` for its jobs. If you see the message in your own terminal, run `unset CLAUDECODE`. |
 | Edits are refused in a job | The job was **Read only**. Use **Edit files** or **Full auto**. In Full auto, Claude's safety classifier can still refuse a risky command. The log says why. |
+| **Move the exact session** can't be picked | The line under it says why: the agent isn't a Claude agent, it is another account ("An exact move stays on one account"), the machine has no project with the same name, the first machine is offline, a later job continues the session (move from that one), or a runner is too old (press **Update now** on the machine's page). **Carry the conversation** works with any agent ([guide 8](08-daily-use.md#continue-on-another-machine)). |
+| A moved job fails with "The session couldn't be copied from …" | The first machine couldn't send the session. "No transcript of session …" means Claude Code keeps it somewhere else: check that the agent's `CLAUDE_CONFIG_DIR` and the project's folder are the same as when the job ran. "Not picked up within 2 minutes" means the machine went offline. "Larger than 32 MB" means the session is too big to move (`HUB_SESSION_MOVE_MAX_MB`). Use **Carry the conversation** instead. |
+| A moved job fails with "The session copy is gone" | The other machine didn't take the copy within 10 minutes (it was busy with other jobs), or the hub restarted in between. Move the session again. |
+| A carry is refused: "This conversation hit a usage limit on …" | The conversation stopped at a usage limit, so it can continue only on the account that hit it. Wait for the reset ([guide 1](01-accounts-and-rules.md#more-than-one-claude-account)). |
 | A job fails with "Claude usage limit reached" | That account reached one of its plan's limits. The message names the window (for example the 5-hour session) and when it resets, and the **Usage** page shows every window. Wait for the reset, then send the job again. Sending it to another Claude account because this one is at its limit is the overflow pattern [guide 1](01-accounts-and-rules.md#more-than-one-claude-account) warns about. |
 | A Claude agent's **Limits** column is blank on its machine's page, the Usage page has no card for it, and **Check limits** leaves it out without a word | The agent signs in with an API key. An API key is billed per token and has no plan limits to read. Its spend shows under **API spend** once you've added an Admin key ([guide 7](07-api-gateway.md#usage-panel-api-spend-per-organization)). |
 | **Check limits** skips an agent, or its job says "Not checked": "signs in with a long-lived token (claude setup-token)" | Such tokens can't read plan usage, though the agent's jobs still report its figures. For a full login, remove `CLAUDE_CODE_OAUTH_TOKEN` from the agent's `env` in `runner.json`, then run the command the message shows (for example `claude-work auth login`) on that machine. |
@@ -84,6 +327,8 @@ lines. Remove passwords, tokens, API keys and enrollment codes from them first.
 | A question was "denied unseen" as too long to review | Its input was over 20,000 characters, too much to check on a card. The agent was asked to split the work into smaller steps. "A tool name of … characters (too long to show)" means the request named a tool with a name over 200 characters long. No real tool has one, so it was denied without asking you. |
 | "The session has ended" when you send a message | The live session ended: you pressed **End session**, it had no message for its quiet time, or it reached the time limit. The log's last line starting with ⏹ says which. **Follow up** continues the conversation. |
 | **Start Remote Control** says it "needs a one-time answer in a terminal" | The first time on each machine, Claude Code asks "Enable Remote Control?" and may ask to trust the folder, and both need a terminal. Run the two commands the message shows on that machine, answer `y`, stop it with Ctrl+C once it says it is ready, then press **Start Remote Control** again. |
+| **Start Remote Control** says it "is already running for this folder from a terminal" | Someone on that machine started `claude remote-control` by hand, in a terminal, in the same project folder. Claude Code then refuses a second server for that folder: "Error: This folder is already served by a terminal `claude remote-control` on this device. Stop it first." (seen with Claude Code 2.1.328 on macOS, 20 November 2026). Either keep using the one in the terminal, or press Ctrl+C in that terminal and then press **Start Remote Control** again. |
+| **Start Remote Control** says Remote Control "didn't start" because "Claude Code reported an error" | Claude Code printed a line starting with "Error:" before it showed its address. The lines under the message show what it said, and the runner has already stopped the server. Fix what those lines name, then press **Start Remote Control** again. |
 | **Start Remote Control** says the agent "signs in with an API key" or "with a long-lived token" | Remote Control needs a full claude.ai login ([Remote Control docs](https://code.claude.com/docs/en/remote-control), last checked 6 November 2026). For a long-lived token, remove `CLAUDE_CODE_OAUTH_TOKEN` from the agent's `env` in `runner.json` and run the command the message shows (for example `claude-work auth login`) on that machine. An agent with an API key can't use Remote Control: use one with a subscription login. |
 | **Start Remote Control** says the agent "has no full claude.ai login that Remote Control can use" | Claude Code gives the same answer when the agent isn't signed in at all and when it uses a long-lived `claude setup-token` token ([Remote Control docs](https://code.claude.com/docs/en/remote-control#troubleshooting), last checked 7 November 2026). Run the command the message shows (for example `claude-work auth login`) on that machine. If the `env` block of that agent's Claude Code `settings.json` (`~/.claude/settings.json`, or the one in its own settings folder such as `~/.claude-work`) sets `CLAUDE_CODE_OAUTH_TOKEN`, remove it first. |
 | **Start Remote Control** says the agent "uses another service than Anthropic's own" | The agent is set up for Bedrock, Vertex or Foundry, or has `ANTHROPIC_BASE_URL` in its `env`. Remote Control works only with Anthropic's own service, so use another agent. |
@@ -95,6 +340,8 @@ lines. Remove passwords, tokens, API keys and enrollment codes from them first.
 | Remote Control "started, but hasn't shown its address" | The server is running but hadn't printed its claude.ai address within 15 seconds. It may still work: open claude.ai/code or the Claude app, signed in to that account, and look for the server's name (for example "build-box myapp"). If it isn't there, press **Stop** and read the lines the job shows. |
 | Start Remote Control was "Not picked up within 2 minutes" | The machine went offline before it picked the request up. The hub drops it rather than start Remote Control much later. Press **Start** again once the machine is back. |
 | A Remote Control server stopped by itself | It stops after `remote_control_max_hours` (8 by default), when `allow_remote_control` is turned off, when the runner stops, and when the hub no longer accepts the machine's token. The machine's page says which. |
+| A Remote Control server didn't come back after a restart | It comes back only if **Start again when the runner starts** was ticked when it was started, and it wasn't stopped with **Stop** since. The runner starts it once it has checked in with the hub, so the machine must be online. On Windows the runner starts when you sign in, not before. It stays off if its hours (from the first start) are up, if `allow_remote_control` is now `false`, or if the machine is paused. The runner's log says which. |
+| "Didn't start again when the runner started" | The runner tried to start a chosen server again and it failed. The rest of the message says why, as for **Start Remote Control** (the rows above). The runner doesn't try again by itself: fix the cause, then press **Start Remote Control**. |
 
 ### Checks with the real Claude Code
 
@@ -112,16 +359,72 @@ Remote Control for a terminal, so this needs checking on each system with a real
 | System | Starts without a terminal and shows its address (real login) | Stops on **Stop** (stand-in) | Stops with the runner (stand-in) |
 |---|---|---|---|
 | Linux | not yet checked | checked, 7 November 2026 | checked, 7 November 2026 |
-| macOS | not yet checked | in the automated tests | not yet checked |
-| Windows | not yet checked | in the automated tests (at once with `taskkill /T /F`) | in the automated tests (the runner's Job Object) |
+| macOS | checked, 20 November 2026 (Apple silicon and Intel) | in the automated tests; also with a real login, 20 November 2026 | not yet checked |
+| Windows | checked, 18 to 19 November 2026 | in the automated tests (at once with `taskkill /T /F`); also with a real login, 18 to 19 November 2026 | in the automated tests (the runner's Job Object) |
 
 The stand-in is the self-test agent's pretend `remote-control`, used by the automated tests.
+
+On Windows, with Claude Code 2.1.326, the first **Start Remote Control** stopped with the "needs a
+one-time answer in a terminal" message, as it should: Claude Code wanted the folder trusted and Remote
+Control enabled. After those questions were answered once in a terminal, **Start Remote Control** on the
+dashboard said "Remote Control is running" with a claude.ai/code link, and **Stop** stopped it. That covers
+step 1 of the Windows checks below, step 2 apart from the window, and the **Stop** in step 4. Sending a
+message through the link, checking that no window appeared and that nothing was left running, and step 5
+weren't checked. Linux and
+macOS haven't been checked with a real login yet.
 
 On Windows the runner can't ask a server to stop cleanly: it ends it at once with `taskkill /T /F`. Ctrl+Break
 can't reach a server that runs without a window, and Claude Code would only be killed by it. So the server
 doesn't sign off, and claude.ai may list it for a while. In a git project it may also leave the worktrees it
 made for its sessions. `git worktree list` in the project folder shows them, and `git worktree remove <path>`
 removes one you no longer need.
+
+**Moving a session.** **Move the exact session** ([guide 8](08-daily-use.md#continue-on-another-machine))
+copies one session's transcript file between machines. What it relies on comes from Anthropic's docs and
+from `claude --help` of Claude Code 2.1.326, last checked 17 November 2026:
+
+- Claude Code keeps each session in `projects/<project>/<session-id>.jsonl` under its settings folder
+  (`CLAUDE_CONFIG_DIR`, or `~/.claude`). `<project>` is the working folder's path with every character other
+  than a letter or digit replaced by `-`, or `CLAUDE_CODE_PROJECT_DIR_NAME` when that is set with
+  `CLAUDE_CONFIG_DIR` ([Manage sessions](https://code.claude.com/docs/en/sessions#where-transcripts-are-stored)).
+  The name matched the folder Claude Code made on a Windows PC.
+- `claude --resume <session-id>` looks in the current folder's project first, then in every other project on
+  the machine ([Manage sessions](https://code.claude.com/docs/en/sessions#resume-by-session-id-or-name)), and
+  continues the session under the same id ([How Claude Code works](https://code.claude.com/docs/en/how-claude-code-works#resume-or-fork-sessions)).
+  The runner writes the copy into the project folder for the new machine's own path.
+
+Checked with a real session on 18 and 19 November 2026, from a Windows 11 PC (Claude Code 2.1.326) to an
+Apple silicon Mac with macOS 27 (Claude Code 2.1.328). Both agents had the same account label, accepted
+on both machines' pages, and both machines had a project with the same name. The Mac resumed the same
+session id and recalled a code word given on the PC. So Claude Code doesn't mind that the transcript's
+lines name the first machine's folder, even when that is a Windows folder and the session resumes on a Mac.
+
+Still not checked, since each check costs plan usage:
+
+- large tool results and subagent transcripts, which Claude Code keeps in a folder next to the transcript
+  (`<session-id>/tool-results/`, `<session-id>/subagents/`, [Application data](https://code.claude.com/docs/en/claude-directory#application-data)).
+  A move doesn't copy them, so the moved session may not find them. The session moved above used no
+  tools, so it had neither folder;
+- on macOS, whether Claude Code names the folder after the path with links resolved (`/private/tmp`, not
+  `/tmp`). The runner tries that name first, then the path as written;
+- moves in other directions, such as Mac to Windows or between Linux machines.
+
+A path with other than plain ASCII characters, or whose folder name would be over 200 characters, can't move:
+Claude Code shortens such names with a hash the docs don't describe.
+
+To check it once with your own machines (two short prompts on your plan):
+
+1. Pick two machines whose Claude agents have the same account label, accepted on both machines' pages, and
+   a project with the same name on both.
+2. On the first machine, send a task: "Remember the word kumquat. Reply with OK."
+3. When it is done, open **Continue on another machine** on its page.
+4. Pick the second machine's agent and **Move the exact session**. As the message, type "Which word did I ask
+   you to remember?", then press **Continue there**.
+5. The answer should name the word. **Follow up** once more on the new job and ask again.
+
+If the answer doesn't know the word, use **Carry the conversation** instead, and
+[open an issue](https://github.com/rob-paprocki/agent-bullpen/issues) saying which systems the two machines
+run.
 
 **Manual checks before relying on Remote Control.** Do these once on each system you want to use it on.
 If a check fails, leave `allow_remote_control` off on that machine, start Remote Control by hand in a
@@ -156,6 +459,9 @@ On **Linux and macOS**:
    **Start Remote Control**, check that **Open** works, then press **Stop**. Run step 4's command again.
 6. Press **Start Remote Control** once more, then restart the runner ([guide 5](05-linux-and-macos-machines.md#managing-the-runner)).
    Run step 4's command again: the server must have stopped with the runner.
+7. Tick **Start again when the runner starts**, press **Start Remote Control**, and note its **Stops at**
+   time. Restart the computer. Once the machine is back online on the dashboard, its page should show the
+   server running again with the same **Stops at** time, and **Open** should work. Press **Stop**.
 
 On **Windows**, in PowerShell:
 
@@ -179,6 +485,9 @@ On **Windows**, in PowerShell:
 5. Press **Start Remote Control** once more, then restart the runner
    ([guide 6](06-windows-machines.md#managing-the-runner)). Run step 4's command again: the server must have
    stopped with the runner.
+6. Tick **Start again when the runner starts**, press **Start Remote Control**, and note its **Stops at**
+   time. Restart the PC and sign in. Once the PC is back online on the dashboard, its page should show the
+   server running again with the same **Stops at** time, and no window should appear. Press **Stop**.
 
 ## Gemini CLI
 
@@ -240,6 +549,8 @@ the rest of Gemini's work are not affected.
 | A machine's page says **behind** | It updates within about 15 seconds of its next check-in. Use **Sync now** to force it. The job log shows each change. |
 | A machine's page lists "exists and isn't ours" | You already had a file or MCP server with that name, so the runner left it alone. Rename yours, or delete it if it was an old copy, then sync again. |
 | `/remember` isn't offered in Claude Code | Check that the skill exists: `ls ~/.claude/skills/remember` (or `~/.claude-<name>/skills/remember` for another account). In a running session, start a new one so skills reload. |
+| The `remember` skill isn't offered in Gemini CLI, Codex or another agent CLI | Check that the skill exists: `ls ~/.agents/skills/remember`. Gemini CLI reads that folder from version 0.28.0 (`gemini --version`); older versions have only the `/remember` and `/recall` commands. Copilot CLI skips it when `COPILOT_HOME` is set, and Kimi CLI when `~/.config/agents/skills` exists ([guide 10](10-shared-memory-and-mcp.md#the-shared-skills-folder)). Start a new session so skills reload. |
+| Gemini CLI says "Skill conflict detected" for `remember` | You have a `remember` skill of your own in both `~/.gemini/skills` and `~/.agents/skills`. The runner only removes copies it made, so delete or rename one of yours. |
 | "'bullpenjob' is reserved for the hub's own servers" on the MCP page | `bullpen` and `bullpenjob` are the hub's own servers (shared memory and job tools). Pick another name. |
 | Claude says the `bullpen` tools aren't available | Run `claude mcp list` (or `claude-<name> mcp list`). `bullpen` should be listed and connected. If it shows failed, open `http://<hub-ip>:8080/healthz` from that machine. The hub may also need `pip install mcp` (re-run the hub installer). |
 | Gemini CLI doesn't see the shared notes | `~/.gemini/GEMINI.md` must contain the `bullpen:begin` block with `@./bullpen-shared.md`. Run `/memory reload` in Gemini, or sync again. |

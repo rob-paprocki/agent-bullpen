@@ -97,6 +97,9 @@ support adds. The [roadmap](../ROADMAP.md) lists the agents planned next.
 | `allow_tools_flag` | the flag that allows tools by name, for example `--allowedTools`. For a job that gets the job tools, the runner adds their names right after this flag in the level's flags, or adds the flag and the names after the level's flags when the flag isn't there. |
 | `live` | the flags that keep the program's input open for more messages, one JSON line each in Claude Code's stream-json format, for "Keep the session open for messages": `["--input-format", "stream-json"]` for Claude Code. Only for `claude-stream` programs that take the prompt on `stdin`. Leave it out and the agent answers once per job. |
 | `remote_control` | the arguments (after `command`) that start the program's Remote Control server in a project, with `{rc_name}` and `{rc_spawn}`: `["remote-control", "--name", "{rc_name}", "--spawn", "{rc_spawn}"]` for Claude Code. Used only for agents with a full claude.ai login, on machines with `allow_remote_control` ([guide 5](05-linux-and-macos-machines.md#remote-control)). |
+| `cli_version` | the arguments (after `command`) that print the program's version: `["--version"]` for Claude Code. The runner checks the version before it uses `auth_status` or `auth_logout`, so an older program never gets arguments it doesn't know. |
+| `auth_status` | the arguments that print the program's own sign-in status as JSON: `["auth", "status", "--json"]` for Claude Code. The machine's page shows the answer (signed in, plan, method; never the account's email). Used only for `claude-stream` agents with a full claude.ai login. Leave it out and the page shows no sign-in. |
+| `auth_logout` | the arguments that sign the program out: `["auth", "logout"]` for Claude Code, for **Sign out…** on machines with `allow_remote_sign_out` ([guide 5](05-linux-and-macos-machines.md#signing-agents-out-from-the-dashboard)). Leave it out and the agent can't be signed out from the dashboard. |
 | `account` | the account label: a word for the account the agent is signed in to, the same on every machine signed in to it. The Usage page joins the plan limits of agents with the same label ([guide 5](05-linux-and-macos-machines.md#account-labels)). Leave it out and the agent is an account of its own. |
 | `usage_check` | how **Check limits** asks a Claude Code agent for its plan limits: `{"args": [...], "prompt": "/usage"}`. The runner starts `command` with these `args` only (not the agent's `args`, levels or `extra_args`), in the `chat` folder, writes the prompt to it and reads Claude Code's JSON lines. The `claude` preset has it; leave it out for any other program. |
 
@@ -198,8 +201,10 @@ Full support for a new agent is code in the runner and the hub. Today it touches
    `scripts/windows/Setup-Workstation.ps1`.
 5. **Settings wiring** (the `Wiring` class in `runner/runner.py`): pinned notes into the program's own memory
    file, the hub's `bullpen` server and the central MCP servers into its MCP settings, and the add-ons into
-   its skills folder. The hub's list of agents that MCP servers can go to (`TARGETS` in `hub/registry.py`) and
-   the MCP page need the new agent too.
+   its skills folder. Most agent CLIs already read `~/.agents/skills`, where every machine gets the
+   `remember` skill, so check first whether the new agent needs a folder of its own
+   ([guide 10](10-shared-memory-and-mcp.md#the-shared-skills-folder)). The hub's list of agents that MCP
+   servers can go to (`TARGETS` in `hub/registry.py`) and the MCP page need the new agent too.
 6. **Features** the runner reports for it in each check-in, so the hub only sends jobs it can do
    (`agent_features` in `runner/runner.py`):
 

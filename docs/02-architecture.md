@@ -24,7 +24,8 @@ Code reported. The runner also keeps asking "anything for me?" When a job arrive
 **Each machine has its own runner token.** You add a machine with **Add a machine** on the dashboard, which
 makes a one-time code. The setup on the machine trades the code for a token of its own
 ([guide 5](05-linux-and-macos-machines.md), [guide 6](06-windows-machines.md)). The hub keeps only a
-fingerprint of each token, and **Forget** on the dashboard revokes it.
+fingerprint of each token, and **Forget** on the dashboard revokes it. Such a machine also gets an MCP token of
+its own for its agents, which **Forget** stops too ([guide 10](10-shared-memory-and-mcp.md#the-mcp-token-each-machine-uses)).
 
 **Agents** are entries in each machine's `~/.bullpen/runner.json`. The setup creates them; you choose which
 and how many:
@@ -76,7 +77,9 @@ settings whenever they change ([guide 10](10-shared-memory-and-mcp.md)):
 - **Notes.** Pinned ones are imported into every Claude account's `CLAUDE.md` and into `GEMINI.md`. All of
   them are searchable through the hub's own MCP server, `bullpen`, at `/mcp`, with the tools `remember`,
   `recall` and `list_notes`.
-- **Add-ons.** The `/remember` skill and command, and "second opinion".
+- **Add-ons.** The `/remember` skill and command, and "second opinion". The `remember` skill also goes to
+  `~/.agents/skills`, the folder that Codex, OpenCode, Copilot CLI, Cursor and several other agent CLIs read
+  ([guide 10](10-shared-memory-and-mcp.md#the-shared-skills-folder)).
 - **The central MCP list.** Servers you add once on the MCP page. By default a remote server is routed
   **through the hub**: agents connect to `/mcp/s/<name>` on the hub with the hub's token, and the hub relays
   their tool calls with the server's real key or OAuth sign-in, which never leave the hub. OAuth servers are
@@ -88,7 +91,7 @@ updates:
 - Claude Code through its own `claude mcp add-json` command, for each account;
 - Gemini CLI's `settings.json`;
 - Antigravity's `mcp_config.json`;
-- the skill and command folders.
+- the skill and command folders, including the shared `~/.agents/skills`.
 
 It only touches entries it created.
 
@@ -111,7 +114,7 @@ task you let hand out subtasks starts them there. For that the hub has a second 
   Claude Code with `--mcp-config`, and allows the job's tools by name with `--allowedTools`, except `approve`.
   The folder is deleted when the job ends. The token is never put on a command line, and the runner hides it
   in every log line.
-- **Neither token works in the other's place.** The hub's MCP token doesn't open `/mcp/job`, and a job token
+- **Neither token works in the other's place.** An MCP token (the shared one or a machine's own) doesn't open `/mcp/job`, and a job token
   doesn't open `/mcp` or `/mcp/s/<name>`.
 
 | Tool | What it does | Which jobs get it |
@@ -143,7 +146,14 @@ travels over the connections the runner and the agent already make to the hub.
   own, and reports its address back with its check-ins. You then drive Claude from claude.ai/code or the
   Claude app; that traffic goes between Claude Code and Anthropic, not through the hub. The runner stops the
   server on **Stop**, after `remote_control_max_hours` (8 by default), when you turn `allow_remote_control`
-  off, and when the runner itself stops.
+  off, and when the runner itself stops. A server started with **Start again when the runner starts** is
+  noted in `~/.bullpen/remote-control.json`, and the next runner starts it again after its first check-in,
+  within the same time limit.
+- **Sign-in status and Sign out.** Each runner asks its Claude agents' own CLI whether they are signed in
+  (`claude auth status --json`, with each agent's command and environment) every 10 minutes, and every
+  minute while one is signed out, and sends only the answer's plain fields with its check-ins. **Sign out…**
+  queues a machine action that runs the agent's own `claude auth logout`, where `allow_remote_sign_out`
+  allows it. Signing in happens on the machine itself; nothing about it goes through the hub.
 
 ## Agents handing work to other machines, and machine tags
 
@@ -238,7 +248,7 @@ agents  ──https──► their providers (each machine's own logins)
   never connects to them, so machines need no open ports. To use the dashboard away from home, use a VPN or
   a tunnel rather than opening a router port ([guide 3](03-cloudflare.md)).
 - **Plain HTTP on the LAN by default.** The dashboard password, the session cookie, the runner tokens, the
-  hub's MCP token, job tokens and every prompt cross your network unencrypted. Anyone who can watch that traffic (another
+  MCP tokens, job tokens and every prompt cross your network unencrypted. Anyone who can watch that traffic (another
   device on the same Wi-Fi, a compromised IoT gadget) can read them. On a home network you trust, that's a
   common trade-off. Otherwise put TLS in front of the hub or reach it only through a VPN
   ([guide 3](03-cloudflare.md) shows both).
@@ -247,7 +257,7 @@ agents  ──https──► their providers (each machine's own logins)
   the runner. Use a long password, and keep the dashboard off the open internet. Read only is the default
   for jobs.
 - **Runner tokens.** Anyone holding a machine's token could pretend to be that machine: receive the jobs sent
-  to it, and fetch the hub's MCP token and the keys of MCP servers added **directly**. It lives in that
+  to it, and fetch its MCP token and the keys of MCP servers added **directly**. It lives in that
   machine's `runner.json`, readable only by its user. **Forget** the machine on the dashboard to revoke it. A
   machine set up by hand may use the shared token `HUB_RUNNER_TOKEN` from `/etc/bullpen/hub.env` instead;
   give it its own ([guide 5](05-linux-and-macos-machines.md#machines-set-up-with-the-shared-token)).
@@ -267,14 +277,16 @@ agents  ──https──► their providers (each machine's own logins)
   (`.claude/settings.json`) and MCP servers (`.mcp.json`) without the trust prompt you'd see in a
   terminal ([details](https://code.claude.com/docs/en/headless)). The runner only works in folders
   you've listed.
-- **The hub's MCP token** (memory access, and access to every server routed through the hub) is written into
-  each agent's settings on each machine, as are the keys of servers you add **directly**. Keys and sign-ins
-  of servers routed through the hub stay in the hub's database. If a machine is lost, forget it and rotate the
-  MCP token ([guide 10](10-shared-memory-and-mcp.md#security-notes)).
+- **MCP tokens** (memory access, and access to every server routed through the hub) are written into each
+  agent's settings on each machine, as are the keys of servers you add **directly**. A machine with its own
+  runner token has an MCP token of its own, and **Forget** stops it; the other machines share the hub's one.
+  Keys and sign-ins of servers routed through the hub stay in the hub's database. If a machine is lost, forget
+  it and rotate the shared MCP token ([guide 10](10-shared-memory-and-mcp.md#security-notes)).
 - **Pinned notes are standing instructions for every agent.** Only you can pin (agents can only ask), and
   the hub neutralises `@` imports in them.
 - **Secrets on disk**, each readable only by you or by the hub's service user:
   - `runner.json` on each machine;
+  - `~/.bullpen/mcp-token.json` on each machine with its own MCP token;
   - `~/.gemini/.env`;
   - `/etc/bullpen/hub.env` and `/var/lib/bullpen/hub.db` on the hub;
   - LiteLLM's `.env`, if you use the gateway.

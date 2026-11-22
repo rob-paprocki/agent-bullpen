@@ -18,6 +18,14 @@ Rules kept here:
     connection) is marked expired, so no card is left that nobody would act on.
   * The approval lines in the job's log are masked with hub/redact.py; the full input stays only in
     the approvals row, and is masked too once the job ends (Database.update_job).
+  * "Allow for this job" (decision 'allow_job') allows the request and remembers it for this job only:
+    a later request in the same job with the same match_key() is allowed without asking, gets its own
+    input back (the same as the one the owner allowed, a Bash description aside), and is recorded as
+    allowed with same_as naming that question. Only the hub keeps this, as a hash in the approvals
+    row, and only while the job runs (the store checks that, as for a question; the hash is cleared
+    when the job ends). Follow-ups, subtasks, council steps and other machines are other jobs,
+    so it never reaches them. It isn't offered, and is refused, for a request the card flags (hidden
+    characters or blank lines, see for_job_ok()).
 
 Imports nothing from app.py and nothing from the `mcp` package.
 """
@@ -25,6 +33,7 @@ Imports nothing from app.py and nothing from the `mcp` package.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -73,6 +82,9 @@ BLANK_RE = re.compile(f"[{BLANK}]")
 # A run of blank or hidden characters in the approval line (see gap()).
 GAP_RE = re.compile(f"(?:[{BLANK}]|{HIDDEN_RE.pattern})+")
 GAP_SHOWN = 3  # a run with a hidden character in it is written out up to this long, else counted
+# A line the dashboard's approval card counts as blank (its BLANK_LINE_RE in app.js): two or more in a row
+# are drawn as one highlighted line, and the card says "blank lines".
+BLANK_LINE_RE = re.compile("[\t    -   ⠀　]*")
 
 STARTUP_EXPIRED = "The hub restarted while this question waited."
 STOPPED_WAITING = "The agent stopped waiting."
@@ -149,6 +161,57 @@ def deny(message: str) -> dict:
     return {"behavior": "deny", "message": message}
 
 
+def match_key(tool_name: str, tool_input: dict) -> str:
+    """What makes two requests the same for "Allow for this job": the same tool name and exactly the
+    same input, every field and every character (as JSON with sorted keys, like the stored input). No
+    prefixes, no patterns. One field is left out: a Bash request's `description`, the agent's own
+    words about the command (shown as "The agent says"), which Claude Code writes afresh each time and
+    which doesn't change what runs. Kept as a sha256, so the row holds no copy of the input that
+    would outlive the masking at the job's end."""
+    keyed = tool_input
+    if tool_name == "Bash" and isinstance(tool_input.get("description"), str):
+        keyed = {k: v for k, v in tool_input.items() if k != "description"}
+    text = json.dumps([tool_name, keyed], ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _strings(value: Any):
+    """Every string in a request's input: keys and values, however deeply nested."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
+def _flagged(text: str) -> bool:
+    """Would the approval card flag this text: hidden characters (line breaks and tabs aside, as the
+    dashboard's HIDDEN_RE), or two or more blank lines in a row?"""
+    if HIDDEN_RE.search(text.replace("\n", "").replace("\t", "")):
+        return True
+    blank = False
+    for line in text.split("\n"):
+        now = BLANK_LINE_RE.fullmatch(line) is not None
+        if now and blank:
+            return True
+        blank = now
+    return False
+
+
+def for_job_ok(tool_name: Any, tool_input: Any) -> bool:
+    """May this request be allowed for the whole job? Not when the card warns about it: hidden
+    characters or blank lines in the tool's name or anywhere in its input (a key, a value, a nested
+    value). The dashboard offers the button only when this is true, and decide() checks it again."""
+    if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
+        return False
+    return not any(_flagged(s) for s in (tool_name, *_strings(tool_input)))
+
+
 class Approvals:
     """Questions from 'ask' jobs. `db` is hub/db.py's Database; `notifier` has send(event, job)."""
 
@@ -194,11 +257,16 @@ class Approvals:
             return deny("This request is too long to show the owner on the dashboard, so it was denied. "
                         "Split it into smaller steps.")
         use_id = tool_use_id[:200] if isinstance(tool_use_id, str) else None
+        key = match_key(tool_name, tool_input)
+        if for_job_ok(tool_name, tool_input):
+            allowed = await self._allowed_for_job(job_id, tool_name, tool_input, raw, use_id, key)
+            if allowed is not None:
+                return allowed
         # From the moment the question is stored, a call dropped before it waits (its connection broke)
         # expires the question, as _wait does once it waits: no card is left that nobody waits for.
         # The store is shielded, so a question stored after the call was dropped is expired then.
         store = asyncio.ensure_future(asyncio.to_thread(self.db.add_approval_if_running, job_id, tool_name, raw,
-                                                        use_id, self.timeout_s))
+                                                        use_id, self.timeout_s, key))
         try:
             row = await asyncio.shield(store)
         except asyncio.CancelledError:
@@ -214,6 +282,19 @@ class Approvals:
             self._expire(row["id"])
             raise
         return await self._wait(job_id, row, progress)
+
+    async def _allowed_for_job(self, job_id: int, tool_name: str, tool_input: dict, raw: str, use_id: str | None,
+                               key: str) -> dict | None:
+        """The answer for a request the owner already allowed for this job, recorded as allowed; None
+        when there is no such question (or the job has ended: the question path then says so). The
+        agent gets its request back as stored: the same match_key means it is the input the owner
+        allowed, a Bash request's description aside."""
+        row = await asyncio.to_thread(self.db.add_allowed_if_remembered, job_id, tool_name, raw, use_id, key)
+        if row is None:
+            return None
+        await self._log(job_id, f"✔ Allowed automatically: {summary(tool_name, tool_input)} "
+                                f"(same as question #{row['same_as']}, allowed for this job)")
+        return {"behavior": "allow", "updatedInput": json.loads(raw)}
 
     def _expire_stored(self, store: asyncio.Future) -> None:
         """The question stored for a call that was dropped meanwhile, if one was stored."""
@@ -302,21 +383,39 @@ class Approvals:
         row = self.db.approval(approval_id)
         if row is None or row["job_id"] != job_id:
             raise Refused(404, "No such question for this job.")
-        if decision not in ("allow", "deny"):
-            raise Refused(400, "Answer allow or deny.")
+        if decision not in ("allow", "allow_job", "deny"):
+            raise Refused(400, "Answer allow, allow_job or deny.")
         if row["status"] != "pending" or (row["expires_at"] or 0) <= time.time():
             raise Refused(409, "This question was already answered or has expired.")
-        status = "allowed" if decision == "allow" else "denied"
+        for_job = decision == "allow_job"
+        if for_job:
+            try:
+                stored = json.loads(row["tool_input"] or "")
+            except ValueError:
+                stored = None
+            if not row["match_key"] or not for_job_ok(row["tool_name"], stored):
+                raise Refused(400, "This request can't be allowed for the whole job, because it has hidden "
+                                   "characters or blank lines. Press Allow to allow it once.")
+        status = "denied" if decision == "deny" else "allowed"
         reason = (message or "").strip()[:MAX_REASON_CHARS] if status == "denied" else ""
-        if not self.db.decide_approval(approval_id, status, reason or None):
+        if not self.db.decide_approval(approval_id, status, reason or None, for_job=for_job):
             raise Refused(409, "This question was already answered or has expired.")
         name = visible(row["tool_name"] or "")[:200]
-        if status == "allowed":
+        if for_job:
+            line = f"✔ You allowed {name} for this job (question #{approval_id})"
+        elif status == "allowed":
             line = f"✔ You allowed {name}"
         else:
             line = f"✖ You denied {name}" + (f": {visible(reason)}" if reason else "")
         self.db.append_logs(job_id, [line])
         self.wake(approval_id)
+        if for_job:
+            # The same request asked in parallel, still waiting: allowed now too.
+            others = self.db.allow_pending_matches(job_id, approval_id, row["match_key"])
+            for aid in others:
+                self.db.append_logs(job_id, [f"✔ Allowed automatically: {name} (same as question #{approval_id}, "
+                                             "allowed for this job)"])
+                self.wake(aid)
         return {"ok": True, "status": status}
 
     def wake(self, approval_id: int) -> None:

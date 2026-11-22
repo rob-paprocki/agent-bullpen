@@ -158,6 +158,9 @@ table.machines td.ml-state, table.machines td.ml-busy { white-space: nowrap; }
 h2.tight { margin: 4px 0 10px; }
 .m-tools { margin: 0 0 12px; }
 .m-tools input[type=search] { flex: 1 1 220px; width: auto; min-width: 0; }
+.m-group { display: inline-flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.m-group[hidden] { display: none; }
+.m-group select { width: auto; max-width: 100%; padding: 4px 8px; }
 .seg { display: inline-flex; }
 .seg button { border-radius: 0; }
 .seg button:first-child { border-radius: 7px 0 0 7px; }
@@ -249,6 +252,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
 dialog.wide { width: min(660px, 94vw); padding: 16px 20px 20px; }
 dialog .dialog-head h2 { margin: 0; }
 dialog #am-form button[type=submit] { margin-top: 12px; }
+dialog .dialog-actions { justify-content: flex-end; margin-top: 16px; }
+.sign-in { margin-top: 4px; }
+.sign-in-cmd { margin-top: 4px; align-items: center; flex-wrap: wrap; }
+.sign-in-cmd code { overflow-wrap: anywhere; }
 .cmd-title { margin-top: 12px; }
 .cmd { display: flex; gap: 8px; align-items: flex-start; background: var(--code-bg); border: 1px solid var(--line);
   border-radius: 8px; padding: 8px 10px; margin: 4px 0 8px; }
@@ -266,8 +273,9 @@ ul.codes li { padding: 6px 0; border-bottom: 1px solid var(--line); }
 h1.j-title { min-width: 0; overflow-wrap: anywhere; }
 button.linkish { background: none; border: 0; border-radius: 0; padding: 0; color: var(--accent); text-decoration: underline; }
 .thread-bar { margin: 12px 0 8px; }
-.card.continue, .card.follow { margin-top: 12px; }
-.follow textarea { min-height: 90px; }
+.card.continue, .card.follow, .card.move { margin-top: 12px; }
+.follow textarea, .move textarea { min-height: 90px; }
+.move select { max-width: 100%; }
 .radio-row label.off { color: var(--muted); cursor: default; }
 .card.continue h3 { margin-bottom: 2px; }
 .card.continue .cmd { margin-bottom: 0; }
@@ -377,6 +385,7 @@ code.a-path { display: block; overflow-wrap: anywhere; background: var(--code-bg
 .rc-form .part { margin: 0; font-weight: 400; min-width: 0; }
 .rc-form .part > span { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 2px; }
 .rc-form select { height: 38px; }
+.rc-form .rc-again { grid-column: 1 / -1; margin: 0; }
 .rc-detail { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; max-width: 46em; }
 .rc-act { gap: 6px; justify-content: flex-end; flex-wrap: nowrap; }
 .rc-why { margin: 12px 0 0; padding-left: 18px; }

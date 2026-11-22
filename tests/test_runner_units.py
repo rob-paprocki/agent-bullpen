@@ -12,15 +12,19 @@ a small local web server.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import contextlib
+import hashlib
 import datetime
 import http.server
 import io
 import json
+import logging
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -33,12 +37,71 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-# Before the runner is imported: everything it keeps (job folders, logs) goes to a temporary folder.
-os.environ["BULLPEN_HOME"] = tempfile.mkdtemp(prefix="bullpen-runner-units-")
+
+
+def remove_tree(path) -> None:
+    """Delete a test's temporary folder. Files git makes read-only (Windows refuses to delete those) are
+    made writable first; anything still in use is left behind rather than failing the test."""
+    def writable_then_retry(func, name, _error):
+        try:
+            os.chmod(name, stat.S_IRWXU)
+            func(name)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable_then_retry)
+    else:
+        shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def stop_remote_control(rc) -> None:
+    """stop_all, then wait for the servers' reader threads: each one saves remote-control.json when its
+    server ends, which would make the test's folder again after remove_tree."""
+    rc.stop_all()
+    for thread in threading.enumerate():
+        if thread.name.startswith("rc-"):
+            thread.join(10)
+
+
+def remove_runner_home(path: str) -> None:
+    logging.shutdown()  # close runner.log first: Windows won't delete an open file
+    remove_tree(path)
+
+
+# Before the runner is imported: everything it keeps (job folders, logs) goes to a temporary folder,
+# deleted when the tests end.
+RUNNER_HOME = os.environ["BULLPEN_HOME"] = tempfile.mkdtemp(prefix="bullpen-runner-units-")
+atexit.register(remove_runner_home, RUNNER_HOME)
+os.environ.pop("CLAUDE_CONFIG_DIR", None)  # the self-test agent's transcripts never go to a real Claude Code folder
+# The runner's home (runner.HOME, from Path.home()) is a temporary folder too, so nothing here can reach the
+# real ~/.claude, ~/.gemini or ~/.local/bin. On Windows that takes USERPROFILE: Path.home() ignores HOME there.
+sys.path.insert(0, str(ROOT / "tests"))
+import home_guard  # noqa: E402
+
+REAL_HOME = home_guard.snapshot()
+FAKE_HOME = tempfile.mkdtemp(prefix="bullpen-runner-units-home-")
+atexit.register(remove_tree, FAKE_HOME)
+home_guard.set_home(os.environ, FAKE_HOME)
+os.environ.pop("GEMINI_CLI_HOME", None)
 sys.path.insert(0, str(ROOT / "runner"))
 
 import runner  # noqa: E402
 import selftest_agent  # noqa: E402
+
+if not home_guard.same_path(runner.HOME, FAKE_HOME):
+    sys.exit(f"runner.HOME is {runner.HOME}, not the tests' own home folder: stopped before any test ran")
+
+
+def check_real_home() -> None:
+    leaked = home_guard.report(REAL_HOME, "The runner's unit tests")
+    if leaked:
+        print("\n" + leaked, file=sys.stderr)
+        remove_runner_home(RUNNER_HOME)
+        remove_tree(FAKE_HOME)
+        os._exit(1)  # the only way to fail at exit: a SystemExit there is ignored
+
+
+atexit.register(check_real_home)  # registered last, so it runs first: before the temporary folder goes
 
 TOKEN = "bpj_" + "T0k3n-" * 7 + "x"  # the shape of a job token (bpj_ + 43 url-safe characters)
 
@@ -186,6 +249,7 @@ def read_json(path: Path, wait_s: float = 2.0):
 class TempDirCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="bullpen-unit-")
+        self.addCleanup(remove_tree, self.tmp)  # registered first, so it runs after every other clean-up
         self.selftest_env = {"SELFTEST_DELAY": "0"}
 
 
@@ -255,7 +319,7 @@ class AgentFeatures(unittest.TestCase):
 
     def test_presets(self):
         login = ["job_mcp", "approvals", "mcp_pick", "live", "levels", "summary", "limits", "usage_check",
-                 "remote_control"]
+                 "remote_control", "sign_out", "session_move"]
         self.assertEqual(runner.agent_features(self.spec(preset="claude"), {}), login)
         self.assertEqual(runner.agent_features(self.spec(preset="selftest"), {}), login)
         with mock.patch.object(runner, "gemini_job_tools_problem", return_value=None):
@@ -272,37 +336,42 @@ class AgentFeatures(unittest.TestCase):
     def test_limits_by_sign_in(self):
         spec = self.spec(preset="claude")
         both = ["job_mcp", "approvals", "mcp_pick", "live", "levels", "summary"]  # whatever the sign-in
-        self.assertEqual(runner.agent_features(spec, {}), both + ["limits", "usage_check", "remote_control"],
-                         "a full login reports limits, can check them and can run Remote Control")
-        self.assertEqual(runner.agent_features(spec, {"CLAUDE_CODE_OAUTH_TOKEN": "t"}), both + ["limits"],
+        moves = ["session_move"]  # whatever the sign-in, too
+        self.assertEqual(runner.agent_features(spec, {}), both + ["limits", "usage_check", "remote_control", "sign_out"] + moves,
+                         "a full login reports limits, can check them, can run Remote Control and can be signed out")
+        self.assertEqual(runner.agent_features(spec, {"CLAUDE_CODE_OAUTH_TOKEN": "t"}), both + ["limits"] + moves,
                          "a setup-token token reports limits but can't read /usage or run Remote Control")
-        self.assertEqual(runner.agent_features(spec, {"ANTHROPIC_API_KEY": "k"}), both,
+        self.assertEqual(runner.agent_features(spec, {"ANTHROPIC_API_KEY": "k"}), both + moves,
                          "an API key has no plan limits")
-        self.assertEqual(runner.agent_features(spec, {"CLAUDE_CODE_USE_BEDROCK": "1"}), both)
-        self.assertEqual(runner.agent_features(spec, {"ANTHROPIC_BASE_URL": "http://192.168.100.20:4000"}), both,
-                         "a gateway isn't Anthropic's own service")
+        self.assertEqual(runner.agent_features(spec, {"CLAUDE_CODE_USE_BEDROCK": "1"}), both + moves)
+        self.assertEqual(runner.agent_features(spec, {"ANTHROPIC_BASE_URL": "http://192.168.100.20:4000"}),
+                         both + moves, "a gateway isn't Anthropic's own service")
         self.assertEqual(runner.agent_features(self.spec(preset="claude", usage_check=None), {}),
-                         both + ["limits", "remote_control"], "no usage_check settings, no Check limits")
+                         both + ["limits", "remote_control", "sign_out"] + moves, "no usage_check settings, no Check limits")
         self.assertEqual(runner.agent_features(self.spec(preset="claude", remote_control=None), {}),
-                         both + ["limits", "usage_check"], "no remote_control settings, no Remote Control")
+                         both + ["limits", "usage_check", "sign_out"] + moves, "no remote_control settings, no Remote Control")
+        self.assertEqual(runner.agent_features(self.spec(preset="claude", auth_logout=None), {}),
+                         both + ["limits", "usage_check", "remote_control"] + moves,
+                         "no auth_logout settings, no Sign out")
 
     def test_own_levels_lose_levels(self):
         spec = self.spec(preset="selftest", autonomy={"readonly": ["--permission-mode", "dontAsk"]})
         self.assertTrue(spec["autonomy_overridden"])
         self.assertEqual(runner.agent_features(spec, {}),
                          ["job_mcp", "approvals", "mcp_pick", "live", "summary", "limits", "usage_check",
-                          "remote_control"])
+                          "remote_control", "sign_out", "session_move"])
         spec = self.spec(preset="claude", autonomy_env={"full": {"X": "1"}})
         self.assertEqual(runner.agent_features(spec, {}),
                          ["job_mcp", "approvals", "mcp_pick", "live", "summary", "limits", "usage_check",
-                          "remote_control"])
+                          "remote_control", "sign_out", "session_move"])
         self.assertFalse(self.spec(preset="claude")["autonomy_overridden"])
         spec = self.spec(preset="claude", autonomy={"ask": None})
         self.assertNotIn("approvals", runner.agent_features(spec, {}), "no 'ask' level, no approvals")
 
     def test_job_tools_can_be_turned_off(self):
         self.assertEqual(runner.agent_features(self.spec(preset="claude", job_mcp=None), {}),
-                         ["mcp_pick", "live", "levels", "summary", "limits", "usage_check", "remote_control"],
+                         ["mcp_pick", "live", "levels", "summary", "limits", "usage_check", "remote_control",
+                          "sign_out", "session_move"],
                          "without the job tools nothing can ask the owner (a task's picked servers still reach it)")
 
     def test_live_needs_the_prompt_on_stdin(self):
@@ -330,13 +399,13 @@ class AgentFeatures(unittest.TestCase):
         self.assertEqual((st["one"]["auth"], st["tok"]["auth"], st["gem"]["auth"], st["txt"]["auth"]),
                          ("login", "token", "api_key", ""))
         self.assertEqual(st["one"]["features"], ["job_mcp", "approvals", "mcp_pick", "live", "levels", "summary",
-                                                 "limits", "usage_check", "remote_control"])
+                                                 "limits", "usage_check", "remote_control", "sign_out", "session_move"])
         self.assertEqual(st["tok"]["features"], ["job_mcp", "approvals", "mcp_pick", "live", "levels", "summary",
-                                                 "limits"])
+                                                 "limits", "session_move"])
         self.assertEqual(st["one"]["terminal"], "selftest --resume {session_id}")
         self.assertFalse(st["gone"]["ready"])
         self.assertEqual(st["gone"]["features"], ["job_mcp", "approvals", "mcp_pick", "live", "levels", "summary",
-                                                  "limits", "usage_check", "remote_control"],
+                                                  "limits", "usage_check", "remote_control", "sign_out", "session_move"],
                          "reported even when not installed")
 
 
@@ -1068,7 +1137,9 @@ class LimitStoreTests(unittest.TestCase):
         self.assertIn("w19", store.view("two")["windows"], "the newest are kept")
 
     def test_file_round_trip(self):
-        path = Path(tempfile.mkdtemp(prefix="bullpen-limits-")) / "limits.json"
+        folder = tempfile.mkdtemp(prefix="bullpen-limits-")
+        self.addCleanup(remove_tree, folder)
+        path = Path(folder) / "limits.json"
         store = runner.LimitStore(path)
         store.record("one", {"five_hour": self.obs(time.time(), used=0.4, status="allowed")},
                      {"using": False, "status": "rejected", "resets_at": None, "disabled_reason": "org_level_disabled",
@@ -1375,6 +1446,56 @@ class CheckLimits(TempDirCase):
         self.assertLess(time.monotonic() - started, 20)
 
 
+class InstallId(TempDirCase):
+    """The random id the hub tells computers apart by (a host name can change by itself, as on a Mac)."""
+
+    def test_made_once_then_kept(self):
+        path = Path(self.tmp) / "home" / "install-id"
+        first = runner.install_id(path)
+        self.assertRegex(first, r"^[0-9a-f]{32}$")
+        self.assertEqual(path.read_text(encoding="utf-8").strip(), first)
+        if POSIX:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(runner.install_id(path), first, "the same install keeps its id")
+        self.assertNotEqual(runner.install_id(Path(self.tmp) / "other" / "install-id"), first,
+                            "another install gets its own")
+        self.assertEqual([p.name for p in path.parent.iterdir()], ["install-id"], "no temporary file left behind")
+
+    def test_a_damaged_file_gets_a_new_id(self):
+        path = Path(self.tmp) / "install-id"
+        path.write_text("not an id\n", encoding="utf-8")
+        made = runner.install_id(path)
+        self.assertRegex(made, r"^[0-9a-f]{32}$")
+        self.assertEqual(runner.install_id(path), made)
+
+    def test_none_when_it_cant_be_saved(self):
+        # No id at all (the hub then compares host names), never one that changes at every start.
+        path = Path(self.tmp) / "install-id"
+        with mock.patch.object(runner, "write_private", side_effect=PermissionError("read-only")), \
+                self.assertLogs(runner.log, "WARNING") as logs:
+            self.assertEqual(runner.install_id(path), "")
+        self.assertIn("host name", logs.output[0])
+        self.assertFalse(path.exists())
+
+    def test_heartbeat_and_enrollment_send_it(self):
+        self.addCleanup(clean_auth_env().stop)
+        path = Path(self.tmp) / "runner.json"
+        path.write_text(json.dumps(make_cfg(self.tmp, {"one": {"preset": "selftest"}})), encoding="utf-8")
+        saved = runner.BASE_DIR / "install-id"
+        r = runner.Runner(path)
+        made = saved.read_text(encoding="utf-8").strip()
+        self.assertEqual(r.heartbeat_payload()["install_id"], made)
+        self.assertNotIn(made, json.dumps(r.heartbeat_payload()["info"]), "not in what the dashboard shows")
+        saved.unlink()
+        self.addCleanup(lambda: saved.unlink() if saved.exists() else None)
+        self.assertEqual(r.heartbeat_payload()["install_id"], made, "read once per run")
+        sent = []
+        with mock.patch.object(runner, "post_json", lambda url, payload, **kw: (sent.append(payload), (400, {}))[1]):
+            runner.enroll_with_code({}, "http://192.168.100.20:8080", "2345-6789-ABCD-EFGH")
+        self.assertRegex(sent[0]["install_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(sent[0]["install_id"], saved.read_text(encoding="utf-8").strip())
+
+
 class RunnerLimits(TempDirCase):
     def test_heartbeat_carries_limits(self):
         self.addCleanup(clean_auth_env().stop)
@@ -1397,6 +1518,22 @@ class RunnerLimits(TempDirCase):
         r.send_heartbeat()
         self.assertFalse(r.limits.changed.is_set(), "a check-in carries the figures")
         self.assertEqual(hub.calls, ["/api/runner/heartbeat"])
+
+    def test_paused_on_the_hub_is_logged_once_each_way(self):
+        self.addCleanup(clean_auth_env().stop)
+        path = Path(self.tmp) / "runner.json"
+        path.write_text(json.dumps(make_cfg(self.tmp, {"one": {"preset": "selftest"}})), encoding="utf-8")
+        r = runner.Runner(path)
+        replies = [{"cancel": []}, {"cancel": [], "paused": True}, {"cancel": [], "paused": True},
+                   {"cancel": []}, {"cancel": [], "paused": False}, {"cancel": [], "paused": False}]
+        r.hub = mock.Mock(call=lambda path, payload, timeout=30: (200, replies.pop(0)))
+        with self.assertLogs("runner", level="INFO") as logs:
+            for _ in range(6):
+                self.assertTrue(r.send_heartbeat())
+        said = [line for line in logs.output if "paused on the hub" in line or "resumed on the hub" in line]
+        self.assertEqual(len(said), 2, logs.output)  # an older hub's reply without "paused" changes nothing
+        self.assertIn("this machine is paused on the hub", said[0])
+        self.assertIn("this machine was resumed on the hub", said[1])
 
     def test_runner_test_and_limits_commands(self):
         self.addCleanup(clean_auth_env().stop)
@@ -1909,6 +2046,376 @@ class SelftestStep3(TempDirCase):
 
 
 # ------------------------------------------------------------------ Remote Control (step 3)
+# ------------------------------------------------------------------ sign-in status and sign-out
+# What Claude Code 2.1.326 prints for "claude auth status --json" (made-up values).
+AUTH_STATUS_FULL = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "analyticsDisabled": False,
+                    "projectsDirectory": "/home/me/.claude/projects", "configDirectory": "/home/me/.claude",
+                    "loginExpiresAt": "2026-12-13T21:22:22.061Z", "consoleProfileSignInOffered": True,
+                    "email": "someone@example.com", "orgId": "00000000-0000-4000-8000-000000000000",
+                    "orgName": "Example Org", "subscriptionType": "max", "storedClaudeAiLogin": True,
+                    "planTier": "max_20x"}
+
+
+class SignInParsing(unittest.TestCase):
+    def test_only_the_allowed_fields_are_kept(self):
+        out = runner.parse_auth_status(json.dumps(AUTH_STATUS_FULL, indent=2))
+        self.assertEqual(out, {"state": "in", "method": "claude.ai", "provider": "firstParty", "plan": "max",
+                               "tier": "max_20x", "expires_at": 1797196942.061})
+        text = json.dumps(out)
+        for value in ("someone@example.com", "Example Org", "00000000-0000", "/home/me"):
+            self.assertNotIn(value, text)
+
+    def test_signed_out_and_missing_fields(self):
+        self.assertEqual(runner.parse_auth_status('{"loggedIn": false, "authMethod": "none"}'),
+                         {"state": "out", "method": "none"})
+        self.assertEqual(runner.parse_auth_status('{"loggedIn": true}'), {"state": "in"})
+        self.assertEqual(runner.parse_auth_status(json.dumps({"loggedIn": True, "loginExpiresAt": "soon",
+                                                              "subscriptionType": None, "planTier": 5})),
+                         {"state": "in"}, "a value that isn't the expected kind is left out")
+
+    def test_odd_words_are_left_out(self):
+        out = runner.parse_auth_status(json.dumps({"loggedIn": True, "authMethod": "<img src=x>",
+                                                   "subscriptionType": "x" * 41, "planTier": "pro\nmax"}))
+        self.assertEqual(out, {"state": "in"})
+
+    def test_not_an_answer(self):
+        for text in ("", "Logged in using Claude.ai (Pro)", "error: unknown command 'auth'", "[1, 2]",
+                     '{"loggedIn": "yes"}', '{"authMethod": "claude.ai"}', "{not json}", "null"):
+            with self.subTest(text=text):
+                self.assertIsNone(runner.parse_auth_status(text))
+
+    def test_a_line_around_the_json(self):
+        text = "Refreshing sign-in…\n" + json.dumps({"loggedIn": True, "subscriptionType": "pro"}) + "\n"
+        self.assertEqual(runner.parse_auth_status(text), {"state": "in", "plan": "pro"})
+
+
+class SignInChecks(TempDirCase):
+    """The sign-in check and sign-out with the fake agent, which answers "auth status --json" like Claude Code."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in AUTH_VARS + ("SELFTEST_AUTH",):
+            os.environ.pop(key, None)
+        home = {"BULLPEN_HOME": self.tmp}
+        self.cfg = make_cfg(self.tmp, {"one": {"preset": "selftest", "env": dict(home)},
+                                       "two": {"preset": "selftest", "env": dict(home)},
+                                       "old": {"preset": "selftest", "env": {**home, "SELFTEST_AUTH": "old"}},
+                                       "text": {"preset": "selftest", "env": {**home, "SELFTEST_AUTH": "text"}},
+                                       "key": {"preset": "selftest", "env": {**home,
+                                                                             "ANTHROPIC_API_KEY": "sk-unit-key-0123456789"}},
+                                       "gem": {"preset": "gemini", "command": sys.executable},
+                                       "txt": {"preset": "text", "command": sys.executable}})
+
+    def spec_env(self, name: str) -> tuple:
+        spec = runner.agent_spec(self.cfg, name)
+        return spec, runner.build_env(spec)
+
+    def check(self, name: str) -> dict:
+        return runner.check_sign_in(*self.spec_env(name))
+
+    def test_signed_in(self):
+        out = self.check("one")
+        self.assertEqual({k: v for k, v in out.items() if k != "expires_at"},
+                         {"state": "in", "method": "claude.ai", "provider": "firstParty", "plan": "pro", "tier": "pro"})
+        self.assertGreater(out["expires_at"], time.time() + 20 * 86400)
+        self.assertNotIn("example.com", json.dumps(out))
+
+    def test_an_old_cli_is_never_asked(self):
+        spec, env = self.spec_env("old")
+        calls = []
+        real = runner.cli_run
+        with mock.patch.object(runner, "cli_run", side_effect=lambda argv, *a: calls.append(argv) or real(argv, *a)):
+            self.assertEqual(runner.check_sign_in(spec, env), {"state": "unknown", "why": "old"})
+        self.assertEqual([argv[-1] for argv in calls], ["--version"], "only its version is asked")
+
+    def test_text_instead_of_json(self):
+        self.assertEqual(self.check("text"), {"state": "unknown", "why": "error"})
+
+    def test_only_agents_with_a_full_login(self):
+        applies = {name: runner.sign_in_applies(*self.spec_env(name)) for name in self.cfg["agents"]}
+        self.assertEqual(applies, {"one": True, "two": True, "old": True, "text": True, "key": False, "gem": False,
+                                   "txt": False})
+
+    def test_sign_out_is_per_agent(self):
+        worked, text = runner.sign_out(*self.spec_env("one"))
+        self.assertTrue(worked)
+        self.assertIn("logged out", text)
+        self.assertEqual(self.check("one"), {"state": "out", "method": "none", "provider": "firstParty"})
+        self.assertEqual(self.check("two")["state"], "in", "the other agent keeps its login")
+
+    def test_sign_out_needs_a_cli_that_has_it(self):
+        worked, text = runner.sign_out(*self.spec_env("old"))
+        self.assertFalse(worked)
+        self.assertIn("Update Claude Code", text)
+        self.assertEqual(self.check("old"), {"state": "unknown", "why": "old"})
+
+    def test_the_agents_own_command_and_environment(self):
+        # A Claude agent with its own settings folder: the runner runs that agent's command, with its env.
+        cfg = {"agents": {"claude-work": {"preset": "claude", "command": "claude-work",
+                                          "env": {"CLAUDE_CONFIG_DIR": "~/.claude-work"}}}}
+        spec = runner.agent_spec(cfg, "claude-work")
+        os.environ["CLAUDECODE"] = "1"  # leaked in from a Claude Code session the runner was started from
+        env = runner.build_env(spec)
+        calls = []
+
+        def fake(argv, run_env, timeout):
+            calls.append((list(argv), dict(run_env)))
+            if argv[-1] == "--version":
+                return 0, "2.1.326 (Claude Code)\n", ""
+            if argv[1:] == ["auth", "status", "--json"]:
+                # A notice with braces on stderr doesn't spoil the answer on stdout.
+                return 1, '{"loggedIn": false, "authMethod": "none"}', "Note: settings {env} has an unknown key\n"
+            return 0, "Successfully logged out from your Anthropic account (someone@example.com).", ""
+
+        with mock.patch.object(runner, "resolve_command", return_value="/usr/local/bin/claude-work"), \
+                mock.patch.object(runner, "cli_run", side_effect=fake):
+            self.assertEqual(runner.check_sign_in(spec, env), {"state": "out", "method": "none"},
+                             "signed out, it exits 1 and still says so")
+            worked, text = runner.sign_out(spec, env)
+        self.assertTrue(worked)
+        self.assertNotIn("someone@example.com", text, "an email in its output is masked")
+        self.assertEqual([argv for argv, _ in calls],
+                         [["/usr/local/bin/claude-work", "--version"],
+                          ["/usr/local/bin/claude-work", "auth", "status", "--json"],
+                          ["/usr/local/bin/claude-work", "--version"],
+                          ["/usr/local/bin/claude-work", "auth", "logout"]])
+        for _, run_env in calls:
+            self.assertEqual(run_env["CLAUDE_CONFIG_DIR"], os.path.expanduser("~/.claude-work"))
+            self.assertNotIn("CLAUDECODE", run_env)
+        self.assertEqual(runner.cli_command(spec, env), "claude-work")
+
+    def test_the_login_command_follows_the_shell(self):
+        cfg = {"agents": {"work": {"preset": "claude", "env": {"CLAUDE_CONFIG_DIR": "/home/me/.claude-work"}}}}
+        spec = runner.agent_spec(cfg, "work")
+        signed_out = {"state": "out"}
+        with mock.patch.object(runner, "resolve_command", return_value="/usr/bin/claude"), \
+                mock.patch.object(runner.shutil, "which", return_value=None):
+            with mock.patch.object(runner, "IS_WINDOWS", False):
+                st = runner.agent_status(cfg, "work", sign_in=signed_out)
+                self.assertEqual(st["sign_in"]["command"], "CLAUDE_CONFIG_DIR=/home/me/.claude-work claude auth login")
+            with mock.patch.object(runner, "IS_WINDOWS", True):
+                st = runner.agent_status(cfg, "work", sign_in=signed_out)
+                self.assertEqual(st["sign_in"]["command"],
+                                 "$env:CLAUDE_CONFIG_DIR='/home/me/.claude-work'; claude auth login")
+
+    def test_readiness_follows_the_cli(self):
+        cfg = {"agents": {"claude": {"preset": "claude", "command": sys.executable,
+                                     "env": {"CLAUDE_CONFIG_DIR": os.path.join(self.tmp, "no-login-here")}},
+                          "key": {"preset": "claude", "command": sys.executable,
+                                  "env": {"ANTHROPIC_API_KEY": "sk-unit-key-0123456789"}},
+                          "gem": {"preset": "gemini", "command": sys.executable}}}
+        with mock.patch.object(runner, "IS_MACOS", True):
+            signed_in = runner.agent_status(cfg, "claude", sign_in={"state": "in", "plan": "pro"})
+            self.assertEqual((signed_in["ready"], signed_in["note"]), (True, ""),
+                             "the CLI sees a Mac's Keychain login, so no Keychain note")
+            self.assertEqual(signed_in["sign_in"]["plan"], "pro")
+            unknown = runner.agent_status(cfg, "claude", sign_in={"state": "unknown", "why": "old"})
+            self.assertTrue(unknown["ready"], "an unknown status never makes an agent not ready")
+            self.assertIn("Keychain", unknown["note"], "the old check, for a CLI too old to say")
+            self.assertEqual({k: v for k, v in unknown["sign_in"].items() if k != "command"},
+                             {"state": "unknown", "why": "old"})
+            self.assertTrue(unknown["sign_in"]["command"].endswith("claude auth login"))
+        with mock.patch.object(runner, "IS_MACOS", False):
+            out = runner.agent_status(cfg, "claude", sign_in={"state": "out"})
+            self.assertFalse(out["ready"])
+            self.assertIn("auth login' on this machine", out["note"])
+            self.assertFalse(runner.agent_status(cfg, "claude")["ready"], "no answer yet: the login file is looked for")
+            for name in ("key", "gem"):
+                st = runner.agent_status(cfg, name, sign_in={"state": "out"})
+                self.assertNotIn("sign_in", st, f"{name}: an API key isn't a sign-in")
+                self.assertTrue(st["ready"] or name == "gem")
+        self.assertNotIn("sign_in", runner.agent_status(cfg, "claude", sign_in={"state": "maybe"}))
+
+
+class SignInStoreTests(TempDirCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = [1000.0]
+        self.store = runner.SignInStore(clock=lambda: self.now[0])
+        self.cfg = make_cfg(self.tmp, {"one": {"preset": "selftest"}, "two": {"preset": "selftest"},
+                                       "key": {"preset": "selftest", "env": {"ANTHROPIC_API_KEY": "sk-unit-key-0123456789"}},
+                                       "gem": {"preset": "gemini", "command": sys.executable}})
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in AUTH_VARS:
+            os.environ.pop(key, None)
+
+    def key(self, name: str) -> tuple:
+        spec = runner.agent_spec(self.cfg, name)
+        return self.store.key(spec, runner.build_env(spec))
+
+    def test_how_often(self):
+        spec = runner.agent_spec(self.cfg, "one")
+        env = runner.build_env(spec)
+        answers = [{"state": "in", "plan": "pro"}, {"state": "in", "plan": "pro"}, {"state": "out"}]
+        with mock.patch.object(runner, "check_sign_in", side_effect=lambda s, e: dict(answers.pop(0))):
+            self.assertTrue(self.store.due("one", self.key("one")))
+            self.store.refresh("one", spec, env)
+            self.assertTrue(self.store.changed.is_set())
+            self.assertEqual(self.store.view("one", self.key("one")), {"state": "in", "plan": "pro", "checked_at": 1000.0})
+            self.now[0] += runner.SIGN_IN_EVERY - 1
+            self.assertFalse(self.store.due("one", self.key("one")), "signed in: every 10 minutes")
+            self.now[0] += 1
+            self.assertTrue(self.store.due("one", self.key("one")))
+            self.store.changed.clear()
+            self.store.refresh("one", spec, env)
+            self.assertFalse(self.store.changed.is_set(), "the same answer is no reason to check in early")
+            self.now[0] += runner.SIGN_IN_EVERY
+            self.store.refresh("one", spec, env)
+            self.assertTrue(self.store.changed.is_set())
+            self.now[0] += runner.SIGN_IN_RETRY
+            self.assertTrue(self.store.due("one", self.key("one")), "signed out: every minute")
+        self.assertIsNone(self.store.view("one", ("another", (), "")), "another program or folder: no answer")
+
+    def test_background_checks_skip_busy_and_other_agents(self):
+        checked = []
+        done = threading.Event()
+
+        def fake(spec, env):
+            checked.append(spec["name"])
+            done.set()
+            return {"state": "in"}
+
+        with mock.patch.object(runner, "check_sign_in", side_effect=fake):
+            self.store.refresh_due(self.cfg, running={"two"})
+            self.assertTrue(done.wait(10))
+            deadline = time.time() + 10
+            while self.store.busy and time.time() < deadline:
+                time.sleep(0.05)
+        self.assertEqual(checked, ["one"], "two runs a job; key has an API key; gem is Gemini")
+        self.assertEqual(self.store.view("one", self.key("one"))["state"], "in")
+
+    def test_heartbeat_carries_the_status_and_the_switch(self):
+        path = Path(self.tmp) / "runner.json"
+        path.write_text(json.dumps(self.cfg), encoding="utf-8")
+        real = runner.Runner(path)
+        spec = runner.agent_spec(real.cfg, "one")
+        with mock.patch.object(runner, "check_sign_in", return_value={"state": "out"}):
+            real.sign_in.refresh("one", spec, runner.build_env(spec))
+        payload = real.heartbeat_payload()
+        agents = {a["name"]: a for a in payload["agents"]}
+        self.assertEqual(agents["one"]["sign_in"]["state"], "out")
+        self.assertEqual(agents["one"]["sign_in"]["command"], "selftest auth login")
+        self.assertNotIn("sign_in", agents["two"], "not checked yet")
+        self.assertIs(payload["info"]["allow_remote_sign_out"], False, "off unless runner.json turns it on")
+        self.assertIn("sign_out", agents["one"]["features"])
+
+
+class SignOutAction(TempDirCase):
+    def setUp(self) -> None:
+        super().setUp()
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in AUTH_VARS + ("SELFTEST_AUTH",):
+            os.environ.pop(key, None)
+        home = {"BULLPEN_HOME": self.tmp}
+        self.cfg = make_cfg(self.tmp, {"one": {"preset": "selftest", "env": dict(home)},
+                                       "key": {"preset": "selftest", "env": {**home,
+                                                                             "ANTHROPIC_API_KEY": "sk-unit-key-0123456789"}}})
+        self.busy: set = set()
+        self.rc_view: list = []
+        self.stub = argparse.Namespace(cfg=self.cfg, hub=LocalHub(), name=lambda: "build-box",
+                                       sign_in=runner.SignInStore(), busy_agents=lambda: set(self.busy),
+                                       rc=argparse.Namespace(view=lambda: list(self.rc_view)))
+
+    def run_action(self, agent: str = "one") -> dict:
+        self.stub.hub = LocalHub()
+        job = runner.Job(self.stub, {"id": 61, "kind": "admin", "options": {"action": "auth.logout",
+                                                                             "params": {"agent": agent}}})
+        job.run()
+        return self.stub.hub.finished
+
+    def status(self, agent: str = "one") -> str:
+        spec = runner.agent_spec(self.cfg, agent)
+        return runner.check_sign_in(spec, runner.build_env(spec))["state"]
+
+    def test_off_by_default(self):
+        out = self.run_action()
+        self.assertEqual(out["status"], "error")
+        self.assertIn("allow_remote_sign_out", out["error"])
+        self.assertEqual(self.status(), "in", "nothing was run")
+
+    def test_signs_out_and_checks_again(self):
+        self.cfg["allow_remote_sign_out"] = True
+        out = self.run_action()
+        self.assertEqual(out["status"], "done", out)
+        self.assertEqual(out["result"], "one on build-box is signed out now. To sign in again, run "
+                                        "'selftest auth login' on build-box itself.")
+        self.assertIn("▶ selftest auth logout", self.stub.hub.lines)
+        spec = runner.agent_spec(self.cfg, "one")
+        self.assertEqual(self.stub.sign_in.view("one", self.stub.sign_in.key(spec, runner.build_env(spec)))["state"],
+                         "out", "the status is checked again right away")
+        self.assertEqual(self.status(), "out")
+
+    def test_waits_for_a_status_check_that_is_running(self):
+        # A background check is asking the CLI when Sign out arrives: the logout waits for it, and the answer
+        # kept at the end is the one asked after the logout.
+        self.cfg["allow_remote_sign_out"] = True
+        started, go = threading.Event(), threading.Event()
+        order: list = []
+        real_check, real_sign_out = runner.check_sign_in, runner.sign_out
+
+        def slow_check(spec, env):
+            if not order:
+                order.append("check started")
+                started.set()
+                go.wait(10)
+                order.append("check ended")
+                return {"state": "in", "plan": "pro"}
+            order.append("check after")
+            return real_check(spec, env)
+
+        def logged_out(spec, env):
+            order.append("logout")
+            return real_sign_out(spec, env)
+
+        spec = runner.agent_spec(self.cfg, "one")
+        with mock.patch.object(runner, "check_sign_in", side_effect=slow_check), \
+                mock.patch.object(runner, "sign_out", side_effect=logged_out):
+            with self.stub.sign_in.lock:
+                self.stub.sign_in.busy.add("one")
+            background = threading.Thread(target=self.stub.sign_in._refresh_quietly,
+                                          args=("one", spec, runner.build_env(spec)))
+            background.start()
+            self.assertTrue(started.wait(10))
+            action = threading.Thread(target=self.run_action)
+            action.start()
+            time.sleep(0.5)
+            self.assertEqual(order, ["check started"], "the logout waits")
+            go.set()
+            background.join(10)
+            action.join(30)
+        self.assertEqual(order, ["check started", "check ended", "logout", "check after"])
+        self.assertEqual(self.stub.hub.finished.get("status"), "done", self.stub.hub.finished)
+        key = self.stub.sign_in.key(spec, runner.build_env(spec))
+        self.assertEqual(self.stub.sign_in.view("one", key)["state"], "out")
+
+    def test_a_background_check_skips_while_signing_out(self):
+        spec = runner.agent_spec(self.cfg, "one")
+        lock = self.stub.sign_in.agent_lock("one")
+        with lock, mock.patch.object(runner, "check_sign_in") as check:
+            self.stub.sign_in._refresh_quietly("one", spec, runner.build_env(spec))
+        check.assert_not_called()
+        self.assertNotIn("one", self.stub.sign_in.busy, "it is due again at the next pass")
+
+    def test_refused_while_busy_or_without_a_login(self):
+        self.cfg["allow_remote_sign_out"] = True
+        self.busy.add("one")
+        self.assertIn("is running a job", self.run_action()["error"])
+        self.busy.clear()
+        self.rc_view.append({"agent": "one", "project": "myapp", "state": "running"})
+        self.assertIn("Remote Control is running", self.run_action()["error"])
+        self.rc_view.clear()
+        self.assertIn("no claude.ai login", self.run_action("key")["error"])
+        self.assertIn("no agent called 'nobody'", self.run_action("nobody")["error"])
+        self.assertEqual(self.status(), "in")
+
+
 class RemoteControlTests(TempDirCase):
     def setUp(self) -> None:
         super().setUp()
@@ -1923,13 +2430,15 @@ class RemoteControlTests(TempDirCase):
                   "apikey": {"preset": "selftest", "env": {"ANTHROPIC_API_KEY": "sk-unit-apikey-0123456789"}},
                   "fresh": {"preset": "selftest", "env": {"SELFTEST_RC": "untrusted"}},
                   "tok": {"preset": "selftest", "env": {"SELFTEST_RC": "token"}},
-                  "slow": {"preset": "selftest", "env": {"SELFTEST_RC": "nourl"}}}
+                  "slow": {"preset": "selftest", "env": {"SELFTEST_RC": "nourl"}},
+                  "busy": {"preset": "selftest", "env": {"SELFTEST_RC": "busy"}},
+                  "oops": {"preset": "selftest", "env": {"SELFTEST_RC": "error"}}}
         self.cfg = make_cfg(self.tmp, agents)
         self.cfg["projects"]["myapp"] = str(self.project)
         self.cfg["allow_remote_control"] = True
         self.rc = runner.RemoteControl(argparse.Namespace(cfg=self.cfg, name=lambda: "build-box"))
         self.rc.state_file = Path(self.tmp) / "remote-control.json"
-        self.addCleanup(self.rc.stop_all)
+        self.addCleanup(stop_remote_control, self.rc)
 
     def pid_file(self, agent: str) -> Path:
         return runner.BASE_DIR / "selftest" / f"rc-build-box-myapp-{agent}.pid"
@@ -2001,6 +2510,26 @@ class RemoteControlTests(TempDirCase):
         self.assertEqual((entry["state"], entry["url"], entry["note"]),
                          ("running", None, "started, but hasn't shown its address"))
 
+    def test_an_error_line_fails_the_start_and_stops_the_server(self):
+        # Claude Code prints "Error: ..." and stays up about a minute before it exits; Start mustn't call that running.
+        for agent, words in (("busy", "Remote Control is already running for this folder from a terminal on "
+                                      "build-box (`selftest remote-control`). Stop that one first (Ctrl+C in its "
+                                      "terminal)"),
+                             ("oops", "Remote Control didn't start on build-box: Claude Code reported an error.")):
+            began = time.monotonic()
+            out = self.rc.start(agent, "myapp")
+            self.assertLess(time.monotonic() - began, 10, "it doesn't wait for the address, or for the server to exit")
+            self.assertEqual(out["status"], "error", out)
+            self.assertIn(words, out["error"])
+            self.assertIn("Its last lines:\nError: ", out["error"])
+            self.assertNotIn("exit code", out["error"])
+            entry = self.rc.servers[(agent, "myapp")]
+            self.assertIsNotNone(entry["proc"].poll(), "the server was stopped, not left to exit by itself")
+            self.assertEqual((entry["state"], entry["url"]), ("failed", None))
+            self.assertIsNotNone(entry["ended"])
+        self.assertIn("already served by a terminal", self.rc.servers[("busy", "myapp")]["error"])
+        self.assertEqual(read_json(self.rc.state_file)["servers"], [], "nothing is left to start again")
+
     def test_failures_get_a_clear_message(self):
         out = self.rc.start("fresh", "myapp")
         self.assertEqual(out["status"], "error")
@@ -2071,6 +2600,178 @@ class RemoteControlTests(TempDirCase):
             self.rc.restore()
             time.sleep(0.5)
             self.assertEqual(self.rc.view(), [])
+
+    # -- "Start again when the runner starts" ------------------------------------------------------------
+    def next_runner(self) -> "runner.RemoteControl":
+        """The Remote Control of the next runner on this machine (after a reboot, say), reading the same state file."""
+        later = runner.RemoteControl(argparse.Namespace(cfg=self.cfg, name=lambda: "build-box"))
+        later.state_file = self.rc.state_file
+        self.addCleanup(stop_remote_control, later)
+        return later
+
+    def settled(self, rc, *pairs) -> list:
+        """Wait until nothing is being started again and each pair has a row that isn't starting; their rows."""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            rows = {(e["agent"], e["project"]): e for e in rc.view()}
+            with rc.lock:
+                busy = bool(rc.restarting)
+            if not busy and all(p in rows and rows[p]["state"] != "starting" for p in pairs):
+                return [rows[p] for p in pairs]
+            time.sleep(0.1)
+        self.fail(f"still starting: {rc.view()}")
+
+    def choose(self, *items) -> None:
+        """A state file whose servers were chosen to start with the runner: (agent, project, started)."""
+        self.rc.state_file.write_text(json.dumps({"servers": [], "at": time.time(), "restart_after_update": [],
+                                                  "start_with_runner": [{"agent": a, "project": p, "started": s}
+                                                                        for a, p, s in items]}), encoding="utf-8")
+
+    def test_the_choice_is_kept_through_a_runner_stop_and_started_again(self):
+        out = self.rc.start("one", "myapp", keep=True)
+        self.assertEqual(out["status"], "done", out)
+        self.assertIn("If the runner restarts before then (after a reboot, say), it starts this server again.",
+                      out["result"])
+        entry = self.rc.view()[0]
+        self.assertIs(entry["start_with_runner"], True)
+        since = entry["since"]
+        self.assertEqual(read_json(self.rc.state_file)["start_with_runner"],
+                         [{"agent": "one", "project": "myapp", "started": since}])
+        self.rc.stop_all(why="the runner stopped")  # SIGTERM at shutdown: the choice stays
+        self.assertEqual(read_json(self.rc.state_file)["start_with_runner"],
+                         [{"agent": "one", "project": "myapp", "started": since}])
+        later = self.next_runner()
+        later.restore()
+        time.sleep(0.5)
+        self.assertEqual(later.view(), [], "nothing starts before the runner has checked in with the hub")
+        self.assertEqual(read_json(later.state_file)["start_with_runner"],
+                         [{"agent": "one", "project": "myapp", "started": since}], "restore's own save keeps it")
+        with mock.patch.object(later, "start", wraps=later.start) as start:
+            later.start_chosen()
+            [row] = self.settled(later, ("one", "myapp"))
+            later.start_chosen()  # the next check-ins
+            later.start_chosen()
+        self.assertEqual(start.call_count, 1, "once per runner")
+        self.assertEqual((row["state"], row["since"], row["start_with_runner"]), ("running", since, True),
+                         "the time limit still counts from the first start, and it stays chosen")
+        self.assertEqual(read_json(later.state_file)["start_with_runner"],
+                         [{"agent": "one", "project": "myapp", "started": since}])
+
+    def test_a_plain_start_is_not_kept(self):
+        self.assertEqual(self.rc.start("one", "myapp")["status"], "done")
+        self.assertIs(self.rc.view()[0]["start_with_runner"], False)
+        self.assertEqual(read_json(self.rc.state_file)["start_with_runner"], [])
+
+    def test_stop_and_the_time_limit_clear_the_choice(self):
+        stub = argparse.Namespace(cfg=self.cfg, hub=LocalHub(), name=lambda: "build-box", rc=self.rc)
+        runner.Job(stub, {"id": 61, "kind": "admin", "options": {"action": "rc.start", "params": {
+            "agent": "one", "project": "myapp", "start_with_runner": "1"}}}).run()
+        self.assertEqual(stub.hub.finished["status"], "done", stub.hub.finished)
+        self.assertIs(self.rc.view()[0]["start_with_runner"], True, "the dashboard's choice reaches the runner")
+        runner.Job(stub, {"id": 62, "kind": "admin", "options": {"action": "rc.stop", "params": {
+            "agent": "one", "project": "myapp"}}}).run()
+        self.assertEqual(read_json(self.rc.state_file)["start_with_runner"], [], "stopped on purpose: stays stopped")
+        later = self.next_runner()
+        later.restore()
+        later.start_chosen()
+        time.sleep(0.5)
+        self.assertEqual(later.view(), [])
+
+        self.assertEqual(self.rc.start("one", "myapp", keep=True)["status"], "done")
+        self.rc.clock = lambda: time.time() + 8 * 3600 + 5
+        self.rc.enforce()
+        self.assertEqual(self.rc.view()[0]["note"], "stopped after 8 hours")
+        self.assertEqual(read_json(self.rc.state_file)["start_with_runner"], [], "its hours are up")
+
+        self.rc.clock = time.time
+        self.assertEqual(self.rc.start("one", "myapp", keep=True)["status"], "done")
+        self.cfg["allow_remote_control"] = False
+        self.rc.enforce()
+        self.assertEqual(read_json(self.rc.state_file)["start_with_runner"], [], "turned off in runner.json")
+
+    def test_a_machine_that_no_longer_allows_it_or_is_paused_starts_nothing(self):
+        for allowed, paused, why in ((False, False, "this machine no longer allows Remote Control "
+                                                    "(allow_remote_control in its runner.json)"),
+                                     (True, True, "this machine is paused on the hub")):
+            self.cfg["allow_remote_control"] = allowed
+            self.choose(("one", "myapp", time.time()))
+            later = self.next_runner()
+            later.restore()
+            with self.assertLogs(runner.log, "WARNING") as logs:
+                later.start_chosen(paused=paused)
+            self.assertEqual(logs.output, [f"WARNING:runner:remote control: not starting one in myapp again: {why}"])
+            time.sleep(0.5)
+            self.assertEqual(later.view(), [])
+            self.assertEqual(read_json(later.state_file)["start_with_runner"], [], "and it isn't tried again")
+
+    def test_a_server_whose_time_is_up_is_not_started_again(self):
+        self.choose(("one", "myapp", time.time() - 8 * 3600 - 60))
+        later = self.next_runner()
+        later.restore()
+        with self.assertLogs(runner.log, "INFO") as logs:
+            later.start_chosen()
+        self.assertIn("INFO:runner:remote control: not starting one in myapp again: its 8 hours are up", logs.output)
+        time.sleep(0.5)
+        self.assertEqual(later.view(), [])
+        self.assertEqual(read_json(later.state_file)["start_with_runner"], [])
+
+    def test_a_start_again_that_fails_is_shown_and_not_tried_again(self):
+        now = time.time()
+        # "oops" prints an Error: line and stays up (it fails the start); "gone" names a project that was removed.
+        self.choose(("oops", "myapp", now), ("one", "gone", now))
+        later = self.next_runner()
+        later.restore()
+        with mock.patch.object(later, "start", wraps=later.start) as start, \
+                self.assertLogs(runner.log, "WARNING") as logs:
+            later.start_chosen()
+            oops, gone = self.settled(later, ("oops", "myapp"), ("one", "gone"))
+            later.start_chosen()
+            later.enforce()
+        self.assertEqual(start.call_count, 2, "each one is tried once")
+        self.assertEqual(oops["state"], "failed")
+        self.assertTrue(oops["error"].startswith("Didn't start again when the runner started. Remote Control didn't "
+                                                 "start on build-box: Claude Code reported an error."), oops["error"])
+        self.assertIn("Its last lines:\nError: ", oops["error"])
+        self.assertIsNotNone(later.servers[("oops", "myapp")]["proc"].poll(), "the server was stopped")
+        self.assertEqual((gone["state"], gone["error"], gone["name"], gone["start_with_runner"]),
+                         ("failed", "Didn't start again when the runner started. There is no project called 'gone' "
+                                    "on build-box.", "build-box gone (one)", False))
+        said = sorted(r.getMessage() for r in logs.records)
+        self.assertEqual(said, ["remote control: one in gone didn't start again when the runner started: There is no "
+                                "project called 'gone' on build-box.",
+                                "remote control: oops in myapp didn't start again when the runner started: Remote "
+                                "Control didn't start on build-box: Claude Code reported an error."])
+        self.assertEqual(read_json(later.state_file)["start_with_runner"], [], "cleared: not tried at the next start")
+        # Shown for longer than other failures (until its time would have been up), then gone.
+        later.clock = lambda: now + runner.RC_KEEP_ENDED + 60
+        later.enforce()
+        self.assertEqual(len(later.view()), 2)
+        later.clock = lambda: now + 8 * 3600 + 60
+        later.enforce()
+        self.assertEqual(later.view(), [])
+        # Stop takes such a row off the page at once.
+        third = self.next_runner()
+        self.choose(("one", "gone", now))
+        third.restore()
+        with self.assertLogs(runner.log, "WARNING"):
+            third.start_chosen()
+            self.settled(third, ("one", "gone"))
+        self.assertEqual(third.stop("one", "gone")["status"], "done")
+        self.assertEqual(third.view(), [])
+
+    def test_a_server_both_updated_and_chosen_starts_once(self):
+        now = time.time()
+        self.rc.state_file.write_text(json.dumps({
+            "servers": [], "at": now, "restart_after_update": [{"agent": "one", "project": "myapp", "started": now}],
+            "start_with_runner": [{"agent": "one", "project": "myapp", "started": now}]}), encoding="utf-8")
+        later = self.next_runner()
+        with mock.patch.object(later, "start", wraps=later.start) as start:
+            later.restore()
+            later.start_chosen()
+            [row] = self.settled(later, ("one", "myapp"))
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual((row["state"], row["since"], row["start_with_runner"]), ("running", now, True),
+                         "started after the update, still chosen")
 
     def restart_state(self) -> None:
         """The state file as an update leaves it: one server to start again, saved just now."""
@@ -2203,12 +2904,17 @@ class RemoteControlTests(TempDirCase):
         info = real.heartbeat_payload()["info"]
         self.assertEqual((info["allow_remote_control"], info["remote_control_max_hours"], info["remote_control"]),
                          (True, 8, []))
+        self.assertIs(info["remote_control_start_with_runner"], True, "the dashboard may offer the choice")
         real.rc = mock.Mock()
         real.rc.view.return_value = []
         with mock.patch.object(real.hub, "call", return_value=(401, {"detail": "no"})):
             for _ in range(5):
                 real.send_heartbeat()
-        real.rc.stop_all.assert_called_once_with(why="the hub no longer accepts this machine")
+        real.rc.stop_all.assert_called_once_with(why="the hub no longer accepts this machine", forget=True)
+        real.rc.start_chosen.assert_not_called()  # only after a check-in the hub accepted
+        with mock.patch.object(real.hub, "call", return_value=(200, {"cancel": [], "paused": True})):
+            real.send_heartbeat()
+        real.rc.start_chosen.assert_called_once_with(paused=True)
 
 
 # ------------------------------------------------------------------ tags and subtasks (step 4)
@@ -2256,7 +2962,9 @@ class InitTags(unittest.TestCase):
         with mock.patch.object(runner, "PLATFORM", "linux"):
             self.assertEqual(runner.heartbeat_tags({"tags": words}), sorted(words[:15] + ["linux"]))
             self.assertEqual(runner.heartbeat_tags({"tags": ["macos"] + words[:15]}), sorted(words[:15] + ["linux"]))
-        path = Path(tempfile.mkdtemp(prefix="bullpen-unit-")) / "runner.json"
+        folder = tempfile.mkdtemp(prefix="bullpen-unit-")
+        self.addCleanup(remove_tree, folder)
+        path = Path(folder) / "runner.json"
         path.write_text(json.dumps({"name": "build-box", "hub_url": "http://127.0.0.1:9", "agents": {},
                                     "tags": words + ["Bad!"]}), encoding="utf-8")
         out = io.StringIO()
@@ -4714,6 +5422,7 @@ class GeminiQuotaWords(unittest.TestCase):
     def test_a_quota_crash_keeps_its_last_lines(self):
         """A Gemini CLI that exits without a result: the message says quota, and its own lines stay."""
         tmp = tempfile.mkdtemp(prefix="bullpen-unit-")
+        self.addCleanup(remove_tree, tmp)
         script = ("import sys; sys.stderr.write('_ApiError: {\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\"}}"
                   "\\nTypeError: boom\\n'); sys.exit(1)")
         cfg = make_cfg(tmp, {"gem": {"preset": "gemini", "command": sys.executable, "args": ["-c", script]}})
@@ -4834,7 +5543,7 @@ class WindowsJobObjectTests(TempDirCase):
         cfg["allow_remote_control"] = True
         rc = runner.RemoteControl(argparse.Namespace(cfg=cfg, name=lambda: "build-box"))
         rc.state_file = Path(self.tmp) / "remote-control.json"
-        self.addCleanup(rc.stop_all)
+        self.addCleanup(stop_remote_control, rc)
         with mock.patch.dict(os.environ):
             for key in AUTH_VARS + ("SELFTEST_RC",):
                 os.environ.pop(key, None)
@@ -4993,10 +5702,152 @@ class OnDemandServers(TempDirCase):
         path.write_text(json.dumps({**make_cfg(self.tmp, {}), "manage_agent_settings": False}), encoding="utf-8")
         r = runner.Runner(path)
         sent: list = []
-        with mock.patch.object(runner, "CONTEXT_DIR", Path(self.tmp) / "context"):
+        with mock.patch.object(runner, "CONTEXT_DIR", Path(self.tmp) / "context"), \
+                mock.patch.object(runner, "MCP_TOKEN_FILE", Path(self.tmp) / "mcp-token.json"):
             r.hub = mock.Mock(call=lambda path, payload, timeout=30: sent.append((path, payload)) or (200, self.context()))
             self.assertEqual(r.sync_from_hub()["status"], "done")
-        self.assertEqual(sent, [("/api/runner/context", {"features": ["hub-route", "on-demand"]})])
+        self.assertEqual(sent, [("/api/runner/context", {"features": ["hub-route", "on-demand", "machine-mcp-token"]})])
+
+
+class MachineMcpToken(TempDirCase):
+    """A machine with its own runner token gets an MCP token of its own from the hub (mcp_token_kind "machine"). The
+    hub keeps only its sha256, so the runner keeps it in a private file, sends it back at each sync, and writes it
+    into the agents' settings in place of the shared one. A new one (after New MCP token on the dashboard) replaces
+    it; a hub that offers none (a machine on the shared runner token, or an older hub) gets the shared one used."""
+
+    T1 = "bpm_" + "One1-" * 8 + "abc"
+    T2 = "bpm_" + "Two2-" * 8 + "xyz"
+    SHARED = "shared-" + "S" * 36
+    HUB = "http://127.0.0.1:9"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.token_file = Path(self.tmp) / "home" / "mcp-token.json"
+        for patch in (mock.patch.object(runner, "MCP_TOKEN_FILE", self.token_file),
+                      mock.patch.object(runner, "CONTEXT_DIR", Path(self.tmp) / "context")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        path = Path(self.tmp) / "runner.json"
+        path.write_text(json.dumps({**make_cfg(self.tmp, {}), "manage_agent_settings": False}), encoding="utf-8")
+        self.runner = runner.Runner(path)
+        self.sent: list = []
+        self.answer: dict = {}
+        self.runner.hub = mock.Mock(call=lambda path, payload, timeout=30: self.sent.append(payload) or (200, dict(self.answer)))
+
+    def context(self, token: str, kind: str | None) -> dict:
+        ctx = {"version": "v-" + token[-3:], "files": {}, "kit": {}, "mcp_enabled": True, "mcp_token": token,
+               "servers": [], "platforms": ["linux", "macos", "windows"]}
+        if kind:
+            ctx["mcp_token_kind"] = kind
+        return ctx
+
+    def sync(self, token: str, kind: str | None = "machine") -> None:
+        self.answer = self.context(token, kind)
+        with self.assertLogs(runner.log, level="DEBUG") as logs:
+            runner.log.debug("sync")  # assertLogs needs one line at least
+            self.assertEqual(self.runner.sync_from_hub()["status"], "done")
+        for line in logs.output:
+            self.assertNotIn(token, line, "the MCP token is never logged")
+
+    def kept(self) -> dict:
+        return json.loads(self.token_file.read_text(encoding="utf-8"))
+
+    def test_the_runner_keeps_its_own_token_and_sends_it_back(self):
+        self.sync(self.T1)
+        self.assertNotIn("mcp_token", self.sent[0], "nothing held yet")
+        self.assertEqual(self.kept(), {"hub_url": self.HUB, "token": self.T1})
+        if not runner.IS_WINDOWS:
+            self.assertEqual(stat.S_IMODE(self.token_file.stat().st_mode), 0o600)
+        self.assertEqual(self.runner.last_context["mcp_token"], self.T1, "its agents and jobs get its own token")
+        self.sync(self.T1)
+        self.assertEqual(self.sent[1]["mcp_token"], self.T1, "sent back, so the hub keeps it")
+        self.assertIn("machine-mcp-token", self.sent[1]["features"])
+        # New MCP token on the dashboard: the hub hands out another one, which replaces the kept one.
+        self.sync(self.T2)
+        self.assertEqual(self.kept()["token"], self.T2)
+        self.assertEqual(self.runner.last_context["mcp_token"], self.T2)
+        self.assertEqual(sorted(p.name for p in self.token_file.parent.iterdir()), ["mcp-token.json"],
+                         "written in one step: no temporary file left")
+        self.assertNotIn(self.T2, json.dumps(self.runner.heartbeat_payload()))
+
+    def test_the_shared_token_when_the_hub_offers_none(self):
+        self.sync(self.T1)
+        self.sync(self.SHARED, kind="shared")
+        self.assertFalse(self.token_file.exists(), "a kept token the hub no longer offers is removed")
+        self.assertEqual(self.runner.last_context["mcp_token"], self.SHARED)
+        self.sync(self.T1)
+        self.sync(self.SHARED, kind=None)  # a hub from before per-machine MCP tokens
+        self.assertFalse(self.token_file.exists())
+        self.assertEqual(self.runner.last_context["mcp_token"], self.SHARED)
+        self.sync(self.SHARED, kind="shared")
+        self.assertNotIn("mcp_token", self.sent[-1], "nothing held any more, so nothing sent")
+
+    def test_a_token_from_another_hub_or_of_another_shape_is_never_sent(self):
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        self.token_file.write_text(json.dumps({"hub_url": "http://192.168.100.20:8080", "token": self.T1}), encoding="utf-8")
+        self.sync(self.T2)
+        self.assertNotIn("mcp_token", self.sent[0])
+        self.assertEqual(self.kept(), {"hub_url": self.HUB, "token": self.T2})
+        self.token_file.write_text(json.dumps({"hub_url": self.HUB, "token": "not a token"}), encoding="utf-8")
+        self.sync(self.T1)
+        self.assertNotIn("mcp_token", self.sent[1])
+        self.token_file.write_text("{broken", encoding="utf-8")
+        self.sync(self.T2)
+        self.assertNotIn("mcp_token", self.sent[2])
+        self.assertEqual(self.kept()["token"], self.T2)
+
+    def test_the_agents_settings_get_the_machines_token_and_a_new_one_replaces_it(self):
+        gemini = Path(self.tmp) / "gemini-home" / ".gemini"
+        gemini.mkdir(parents=True)
+        settings = gemini / "settings.json"
+        settings.write_text(json.dumps({"theme": "x", "mcpServers": {"mine": {"url": "https://example.com/mcp"}}}),
+                            encoding="utf-8")
+        cfg = make_cfg(self.tmp, {})
+
+        def wire(token: str) -> dict:
+            wiring = runner.Wiring(cfg, {**self.context(token, "machine"),
+                                         "servers": [OnDemandServers.server("relayed", route="hub", targets=["gemini"])]},
+                                   lambda *a: None)
+            wiring.gemini_dir = gemini
+            state = Path(self.tmp) / "wired.json"
+            wiring.state = json.loads(state.read_text(encoding="utf-8")) if state.exists() else {}  # as Wiring.run does
+            with mock.patch.object(runner, "STATE_FILE", state):
+                wiring.gemini()
+            self.assertEqual(wiring.notes, [])
+            return read_json(settings)
+
+        first = wire(self.T1)
+        auth = {name: first["mcpServers"][name]["headers"]["Authorization"] for name in ("bullpen", "relayed")}
+        self.assertEqual(auth, {"bullpen": "Bearer " + self.T1, "relayed": "Bearer " + self.T1})
+        second = wire(self.T2)
+        self.assertEqual(second["mcpServers"]["bullpen"]["headers"]["Authorization"], "Bearer " + self.T2)
+        self.assertEqual(second["mcpServers"]["relayed"]["headers"]["Authorization"], "Bearer " + self.T2)
+        self.assertNotIn(self.T1, settings.read_text(encoding="utf-8"), "the old token is gone")
+        self.assertEqual((second["theme"], list(second["mcpServers"])[0]), ("x", "mine"), "the user's own settings stay")
+        self.assertEqual([p.name for p in gemini.iterdir() if "tmp" in p.name], [], "written in one step")
+        if not runner.IS_WINDOWS:
+            self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
+
+    def test_claude_code_gets_the_new_token_through_its_own_cli(self):
+        cfg_dir = Path(self.tmp) / "claude-home"
+        cfg_dir.mkdir()
+        hub = self.HUB + "/mcp"
+        old = {"type": "http", "url": hub, "headers": {"Authorization": "Bearer " + self.T1, "X-Bullpen-Agent": "claude@build-box"}}
+        (cfg_dir / ".claude.json").write_text(json.dumps({"mcpServers": {"bullpen": old}}), encoding="utf-8")
+        cfg = make_cfg(self.tmp, {"claude": {"preset": "claude", "env": {"CLAUDE_CONFIG_DIR": str(cfg_dir)}}})
+        calls: list = []
+        wiring = runner.Wiring(cfg, self.context(self.T2, "machine"), lambda *a: None)
+        with mock.patch.object(runner, "resolve_command", return_value="claude-cli"), \
+                mock.patch.object(runner, "STATE_FILE", Path(self.tmp) / "wired.json"), \
+                mock.patch.object(runner.Wiring, "run_cli", lambda _self, argv, env: calls.append(argv) or True):
+            wiring.claude()
+        new = {**old, "headers": {**old["headers"], "Authorization": "Bearer " + self.T2}}
+        self.assertEqual(calls, [["claude-cli", "mcp", "remove", "-s", "user", "bullpen"],
+                                 ["claude-cli", "mcp", "add-json", "-s", "user", "bullpen", json.dumps(new)]])
+
+    def test_the_token_shape_is_masked(self):
+        token = "bpm_" + "k" * 43
+        self.assertEqual(runner.redact(f"header Authorization {token} end"), "header Authorization *** end")
 
 
 class JobMcpPicks(TempDirCase):
@@ -5735,6 +6586,155 @@ class PrivateFiles(TempDirCase):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
+class LaunchdLogging(unittest.TestCase):
+    """Under the setup's launchd agent, stderr is ~/.bullpen/launchd.log, which nothing rotates: log lines go
+    only to the rotated runner.log. Under systemd and in a terminal they also go to stderr (journald, the screen)."""
+
+    def handlers_with(self, env: dict) -> list:
+        seen = []
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(runner.logging, "basicConfig", lambda **kw: seen.extend(kw["handlers"])):
+            runner.setup_logging()
+        for h in seen:
+            h.close()  # Windows keeps the file open otherwise
+        return [type(h).__name__ for h in seen]
+
+    def test_launchd_gets_only_the_rotated_file(self):
+        both = ["RotatingFileHandler", "StreamHandler"]
+        self.assertEqual(self.handlers_with({}), both)
+        self.assertEqual(self.handlers_with({"XPC_SERVICE_NAME": "0"}), both, "Terminal on a Mac")
+        self.assertEqual(self.handlers_with({"XPC_SERVICE_NAME": "application.com.example.term"}), both)
+        self.assertEqual(self.handlers_with({"BULLPEN_SERVICE": "launchd"}), ["RotatingFileHandler"])
+        self.assertEqual(self.handlers_with({"XPC_SERVICE_NAME": "bullpen.runner"}), ["RotatingFileHandler"],
+                         "an agent made by an older setup, without BULLPEN_SERVICE")
+
+
+class HomeGuard(TempDirCase):
+    """tests/home_guard.py: a runner under test never gets the real home folder, and a test that writes there
+    anyway fails. Only temporary folders here."""
+
+    def folder(self, name: str) -> Path:
+        path = Path(self.tmp) / name  # a new one each time: home_guard remembers homes it has checked
+        path.mkdir()
+        return path
+
+    def test_an_environment_that_sets_only_home_is_refused_on_windows(self):
+        home = self.folder("only-home")
+        env = {k: v for k, v in os.environ.items() if k not in ("USERPROFILE", "HOMEDRIVE", "HOMEPATH")}
+        env["USERPROFILE"] = str(self.folder("elsewhere"))  # what HOME alone leaves Windows with
+        env["HOME"] = str(home)
+        if os.name == "nt":
+            with self.assertRaisesRegex(AssertionError, "isn't isolated"):
+                home_guard.check_home(env, home)
+        self.assertTrue(home_guard.same_path(home_guard.home_env(home)["HOME"], home))
+
+    def test_a_home_somewhere_else_is_refused(self):
+        env = home_guard.set_home(dict(os.environ), self.folder("a"))
+        with self.assertRaisesRegex(AssertionError, "Stopped before any runner started"):
+            home_guard.check_home(env, self.folder("b"))
+
+    def test_home_env(self):
+        home = self.folder("h")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/elsewhere", "GEMINI_CLI_HOME": "/elsewhere"}):
+            env = home_guard.home_env(home, BULLPEN_AGENT="x")
+        self.assertEqual((env["BULLPEN_HOME"], env["BULLPEN_AGENT"]), (str(home / ".bullpen"), "x"))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", env)
+        self.assertNotIn("GEMINI_CLI_HOME", env)
+        if os.name == "nt":
+            self.assertEqual(env["USERPROFILE"], str(home))
+            self.assertEqual(env["HOMEDRIVE"] + env["HOMEPATH"], str(home))
+
+    def test_the_snapshot_sees_what_the_runner_writes(self):
+        home = self.folder("real")
+        claude_json = home / ".claude.json"
+        claude_json.write_text(json.dumps({"numStartups": 1}), encoding="utf-8")
+        before = home_guard.snapshot([home])
+        claude_json.write_text(json.dumps({"numStartups": 2}), encoding="utf-8")
+        self.assertEqual(home_guard.changed(before), [], "Claude Code's own keys change all the time")
+        self.assertEqual(home_guard.report(before, "x"), "")
+        (home / ".claude").mkdir()
+        (home / ".claude" / "CLAUDE.md").write_text("@~/somewhere/shared.md\n", encoding="utf-8")
+        claude_json.write_text(json.dumps({"numStartups": 2, "mcpServers": {"bullpen": {"url": "u"}}}),
+                               encoding="utf-8")
+        skill = home / ".claude" / "skills" / "remember" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("x", encoding="utf-8")
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "bullpen.cmd").write_text("x", encoding="utf-8")
+        (home / ".gemini").mkdir()
+        self.assertEqual(home_guard.changed(before), [
+            "changed: ~/.claude.json (mcpServers)", "created: ~/.claude/CLAUDE.md", "created: ~/.claude/skills/remember/",
+            "created: ~/.gemini (exists)", "created: ~/.local/bin/bullpen.cmd"])
+        message = home_guard.report(before, "The test")
+        self.assertIn("The test wrote into the real home folder", message)
+        self.assertNotIn("somewhere", message, "names only, never what a file holds")
+
+
+class StablePython(TempDirCase):
+    """On a Mac with Apple's Python, sys.executable is the copy inside Xcode or the Command Line Tools even when
+    launchd started /usr/bin/python3. The `bullpen` command and a restart after an update use /usr/bin/python3,
+    which follows xcode-select, so moving or switching Xcode can't break them."""
+    XCODE = "/Applications/Xcode.app/Contents/Developer/usr/bin/python3"
+    CLT = "/Library/Developer/CommandLineTools/usr/bin/python3"
+
+    def pick(self, platform: str, exe: str, usable: bool = True, asked: list | None = None) -> str:
+        def access(path, mode):
+            if asked is not None:
+                asked.append((path, mode))
+            return usable
+        with mock.patch.object(runner.sys, "platform", platform), \
+                mock.patch.object(runner.sys, "executable", exe), \
+                mock.patch.object(runner.os, "access", access):
+            return runner.stable_python()
+
+    def test_apples_developer_copies_become_usr_bin_python3(self):
+        for exe in (self.XCODE, self.CLT, "/Applications/Xcode-beta.app/Contents/Developer/usr/bin/python3",
+                    "/Users/me/Applications/Xcode_16.app/Contents/Developer/usr/bin/python3",
+                    "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3"):
+            self.assertEqual(self.pick("darwin", exe), "/usr/bin/python3", exe)
+        asked: list = []
+        self.pick("darwin", self.XCODE, asked=asked)
+        self.assertEqual(asked, [("/usr/bin/python3", os.X_OK)], "only when /usr/bin/python3 can run")
+
+    def test_every_other_python_is_kept(self):
+        self.assertEqual(self.pick("darwin", self.XCODE, usable=False), self.XCODE, "no /usr/bin/python3 to run")
+        for exe in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3.12", "/usr/bin/python3",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3", "/Users/me/.venv/bin/python",
+                    "/Applications/Xcode.app.old/python3", ""):
+            self.assertEqual(self.pick("darwin", exe), exe, exe)
+        asked: list = []
+        for platform in ("linux", "win32"):
+            self.assertEqual(self.pick(platform, self.XCODE, asked=asked), self.XCODE, f"not a Mac: {platform}")
+        self.assertEqual(asked, [], "nothing to check off a Mac")
+
+    def test_the_bullpen_command_runs_the_stable_python(self):
+        home = Path(self.tmp)
+        wiring = runner.Wiring(make_cfg(self.tmp, {}), {}, lambda *a: None)
+        wiring.cfg_path = home / "runner.json"
+        with mock.patch.object(runner, "HOME", home), mock.patch.object(runner, "IS_WINDOWS", False), \
+                mock.patch.object(runner, "stable_python", lambda: "/usr/bin/python3"):
+            wiring.command()
+        text = (home / ".local" / "bin" / "bullpen").read_text(encoding="utf-8")
+        self.assertIn('exec "/usr/bin/python3" ', text)
+
+    def test_a_restart_runs_the_stable_python(self):
+        class Execed(Exception):
+            pass
+
+        def execv(path, argv):
+            raise Execed(path, argv)
+
+        stub = mock.Mock(sync_lock=threading.Lock())
+        with mock.patch.object(runner, "IS_WINDOWS", False), mock.patch.object(runner.os, "execv", execv), \
+                mock.patch.object(runner, "stable_python", lambda: "/usr/bin/python3"), \
+                mock.patch.object(runner.sys, "argv", ["/opt/bullpen/runner.py", "run"]):
+            with self.assertRaises(Execed) as done:
+                runner.Runner.restart(stub)
+        path, argv = done.exception.args
+        self.assertEqual((path, argv[0], argv[2:]), ("/usr/bin/python3", "/usr/bin/python3", ["run"]))
+        stub.rc.stop_all.assert_called_once()
+
+
 # ------------------------------------------------------------------ job summaries for shared memory
 class SummaryTurn(TempDirCase):
     """After a job that ends done with options.summarize, the runner resumes the job's session once with the agent's
@@ -6112,6 +7112,666 @@ class SummaryTurn(TempDirCase):
     def test_the_prompt_is_the_designs(self):
         self.assertEqual(runner.SUMMARY_PROMPT, self.PROMPT)
         self.assertEqual(selftest_agent.SUMMARY_PROMPT, runner.SUMMARY_PROMPT)
+
+
+# ------------------------------------------------------------------ continue on another machine (exact moves)
+SID = "0b6f4c2e-7d1a-4c3b-9e8f-1a2b3c4d5e6f"
+
+
+class CopyHub(LocalHub):
+    """LocalHub with the session copy endpoints: keeps what a machine sends, hands it out once."""
+
+    def __init__(self, take=None) -> None:
+        super().__init__()
+        self.sent: list = []
+        self.take = take  # (status, data, headers) for /take
+
+    def call_bytes(self, path, data, content_type="application/octet-stream", headers=None, timeout=120):
+        if path.endswith("/take"):
+            self.sent.append((path, json.loads(data)))
+            return self.take
+        self.sent.append((path, data, dict(headers or {})))
+        return 200, b'{"ok": true}', {}
+
+
+def run_move_job(hub, cfg: dict, data: dict) -> dict:
+    job = runner.Job(argparse.Namespace(cfg=cfg, hub=hub), {"options": {"timeout_min": 2}, **data})
+    job.run()
+    return hub.finished
+
+
+class SessionMoves(TempDirCase):
+    """The runner's part of an exact move (hub/moves.py): it finds one session's transcript in the agent's config
+    folder by its exact path, reads it as it is, and writes it into the target's project folder, nothing else."""
+
+    def config(self, name: str) -> Path:
+        folder = Path(self.tmp) / name
+        folder.mkdir()
+        return folder
+
+    def workdir(self, name: str) -> str:
+        folder = Path(self.tmp) / name
+        folder.mkdir()
+        return str(folder)
+
+    def test_project_folder_names(self):
+        self.assertEqual(runner.claude_project_dirname("/home/me/my_app.v2"), "-home-me-my-app-v2")
+        self.assertEqual(runner.claude_project_dirname("C:\\Users\\you\\myapp"), "C--Users-you-myapp")
+        self.assertIsNone(runner.claude_project_dirname("/home/me/caf\u00e9"), "non-ASCII: not documented")
+        self.assertEqual(len(runner.claude_project_dirname("/" + "a" * 199)), 200)
+        self.assertIsNone(runner.claude_project_dirname("/" + "a" * 200), "over 200 characters: a hash we can't make")
+        work = self.workdir("work")
+        names = runner.claude_project_dirnames(work, {})
+        self.assertEqual(names[0], re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(work) if os.name == "nt"
+                                          else os.path.realpath(work)))
+        pinned = {"CLAUDE_CONFIG_DIR": "/srv/a", "CLAUDE_CODE_PROJECT_DIR_NAME": "work"}
+        self.assertEqual(runner.claude_project_dirnames(work, pinned), ["work"])
+        self.assertEqual(runner.claude_project_dirnames(work, {"CLAUDE_CODE_PROJECT_DIR_NAME": "work"}), names,
+                         "ignored without CLAUDE_CONFIG_DIR, as Claude Code does")
+        self.assertEqual(runner.claude_project_dirnames(work, {**pinned, "CLAUDE_CODE_PROJECT_DIR_NAME": "a/../b"}),
+                         names, "an invalid name is ignored")
+
+    def test_config_folder(self):
+        claude = runner.agent_spec({"agents": {"a": {"preset": "claude"}}}, "a")
+        fake = runner.agent_spec({"agents": {"a": {"preset": "selftest"}}}, "a")
+        self.assertEqual(runner.session_config_dir(claude, {}), runner.HOME / ".claude")
+        self.assertEqual(runner.session_config_dir(claude, {"CLAUDE_CONFIG_DIR": self.tmp}), Path(self.tmp))
+        self.assertEqual(runner.session_config_dir(fake, {}), runner.BASE_DIR / "selftest" / "claude",
+                         "the self-test agent never touches a real ~/.claude")
+        self.assertFalse(runner.takes_session_moves(claude, {"CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1"}),
+                         "no transcripts kept, nothing to move")
+        gemini = runner.agent_spec({"agents": {"a": {"preset": "gemini"}}}, "a")
+        self.assertFalse(runner.takes_session_moves(gemini, {}))
+
+    def test_reads_only_that_one_file_as_it_is(self):
+        cfg_dir, work = self.config("claude"), self.workdir("work")
+        folder = cfg_dir / "projects" / runner.claude_project_dirnames(work, {})[0]
+        folder.mkdir(parents=True)
+        body = b'{"type": "user"}\r\n{"type": "assistant", "x": "\xc3\xa9 sk-ant-api03-notmasked"}\n\x00'
+        (folder / f"{SID}.jsonl").write_bytes(body)
+        (folder / "11111111-2222-4333-8444-555555555555.jsonl").write_bytes(b"another session")
+        (cfg_dir / ".credentials.json").write_text('{"secret": 1}', encoding="utf-8")
+        (cfg_dir / "settings.json").write_text("{}", encoding="utf-8")
+        opened, listed = [], []
+        real_open, real_os_open = open, os.open
+
+        def spy_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_open(path, *args, **kwargs)
+
+        def spy_os_open(path, *args, **kwargs):
+            opened.append(str(path))
+            return real_os_open(path, *args, **kwargs)
+
+        def no_listing(*args, **kwargs):
+            listed.append(args)
+            raise AssertionError("the runner never lists a config folder")
+
+        with mock.patch("builtins.open", spy_open), mock.patch.object(runner.os, "open", spy_os_open), \
+                mock.patch.object(runner.os, "listdir", no_listing), mock.patch.object(runner.os, "scandir", no_listing), \
+                mock.patch.object(Path, "iterdir", no_listing), mock.patch.object(Path, "glob", no_listing), \
+                mock.patch.object(Path, "rglob", no_listing):
+            path = runner.find_session_transcript(cfg_dir, work, SID, {})
+            data = runner.read_session_transcript(path, 1024)
+        self.assertEqual(data, body, "byte for byte: no masking, no line-ending change")
+        self.assertEqual(path, folder / f"{SID}.jsonl")
+        self.assertEqual(opened, [str(folder / f"{SID}.jsonl")])
+        self.assertEqual(listed, [])
+        with self.assertRaisesRegex(runner.SessionMoveError, "larger than"):
+            runner.read_session_transcript(path, len(body) - 1)
+
+    def test_refuses_what_isnt_a_session_file(self):
+        cfg_dir, work = self.config("claude"), self.workdir("work")
+        for bad in ("../.credentials", "x" * 36, "", SID + "/../a"):
+            with self.assertRaisesRegex(runner.SessionMoveError, "isn't a Claude Code session id"):
+                runner.find_session_transcript(cfg_dir, work, bad, {})
+            with self.assertRaisesRegex(runner.SessionMoveError, "isn't a Claude Code session id"):
+                runner.install_session_transcript(cfg_dir, work, bad, b"x", {})
+        with self.assertRaisesRegex(runner.SessionMoveError, "no transcript of session"):
+            runner.find_session_transcript(cfg_dir, work, SID, {})
+        if POSIX:
+            folder = cfg_dir / "projects" / runner.claude_project_dirnames(work, {})[0]
+            folder.mkdir(parents=True)
+            (cfg_dir / ".credentials.json").write_text("secret", encoding="utf-8")
+            os.symlink(cfg_dir / ".credentials.json", folder / f"{SID}.jsonl")
+            with self.assertRaisesRegex(runner.SessionMoveError, "isn't a plain file"):
+                runner.find_session_transcript(cfg_dir, work, SID, {})
+            with self.assertRaisesRegex(runner.SessionMoveError, "isn't a plain file"):
+                runner.install_session_transcript(cfg_dir, work, SID, b"x", {})
+            self.assertEqual((cfg_dir / ".credentials.json").read_text(encoding="utf-8"), "secret")
+
+    def test_writes_it_where_the_agent_looks_first(self):
+        cfg_dir, work = self.config("claude"), self.workdir("work")
+        body = b'{"a": 1}\n{"b": 2}\r\n'
+        path = runner.install_session_transcript(cfg_dir, work, SID, body, {})
+        self.assertEqual(path, cfg_dir / "projects" / runner.claude_project_dirnames(work, {})[0] / f"{SID}.jsonl")
+        self.assertEqual(path.read_bytes(), body)
+        if POSIX:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        # Moved here again later: the copy already here is set aside, not overwritten.
+        runner.install_session_transcript(cfg_dir, work, SID, b"newer\n", {})
+        self.assertEqual(path.read_bytes(), b"newer\n")
+        kept = [p for p in path.parent.iterdir() if p.name.startswith(f"{SID}.jsonl.superseded-")]
+        self.assertEqual([p.read_bytes() for p in kept], [body])
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir() if not p.name.startswith(f"{SID}.jsonl")), [],
+                         "nothing else is written")
+
+    def make_session(self, cfg_dir: Path, work: str) -> str:
+        """Run the self-test agent once in work, keeping its transcript in cfg_dir; returns its session id."""
+        cfg = make_cfg(work, {"one": {"preset": "selftest", "env": {**self.selftest_env,
+                                                                   "CLAUDE_CONFIG_DIR": str(cfg_dir)}}})
+        finished = run_move_job(LocalHub(), cfg, {"id": 1, "agent": "one", "project": "chat", "autonomy": "readonly",
+                                             "prompt": "First question"})
+        self.assertEqual(finished["status"], "done", finished)
+        return finished["session_id"]
+
+    def test_export_then_resume_on_the_other_machine(self):
+        src_cfg, src_work = self.config("src-claude"), self.workdir("src-work")
+        dst_cfg, dst_work = self.config("dst-claude"), self.workdir("dst-work")
+        session = self.make_session(src_cfg, src_work)
+        source = make_cfg(src_work, {"one": {"preset": "selftest", "env": {**self.selftest_env,
+                                                                          "CLAUDE_CONFIG_DIR": str(src_cfg)}}})
+        hub = CopyHub()
+        params = {"copy": "c" * 32, "target_job": 9, "session_id": session, "agent": "one", "project": "chat",
+                  "max_bytes": 1024 * 1024}
+        finished = run_move_job(hub, source, {"id": 8, "kind": "admin",
+                                          "options": {"action": "session.export", "params": params}})
+        self.assertEqual(finished["status"], "done", finished)
+        path, data, headers = hub.sent[0]
+        self.assertEqual(path, "/api/runner/session-copies/" + "c" * 32)
+        self.assertEqual(headers["X-Bullpen-Sha256"], hashlib.sha256(data).hexdigest())
+        self.assertIn(b"First question", data)
+        self.assertFalse(any(b"First question" in str(ln).encode() for ln in hub.lines), "the content isn't logged")
+        # The target machine takes it once, writes it under its own project path, and resumes it.
+        target = make_cfg(dst_work, {"one": {"preset": "selftest", "env": {**self.selftest_env,
+                                                                          "CLAUDE_CONFIG_DIR": str(dst_cfg)}}})
+        dst = CopyHub(take=(200, data, {"x-bullpen-sha256": hashlib.sha256(data).hexdigest()}))
+        move = {"mode": "exact", "copy": "c" * 32, "from_job": 1}
+        finished = run_move_job(dst, target, {"id": 9, "agent": "one", "project": "chat", "autonomy": "readonly",
+                                          "resume_session": session, "prompt": "SELFTEST: transcript",
+                                          "options": {"timeout_min": 2, "move": move}})
+        self.assertEqual(finished["status"], "done", finished)
+        self.assertIn("transcript: 1 earlier turn, the first: First question", finished["result"])
+        self.assertEqual(dst.sent[0], ("/api/runner/session-copies/" + "c" * 32 + "/take", {"job_id": 9}))
+        moved = dst_cfg / "projects" / runner.claude_project_dirnames(dst_work, {})[0] / f"{session}.jsonl"
+        self.assertTrue(moved.read_bytes().startswith(data), "the copy, with the new turn added after it")
+        self.assertEqual(finished["session_id"], session)
+
+    def test_a_damaged_or_missing_copy_stops_the_job(self):
+        work = self.workdir("work")
+        cfg = make_cfg(work, {"one": {"preset": "selftest", "env": {**self.selftest_env,
+                                                                   "CLAUDE_CONFIG_DIR": str(self.config("c"))}}})
+        job = {"id": 9, "agent": "one", "project": "chat", "autonomy": "readonly", "resume_session": SID,
+               "prompt": "hi", "options": {"timeout_min": 2, "move": {"mode": "exact", "copy": "c" * 32}}}
+        finished = run_move_job(CopyHub(take=(200, b"data", {"x-bullpen-sha256": "0" * 64})), cfg, job)
+        self.assertEqual(finished["status"], "error")
+        self.assertIn("arrived damaged", finished["error"])
+        finished = run_move_job(CopyHub(take=(410, b"The session copy is gone", {})), cfg, job)
+        self.assertIn("The session copy is gone", finished["error"])
+        # Without the copy, the agent finds no session: Claude Code's own message (the self-test agent's here).
+        code = subprocess.run([sys.executable, str(ROOT / "runner" / "selftest_agent.py"), "--resume", SID],
+                              input="hi", capture_output=True, text=True, cwd=work, timeout=60,
+                              env=dict(os.environ, SELFTEST_DELAY="0", CLAUDE_CONFIG_DIR=str(Path(self.tmp) / "c")))
+        self.assertEqual(code.returncode, 1)
+        self.assertIn(f"No conversation found with session ID: {SID}", code.stderr)
+
+
+# ------------------------------------------------------------------ uninstall
+def tree_state(folder: Path) -> dict:
+    """Every file under `folder` with its contents, so a test can see that nothing changed."""
+    return {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+class WiredHome(TempDirCase):
+    """A temporary home with a runner folder, and a real settings sync into it (no test of its own)."""
+
+    USER_SERVER = {"command": "my-server", "args": ["--port", "1"]}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = Path(self.tmp) / "home"
+        self.base = self.home / ".bullpen"
+        self.base.mkdir(parents=True)
+        self.calls: list = []
+
+    def run_stub(self, argv: list, env=None) -> tuple:
+        """Stands in for every program the uninstaller runs. `claude mcp remove` edits the account's
+        .claude.json the way Claude Code would."""
+        self.calls.append(list(argv))
+        if argv[1:4] == ["mcp", "remove", "-s"]:
+            folder = (env or {}).get("CLAUDE_CONFIG_DIR")
+            path = Path(folder) / ".claude.json" if folder else self.home / ".claude.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["mcpServers"].pop(argv[5])
+            path.write_text(json.dumps(data), encoding="utf-8")
+        return 0, ""
+
+    def shown(self, path: Path) -> str:
+        """A path as the uninstaller shows it: ~ for the home folder."""
+        return "~" + str(path)[len(str(self.home)):]
+
+    def write(self, rel: str, text: str) -> Path:
+        path = self.home / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def cfg(self) -> dict:
+        work = self.home / ".claude-work"
+        work.mkdir(exist_ok=True)
+        cfg = make_cfg(str(self.base / "chat"), {
+            "claude": {"preset": "claude", "command": "claude-cli"},
+            "claude-work": {"preset": "claude", "command": "claude-cli", "env": {"CLAUDE_CONFIG_DIR": str(work)}},
+            "gemini": {"preset": "gemini"}})
+        cfg["projects_root"] = str(self.home / "projects")
+        return cfg
+
+    def wire(self, cfg: dict, kit: dict | None = None, expect_notes: list | None = None,
+             gemini_cli_home: str = "") -> None:
+        """A real settings sync into the temporary home, with the hub's add-ons (or `kit`) and its MCP server.
+        The sync's notes must be `expect_notes` (none by default). GEMINI_CLI_HOME is `gemini_cli_home`, or
+        unset."""
+        expect_notes = expect_notes or []
+        gemini_env = {"GEMINI_CLI_HOME": gemini_cli_home} if gemini_cli_home else {}
+        if kit is None:
+            kit_dir = ROOT / "agent-kit"
+            kit = {p.relative_to(kit_dir).as_posix(): p.read_text(encoding="utf-8")
+                   for p in sorted(kit_dir.rglob("*")) if p.is_file()}
+        ctx = {"kit": kit, "mcp_enabled": True, "mcp_token": "bpm_" + "u" * 40, "servers": [],
+               "platforms": ["linux", "macos", "windows"]}
+        (self.base / "context").mkdir(parents=True, exist_ok=True)
+        (self.base / "context" / "shared.md").write_text("notes\n", encoding="utf-8")
+
+        def add_with_cli(_self, argv: list, env: dict) -> bool:  # `claude mcp add-json/remove`, as Claude Code does
+            folder = env.get("CLAUDE_CONFIG_DIR")
+            path = Path(folder) / ".claude.json" if folder else self.home / ".claude.json"
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if argv[2] == "add-json":
+                data.setdefault("mcpServers", {})[argv[5]] = json.loads(argv[6])
+            path.write_text(json.dumps(data), encoding="utf-8")
+            return True
+
+        with mock.patch.object(runner, "HOME", self.home), \
+                mock.patch.object(runner, "CONTEXT_DIR", self.base / "context"), \
+                mock.patch.object(runner, "STATE_FILE", self.base / "wired.json"), \
+                mock.patch.object(runner, "SYNC_LOCK", self.base / "sync.lock"), \
+                mock.patch.object(runner, "resolve_command", return_value="claude-cli"), \
+                mock.patch.object(runner.Wiring, "run_cli", add_with_cli),                 mock.patch.dict(os.environ, gemini_env):
+            if not gemini_cli_home:
+                os.environ.pop("GEMINI_CLI_HOME", None)
+            notes = runner.Wiring(cfg, ctx, lambda *a: None).run(self.base / "runner.json")
+        self.assertEqual(notes, expect_notes)
+
+    def plan(self, cfg: dict, system: str = "linux") -> "runner.UninstallPlan":
+        with mock.patch.object(runner, "resolve_command", return_value="claude-cli"):
+            return runner.plan_uninstall(cfg, home=self.home, base_dir=self.base, system=system, run=self.run_stub)
+
+
+class Uninstall(WiredHome):
+    """`runner.py uninstall` takes away the service, the runner's folder, the commands and what the settings
+    sync wrote into the agents' own settings, and nothing else: logins, your own settings, skills, MCP
+    servers and commands stay. Everything happens in a temporary home; programs (systemctl, launchctl,
+    PowerShell, claude) are stand-ins that only record what they were asked."""
+
+    def test_without_block(self):
+        block = runner.BLOCK_BEGIN + "\n@~/.bullpen/context/shared.md\n" + runner.BLOCK_END
+        self.assertIsNone(runner.without_block("# Mine\n"))
+        self.assertEqual(runner.without_block(block + "\n"), "")
+        self.assertEqual(runner.without_block("# Mine\nkeep this\n\n" + block + "\n"), "# Mine\nkeep this\n")
+        self.assertEqual(runner.without_block("# Mine\n\n" + block + "\n\n# Later\n"), "# Mine\n\n# Later\n")
+        self.assertEqual(runner.without_block(block + "\n\n# Later\n"), "# Later\n")
+
+    def test_takes_out_what_the_sync_wrote_and_nothing_else(self):
+        cfg = self.cfg()
+        # Your own things, from before Agent Bullpen.
+        self.write(".claude/CLAUDE.md", "# My notes\n")
+        own_skill = self.write(".claude/skills/mine/SKILL.md", "my own skill\n")
+        self.write(".claude.json", json.dumps({"numStartups": 3, "mcpServers": {"mine": self.USER_SERVER}}))
+        self.write(".claude/.credentials.json", '{"claudeAiOauth": "login"}')
+        self.write(".claude-work/.credentials.json", '{"claudeAiOauth": "work login"}')
+        self.write(".gemini/settings.json", json.dumps({"theme": "Dark", "mcpServers": {"mine": self.USER_SERVER}}))
+        self.write(".gemini/.env", "GEMINI_API_KEY=placeholder\n")
+        self.write(".bashrc", '\n# added by bullpen setup\nexport PATH="$HOME/.local/bin:$PATH"\n')
+        own_command = self.write(".local/bin/claude-mine", '#!/bin/sh\nexport CLAUDE_CONFIG_DIR="/x"\nexec claude\n')
+        (self.home / "projects" / "myapp").mkdir(parents=True)
+        self.wire(cfg)
+        # What the setup script adds: the service and a command for the extra account.
+        unit = self.write(".config/systemd/user/bullpen-runner.service",
+                          f'[Service]\nExecStart="/usr/bin/python3" "{self.base}/runner/runner.py" run\n')
+        wrapper = self.write(".local/bin/claude-work",
+                             "#!/usr/bin/env sh\n# Claude Code with the 'claude-work' login (made by the bullpen "
+                             f'setup).\nexport CLAUDE_CONFIG_DIR="{self.home / ".claude-work"}"\nexec claude "$@"\n')
+        (self.base / "runner").mkdir()
+        (self.base / "runner" / "runner.py").write_text("# the runner\n", encoding="utf-8")
+        for path in (self.home / ".claude/skills/remember/SKILL.md", self.home / ".claude-work/skills/second-opinion/SKILL.md",
+                     self.home / ".agents/skills/remember/SKILL.md", self.home / ".gemini/commands/remember.toml", self.home / ".gemini/GEMINI.md",
+                     self.home / ".gemini/bullpen-shared.md", self.home / ".local/bin" / (
+                         "bullpen.cmd" if runner.IS_WINDOWS else "bullpen")):
+            self.assertTrue(path.exists(), f"the sync didn't write {path}")
+        self.assertIn("bullpen", json.loads((self.home / ".claude-work/.claude.json").read_text())["mcpServers"])
+
+        plan = self.plan(cfg)
+        described = plan.describe()
+        for text in ("systemd user service bullpen-runner", "Agent Bullpen block in", "MCP server bullpen in",
+                     "the command claude-work for an extra Claude account", "the bullpen command",
+                     "the copy of the shared notes", "Shared skills folder: the Agent Bullpen add-ons in",
+                     self.shown(self.base) + ": the runner"):
+            self.assertIn(text, described)
+        self.assertNotIn("claude-mine", described.split("This leaves alone:")[0])
+        kept = described.split("This leaves alone:")[1]
+        for text in (self.shown(self.home / ".claude-work") + ": the login and settings of the claude-work account",
+                     ".env, which holds the Gemini API key", "PATH line the setup added",
+                     "your projects in " + self.shown(self.home / "projects")):
+            self.assertIn(text, kept)
+        self.assertEqual(self.calls, [], "making the plan runs nothing that changes anything")
+
+        said: list = []
+        self.assertEqual(plan.run(said.append), [], said)
+
+        self.assertEqual((self.home / ".claude/CLAUDE.md").read_text(encoding="utf-8"), "# My notes\n")
+        self.assertFalse((self.home / ".claude-work/CLAUDE.md").exists(), "only our block was in it")
+        self.assertTrue(own_skill.exists())
+        for gone in (".claude/skills/remember", ".claude/skills/second-opinion", ".claude-work/skills/remember",
+                     ".agents/skills/remember", ".gemini/skills/remember", ".gemini/GEMINI.md", ".gemini/bullpen-shared.md",
+                     ".local/bin/bullpen", ".local/bin/bullpen.cmd", ".local/bin/claude-work", ".bullpen",
+                     ".config/systemd/user/bullpen-runner.service"):
+            self.assertFalse((self.home / gone).exists(), gone)
+        self.assertEqual(sorted(p.name for p in (self.home / ".gemini/commands").iterdir()), [])
+        claude_json = json.loads((self.home / ".claude.json").read_text(encoding="utf-8"))
+        self.assertEqual(claude_json, {"numStartups": 3, "mcpServers": {"mine": self.USER_SERVER}})
+        self.assertEqual(json.loads((self.home / ".claude-work/.claude.json").read_text())["mcpServers"], {})
+        self.assertEqual(json.loads((self.home / ".gemini/settings.json").read_text(encoding="utf-8")),
+                         {"theme": "Dark", "mcpServers": {"mine": self.USER_SERVER}})
+        for kept_file in (".claude/.credentials.json", ".claude-work/.credentials.json", ".gemini/.env", ".bashrc"):
+            self.assertTrue((self.home / kept_file).exists(), kept_file)
+        self.assertTrue(own_command.exists() and (self.home / "projects" / "myapp").is_dir())
+        self.assertFalse(unit.exists() or wrapper.exists())
+        self.assertIn(["systemctl", "--user", "disable", "--now", "bullpen-runner.service"], self.calls)
+        self.assertIn(["claude-cli", "mcp", "remove", "-s", "user", "bullpen"], self.calls)
+
+        # Run again: nothing of ours is left to take away.
+        self.calls.clear()
+        again = self.plan(cfg)
+        self.assertEqual(again.steps, [], again.describe())
+
+    def test_leaves_what_it_cannot_tell_is_ours(self):
+        self.base.rmdir()  # no runner folder either
+        cfg = self.cfg()
+        own = {
+            ".local/bin/bullpen": "#!/bin/sh\necho my own bullpen\n",
+            ".claude/skills/remember/SKILL.md": "my own remember skill, without the marker\n",
+            ".claude/CLAUDE.md": "# Mine, no block\n",
+            ".gemini/settings.json": json.dumps({"mcpServers": {"mine": self.USER_SERVER}}),
+            ".config/systemd/user/bullpen-runner.service": "ExecStart=/usr/bin/python3 /elsewhere/runner.py run\n",
+        }
+        for rel, text in own.items():
+            self.write(rel, text)
+        before = tree_state(self.home)
+        plan = self.plan(cfg)
+        self.assertEqual(plan.steps, [], plan.describe())
+        kept = plan.describe()
+        self.assertIn(f"{self.shown(self.home / '.local/bin/bullpen')}: Agent Bullpen didn't make it", kept)
+        self.assertIn("it starts a runner in another folder", kept)
+        plan.run(lambda *_: None)
+        self.assertEqual(tree_state(self.home), before)
+
+    def test_a_bullpen_home_that_holds_your_home_is_never_deleted(self):
+        (self.home / "runner.json").write_text("{}", encoding="utf-8")
+        plan = runner.plan_uninstall({"agents": {}}, home=self.home, base_dir=self.home, system="linux",
+                                     run=self.run_stub)
+        self.assertEqual(plan.steps, [])
+        self.assertIn("it is your home folder, or holds it", plan.describe())
+        plan = runner.plan_uninstall({"agents": {}}, home=self.home, base_dir=Path(self.tmp), system="linux",
+                                     run=self.run_stub)
+        self.assertEqual(plan.steps, [])
+        other = Path(self.tmp) / "somewhere"
+        other.mkdir()
+        plan = runner.plan_uninstall({"agents": {}}, home=self.home, base_dir=other, system="linux", run=self.run_stub)
+        self.assertEqual(plan.steps, [])
+        self.assertIn("it has no runner.json", plan.describe())
+
+    def test_a_runner_still_running_keeps_its_folder(self):
+        (self.base / "runner.lock").write_text("", encoding="utf-8")
+
+        class Held:
+            def __init__(self, path):
+                pass
+
+            def acquire(self, timeout=60.0):
+                return False
+
+        plan = self.plan({"agents": {}})
+        with mock.patch.object(runner, "FileLock", Held):
+            said: list = []
+            failed = plan.run(said.append)
+        self.assertEqual(len(failed), 1)
+        self.assertIn("a runner is still running on this machine", said[-1])
+        self.assertTrue(self.base.is_dir())
+
+    def test_the_lock_a_stopped_runner_left_behind(self):
+        # Every runner that ever ran leaves runner.lock; with no runner holding it, the folder goes.
+        (self.base / "runner.lock").write_text("", encoding="utf-8")
+        (self.base / "runner.log").write_text("log\n", encoding="utf-8")
+        plan = self.plan({"agents": {}})
+        said: list = []
+        self.assertEqual(plan.run(said.append), [], said)
+        self.assertFalse(self.base.exists())
+
+    def test_the_windows_command_for_an_extra_account(self):
+        # Exactly what Setup-Workstation.ps1 (Set-Wrapper) writes.
+        wrapper = self.write(".local/bin/claude-work.cmd", "\r\n".join([
+            "@echo off",
+            "rem Claude Code with the 'claude-work' login (made by the bullpen setup). Its login and settings "
+            "live in %USERPROFILE%\\.claude-work",
+            "setlocal", 'set "CLAUDE_CONFIG_DIR=%USERPROFILE%\\.claude-work"', 'set "CLAUDECODE="', "claude %*", ""]))
+        with mock.patch.dict(os.environ, {"USERPROFILE": str(self.home)}):
+            plan = self.plan({"agents": {}}, system="windows")
+        described = plan.describe()
+        self.assertIn(f"the command claude-work for an extra Claude account, {self.shown(wrapper)}", described)
+        login = str(self.home / ".claude-work") if runner.IS_WINDOWS else "%USERPROFILE%\\.claude-work"
+        self.assertIn(f"{plan.short(login)}: the login and settings of the claude-work account", described)
+        [remove] = [action for what, action in plan.steps if "claude-work" in what]
+        remove()
+        self.assertFalse(wrapper.exists())
+
+    def test_windows_task_only_when_it_starts_this_runner(self):
+        runs_here = f'C:\\Python\\pythonw.exe "{self.base}{os.sep}runner{os.sep}runner.py" --config x run'
+        answers = {"here": (0, runs_here.upper()), "elsewhere": (0, 'pythonw.exe "D:\\other\\runner.py" run'),
+                   "none": (3, ""), "broken": (1, "Access is denied")}
+        for case, answer in answers.items():
+            calls: list = []
+
+            def stub(argv, env=None):
+                calls.append(argv)
+                return answer if "Get-ScheduledTask" in argv[-1] else (0, "")
+
+            plan = runner.plan_uninstall({"agents": {}}, home=self.home, base_dir=self.base, system="windows", run=stub)
+            task = [what for what, _ in plan.steps if "scheduled task" in what]
+            self.assertEqual(bool(task), case == "here", case)
+            if case == "elsewhere":
+                self.assertIn("it starts a runner in another folder", plan.describe())
+            if case == "broken":
+                self.assertIn("couldn't look at it (Access is denied)", plan.describe())
+            if case == "here":
+                plan.steps[0][1]()
+                self.assertIn("Unregister-ScheduledTask -TaskName 'Agent Bullpen Runner' -Confirm:$false",
+                              calls[-1][-1])
+
+    def test_macos_launchd_agent(self):
+        plist = self.write("Library/LaunchAgents/bullpen.runner.plist",
+                           f"<string>{self.base}/runner/runner.py</string>")
+        plan = self.plan({"agents": {}}, system="macos")
+        self.assertIn("the launchd agent bullpen.runner", plan.steps[0][0])
+        plan.steps[0][1]()
+        self.assertFalse(plist.exists())
+        self.assertEqual(self.calls[0][:2], ["launchctl", "bootout"])
+        self.assertTrue(self.calls[0][2].endswith("/bullpen.runner"))
+
+    def test_the_command_shows_first_and_asks(self):
+        (self.base / "runner.json").write_text(json.dumps(make_cfg(str(self.base / "chat"), {})), encoding="utf-8")
+        (self.base / "chat").mkdir()
+        self.write(".local/bin/bullpen", f"#!/bin/sh\n# {runner.MARKER}\nexec python3 runner.py \"$@\"\n")
+        # Apple's Python keeps its bytecode cache under the home folder (~/Library/Caches/com.apple.python),
+        # which would count as a change here; the command itself never writes there.
+        env = home_guard.home_env(self.home, PYTHONDONTWRITEBYTECODE="1")
+        before = tree_state(self.home)
+        command = [sys.executable, str(ROOT / "runner" / "runner.py"), "uninstall"]
+        dry = subprocess.run(command + ["--dry-run"], capture_output=True, text=True, env=env, timeout=120,
+                             stdin=subprocess.DEVNULL)
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        self.assertIn(f"the bullpen command, {self.shown(self.home / '.local' / 'bin' / 'bullpen')}", dry.stdout)
+        self.assertIn(f"{self.shown(self.base)}: the runner, its settings and runner token", dry.stdout)
+        self.assertNotIn(str(self.home), dry.stdout)
+        self.assertIn("Dry run: nothing was changed.", dry.stdout)
+        self.assertEqual(tree_state(self.home), before)
+        no = subprocess.run(command, input="n\n", capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(no.returncode, 1, no.stdout + no.stderr)
+        self.assertIn("Remove all of this? (y/N)", no.stdout)
+        self.assertIn("Nothing was changed.", no.stdout)
+        self.assertEqual(tree_state(self.home), before)
+
+
+class SharedSkillsFolder(WiredHome):
+    """The add-ons for every agent also go to ~/.agents/skills, the user-level skills folder that Codex,
+    OpenCode, Copilot CLI, Cursor and others read. Same rules as the agents' own folders: marked as ours,
+    updated by later syncs, removed by uninstall, and a skill there that isn't ours is never touched."""
+
+    def kit(self, version: str) -> dict:
+        return {"skills/remember/SKILL.md": f"---\nname: remember\n---\n{version}\n\n<!-- {runner.MARKER} -->\n",
+                "claude/skills/second-opinion/SKILL.md": f"second opinion\n<!-- {runner.MARKER} -->\n",
+                "gemini/commands/remember.toml": f"# {runner.MARKER}\nprompt = \"x\"\n"}
+
+    def claude_only(self) -> dict:
+        (self.home / ".claude").mkdir(exist_ok=True)  # signed in once
+        return make_cfg(str(self.base / "chat"), {"claude": {"preset": "claude", "command": "claude-cli"}})
+
+    def test_the_add_ons_for_every_agent_go_there(self):
+        self.wire(self.claude_only())
+        shared = self.home / ".agents" / "skills"
+        kit_dir = ROOT / "agent-kit"
+        self.assertEqual((shared / "remember" / "SKILL.md").read_text(encoding="utf-8"),
+                         (kit_dir / "skills" / "remember" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertIn(runner.MARKER, (shared / "remember" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(p.name for p in shared.iterdir()), ["remember"],
+                         "only the add-ons for every agent: second opinion is written for Claude Code")
+        for skill in ("remember", "second-opinion"):
+            self.assertTrue((self.home / ".claude" / "skills" / skill / "SKILL.md").exists(),
+                            "Claude Code doesn't read ~/.agents/skills, so its own folder keeps both")
+
+    def test_a_later_sync_updates_ours(self):
+        cfg = self.claude_only()
+        self.wire(cfg, kit=self.kit("first"))
+        skill = self.home / ".agents" / "skills" / "remember" / "SKILL.md"
+        self.assertIn("first", skill.read_text(encoding="utf-8"))
+        self.wire(cfg, kit=self.kit("second"))
+        self.assertIn("second", skill.read_text(encoding="utf-8"))
+        self.assertNotIn("first", skill.read_text(encoding="utf-8"))
+
+    def test_a_skill_that_isnt_ours_is_left_alone(self):
+        cfg = self.claude_only()
+        theirs = self.write(".agents/skills/remember/SKILL.md", "---\nname: remember\n---\nmy own remember\n")
+        mine = self.write(".agents/skills/mine/SKILL.md", "---\nname: mine\n---\nmy own skill\n")
+        self.wire(cfg, kit=self.kit("first"),
+                  expect_notes=[f"Shared skills folder: {theirs} exists and isn't ours, so it was left alone"])
+        self.assertEqual(theirs.read_text(encoding="utf-8"), "---\nname: remember\n---\nmy own remember\n")
+        plan = self.plan(cfg)
+        self.assertNotIn(".agents", plan.describe().split("This leaves alone:")[0])
+        plan.run(lambda *_: None)
+        self.assertTrue(theirs.exists() and mine.exists())
+
+    def test_uninstall_takes_out_ours_only(self):
+        cfg = self.claude_only()
+        mine = self.write(".agents/skills/mine/SKILL.md", "---\nname: mine\n---\nmy own skill\n")
+        self.wire(cfg)
+        shared = self.home / ".agents" / "skills"
+        plan = self.plan(cfg)
+        self.assertIn(f"Shared skills folder: the Agent Bullpen add-ons in {self.shown(shared)} (remember)",
+                      plan.describe())
+        said: list = []
+        self.assertEqual(plan.run(said.append), [], said)
+        self.assertFalse((shared / "remember").exists())
+        self.assertEqual(mine.read_text(encoding="utf-8"), "---\nname: mine\n---\nmy own skill\n")
+        self.assertEqual(self.plan(cfg).steps, [])
+
+    # Gemini CLI 0.28 and later reads ~/.agents/skills as another name for ~/.gemini/skills, and warns of a
+    # "skill conflict" when a skill is in both: the skill goes to one of them only.
+    def with_gemini(self) -> dict:
+        return make_cfg(str(self.base / "chat"), {"gemini": {"preset": "gemini"}})
+
+    def test_gemini_cli_finds_the_skill_in_the_shared_folder_only(self):
+        cfg = self.with_gemini()
+        # What an earlier sync wrote, and a skill of your own next to it.
+        earlier = self.write(".gemini/skills/remember/SKILL.md", self.kit("old")["skills/remember/SKILL.md"])
+        mine = self.write(".gemini/skills/mine/SKILL.md", "---\nname: mine\n---\nmy own skill\n")
+        self.wire(cfg, kit=self.kit("new"))
+        self.assertIn("new", (self.home / ".agents/skills/remember/SKILL.md").read_text(encoding="utf-8"))
+        self.assertFalse(earlier.exists() or earlier.parent.exists(), "the earlier copy and its folder are gone")
+        self.assertTrue(mine.exists())
+        self.assertTrue((self.home / ".gemini/commands/remember.toml").exists(), "the commands stay where they were")
+        self.assertFalse((self.home / ".agents/skills/second-opinion").exists())
+        # Nothing changes on the next sync.
+        before = tree_state(self.home)
+        self.wire(cfg, kit=self.kit("new"))
+        self.assertEqual(tree_state(self.home), before)
+
+    def test_gemini_cli_and_a_skill_of_yours(self):
+        cfg = self.with_gemini()
+        own = "---\nname: remember\n---\nmy own remember\n"
+        # A copy of ours in ~/.agents/skills from an earlier sync, and then a `remember` of your own in
+        # ~/.gemini/skills: Gemini CLI keeps yours, so ours leaves ~/.agents/skills instead of replacing it.
+        self.wire(cfg, kit=self.kit("new"))
+        ours = self.home / ".agents/skills/remember/SKILL.md"
+        self.assertTrue(ours.exists())
+        theirs = self.write(".gemini/skills/remember/SKILL.md", own)
+        self.wire(cfg, kit=self.kit("new"), expect_notes=[
+            f"Shared skills folder: Gemini CLI has a skill of yours at {theirs}, so the runner's wasn't put in "
+            f"{self.home / '.agents' / 'skills'}",
+            f"Gemini CLI: {theirs} exists and isn't ours, so it was left alone"])
+        self.assertEqual(theirs.read_text(encoding="utf-8"), own)
+        self.assertFalse(ours.exists() or ours.parent.exists())
+        theirs.unlink()
+        # Yours in ~/.agents/skills: Gemini CLI reads it there, so ours doesn't go to ~/.gemini/skills either.
+        shared = self.write(".agents/skills/remember/SKILL.md", own)
+        self.wire(cfg, kit=self.kit("new"),
+                  expect_notes=[f"Shared skills folder: {shared} exists and isn't ours, so it was left alone"])
+        self.assertFalse(theirs.exists())
+        self.assertEqual(shared.read_text(encoding="utf-8"), own)
+
+    def test_gemini_cli_with_a_home_of_its_own(self):
+        # With GEMINI_CLI_HOME set, Gemini CLI reads $GEMINI_CLI_HOME/.gemini/skills and
+        # $GEMINI_CLI_HOME/.agents/skills (its homedir() in packages/core/src/utils/paths.ts), not the
+        # runner's ~/.agents/skills: the skill goes to its own folder as before, and there is one copy.
+        elsewhere = Path(self.tmp) / "gemini-home"
+        (elsewhere / ".gemini").mkdir(parents=True)
+        self.wire(self.with_gemini(), kit=self.kit("new"), gemini_cli_home=str(elsewhere))
+        self.assertTrue((elsewhere / ".gemini/skills/remember/SKILL.md").exists())
+        self.assertFalse((elsewhere / ".agents").exists())
+        self.assertTrue((self.home / ".agents/skills/remember/SKILL.md").exists())
+        self.assertFalse((self.home / ".gemini").exists())
+
+    def test_the_antigravity_cli(self):
+        # The Antigravity CLI reads ~/.gemini/skills, ~/.gemini/antigravity-cli/skills and ~/.gemini/config/skills,
+        # not ~/.agents/skills. Gemini CLI reads ~/.gemini/skills and ~/.agents/skills. One copy for each.
+        cfg = self.with_gemini()
+        (self.home / ".gemini/antigravity-cli").mkdir(parents=True)
+        self.wire(cfg, kit=self.kit("new"))
+        agy_cli = self.home / ".gemini/antigravity-cli/skills/remember/SKILL.md"
+        self.assertTrue(agy_cli.exists(), "no Antigravity skills folder is written, so the CLI gets its own copy")
+        self.assertTrue((self.home / ".agents/skills/remember/SKILL.md").exists())
+        self.assertFalse((self.home / ".gemini/skills/remember").exists())
+        self.assertIn("Antigravity CLI: the Agent Bullpen add-ons in", self.plan(cfg).describe())
+        (self.home / ".gemini/config").mkdir()
+        self.wire(cfg, kit=self.kit("new"))
+        self.assertTrue((self.home / ".gemini/config/skills/remember/SKILL.md").exists())
+        self.assertFalse(agy_cli.exists() or agy_cli.parent.exists(), "config/skills has it now")
+        self.assertFalse((self.home / ".gemini/skills/remember").exists())
+        self.assertTrue((self.home / ".agents/skills/remember/SKILL.md").exists())
+
+    def test_not_when_agent_settings_are_left_alone(self):
+        cfg = self.claude_only()
+        cfg["manage_agent_settings"] = False
+        self.wire(cfg, expect_notes=["managing agent settings is turned off for this machine (manage_agent_settings)"])
+        self.assertFalse((self.home / ".agents").exists())
 
 
 if __name__ == "__main__":

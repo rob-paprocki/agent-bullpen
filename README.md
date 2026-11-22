@@ -169,7 +169,8 @@ machine are set up, the dashboard works, and you can add the rest whenever you l
   "Full auto" task), start programs on all of them (an MCP server of the "local program" kind), and push a
   runner update. Use a long password. Keep the dashboard on your network or a VPN, or behind a login wall such
   as Cloudflare Access. Never open its port on your router.
-- **Each machine has its own runner token.** The hub keeps only its fingerprint. **Forget** on the dashboard revokes it.
+- **Each machine has its own runner token and MCP token.** The hub keeps only their fingerprints. **Forget** on
+  the dashboard revokes both.
 - **Subtasks are off unless you allow them**, per task, and they only read unless you raise the hub's limit.
   Tags and account labels a machine reports count only after you accept them.
 - **The hub never sees the agents' logins.** They stay on each machine. Keys and OAuth sign-ins of MCP servers

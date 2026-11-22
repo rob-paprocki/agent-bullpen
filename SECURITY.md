@@ -50,9 +50,10 @@ can log in can do everything.
 
 | Token | Where it is | What someone holding it can do |
 |---|---|---|
-| A machine's **runner token** | that machine's `~/.bullpen/runner.json`, readable only by its user; the hub keeps only a fingerprint | act as that machine: receive the jobs sent to it (prompts included), report results, and fetch the hub's MCP token and the keys of MCP servers added **directly**; and, while a task that may hand out subtasks runs there, that task's subtask powers |
-| The **shared runner token** (`HUB_RUNNER_TOKEN`, for machines set up by hand) | `/etc/bullpen/hub.env`, and the `runner.json` of each machine that uses it | the same, for any machine name, except tasks that hand out subtasks and tasks for a tag, which only go to machines with their own token |
-| The hub's **MCP token** | every agent's settings on every machine | read and write the shared notes, and call every MCP server that goes through the hub, with your keys and sign-ins |
+| A machine's **runner token** | that machine's `~/.bullpen/runner.json`, readable only by its user; the hub keeps only a fingerprint | act as that machine: receive the jobs sent to it (prompts included), report results, and fetch that machine's own MCP token (a new one, which stops the one the machine holds) and the keys of MCP servers added **directly**; and, while a task that may hand out subtasks runs there, that task's subtask powers |
+| The **shared runner token** (`HUB_RUNNER_TOKEN`, for machines set up by hand) | `/etc/bullpen/hub.env`, and the `runner.json` of each machine that uses it | the same, for any machine name, except tasks that hand out subtasks and tasks for a tag, which only go to machines with their own token. It fetches the shared MCP token, never a machine's own |
+| A machine's own **MCP token** (for machines with their own runner token) | that machine's `~/.bullpen/mcp-token.json`, readable only by its user, and its agents' settings; the hub keeps only a fingerprint | read and write the shared notes, and call every MCP server that goes through the hub, with your keys and sign-ins, until you **Forget** the machine or press **New MCP token** on its page |
+| The hub's **shared MCP token** | the agents' settings on machines that use the shared runner token or a runner from before per-machine MCP tokens, and any client you set it up in | the same, until you press **Rotate** on the MCP page. `HUB_MCP_SHARED_TOKEN=0` turns it off |
 | A **job token** | a file in `~/.bullpen/jobs/<job>/` on the machine running that job, only for jobs that ask before commands or hand out subtasks; removed when the job ends; the hub keeps only a fingerprint. Any program running as the runner's user on that machine can read it while the job runs, other jobs included | while that one job runs: read the job's own details; in jobs set to "ask me before commands", ask you a question on the dashboard (not answer it); in jobs allowed to hand out subtasks, list the machines you allowed and start up to 5 subtasks within that job's scope and limits, and read their answers |
 | A **git account's token** (and the path of its SSH key) | that machine's `~/.bullpen/runner.json`, readable only by its user. It never reaches the hub: the hub learns only the account's name, host and kind | sign in to that git host as the account, with whatever access the token has. While a job with that account runs, its token is in the agent's environment, so the agent can use it too |
 | **Your Claude account's sign-in** (claude.ai, the Claude app) | wherever you are signed in | while Remote Control runs on a machine: drive Claude in that project folder there, and approve its commands |
@@ -63,16 +64,27 @@ limit, and when its machine stops checking in. It doesn't open the shared notes 
 routed through the hub (`/mcp/s/<name>`).
 
 Approvals are answered only on the dashboard. An agent's question waits on the job's page. Only someone
-logged in to the dashboard can press **Allow** or **Deny**; a job token, a runner token or the MCP token never
+logged in to the dashboard can press **Allow** or **Deny**; a job token, a runner token or an MCP token never
 can. The hub refuses jobs that ask before commands while `HUB_UI_PASSWORD` is empty, because without a
 password any program on your network could answer. A question nobody answers within 10 minutes
 (`HUB_APPROVAL_TIMEOUT_MIN`) is denied. A request over 20,000 characters is denied without being shown,
 since nobody can check that much on a card. On **Allow**, the agent gets exactly the input the card showed.
-If an agent tries to approve the hub's own tools, the hub denies it without asking.
+If an agent tries to approve the hub's own tools, the hub denies it without asking. **Allow for this job**
+also lets that same request through again without a card, until the job ends. It matches only the same tool
+with exactly the same input (a Bash command's description aside), never another job, and the hub refuses
+it for a request with hidden characters or blank lines.
 
-**Forget** on the dashboard revokes a machine's own token at once. If a machine is lost, follow the steps in
-[guide 10, "Security notes"](docs/10-shared-memory-and-mcp.md#security-notes): forget it, rotate the MCP
-token, change the keys of servers added directly, and sign its agents' accounts out.
+**Forget** on the dashboard revokes a machine's own runner token and its own MCP token at once, and no other
+machine is affected. Once a machine has had an MCP token of its own, its runner token never fetches the shared
+one again. Every machine held the shared MCP token before its runner got its own, though. If a machine is lost,
+follow the steps in [guide 10, "Security notes"](docs/10-shared-memory-and-mcp.md#security-notes): forget it,
+rotate the shared MCP token (unless it is off), change the keys of servers added directly, and sign its
+agents' accounts out.
+
+The hub compares the shared MCP token in constant time and finds a machine's own by its fingerprint, as it
+does runner tokens. Neither the hub nor the runner writes an MCP token to its log. The dashboard shows the
+shared one only under **Show**, and never a machine's own. Anything shaped like a machine's MCP token (`bpm_`
+and 43 characters) is masked in job logs, answers and diffs.
 
 ### Plain HTTP on your network
 
@@ -104,7 +116,7 @@ On the hub, readable only by root and the hub's service user:
   - for each task, the name of the git account and the MCP servers you picked (names only), and for each
     machine the git accounts it reports: name, host and kind, and which are its defaults. Never a token, a
     key path, a commit name or an email;
-  - the MCP token;
+  - the shared MCP token, and a fingerprint of each machine's own MCP token;
   - the MCP servers with their keys and headers, OAuth sign-ins (access and refresh tokens) and your own
     OAuth apps' client secrets;
   - the platform-credit settings you make on the Usage page (each organization's monthly amount and reset
@@ -113,6 +125,9 @@ On the hub, readable only by root and the hub's service user:
     report (or to `HUB_ANTHROPIC_COST_URL`, if you set it).
 
 Back the database up like a password store, and keep the backups as private as the hub.
+
+A Claude Code session on its way to another machine (**Move the exact session**, below) is kept only in the
+hub's memory, never in the database or a log.
 
 The hub never sees your agents' logins. Claude Code, Gemini CLI and the other agents keep their own logins
 and API keys on each machine, in their own folders. The hub only starts them through the runner.
@@ -177,19 +192,32 @@ and API keys on each machine, in their own folders. The hub only starts them thr
   - **The tools of picked servers are allowed at every level, Read only included.** The dashboard says so
     where you pick: "Tools of the picked servers are allowed even in Read only." A job with picks is
     never retried on credits by itself.
-  - **The agent program enforces the limit, not the hub.** The hub's relay at `/mcp/s/<name>` accepts the
-    shared MCP token from any agent, so a program holding the token can call any server routed through the hub,
-    whatever a task picked. Narrowing is Claude Code's `--strict-mcp-config`.
+  - **The agent program enforces the limit, not the hub.** The hub's relay at `/mcp/s/<name>` accepts any
+    valid MCP token (the shared one or a machine's own) from any agent, so a program holding one can call any
+    server routed through the hub, whatever a task picked. Narrowing is Claude Code's `--strict-mcp-config`.
   - **Subtasks never get a task's git account or MCP choice.** This stops an agent from giving itself tools
     beyond the subtask limits.
 
-  The settings file written for a job holds the hub's MCP token and any key of a server added directly. It is
+  The settings file written for a job holds the machine's MCP token and any key of a server added directly. It is
   private to the runner's user and deleted when the job ends. Its secrets are masked in the job's log, answer
   and diff: the job token and anything shaped like one, every value of 6 characters or more, and a shorter
   one when its name or place marks it as a secret (a header value, a URL's password, `API_KEY=12345`,
   `PIN=1234`). A short secret under an ordinary name (such as `CODE=1234`) isn't masked. Give a short secret
   a name with `key`, `token`, `pin` and so on, or use a longer one
   ([guide 10](docs/10-shared-memory-and-mcp.md#secrets-in-the-jobs-file)).
+- **Moving a session to another machine.** Only the dashboard can start one, and only you pick where it goes.
+  **Carry the conversation** puts the conversation so far into the new task's prompt, with anything that
+  looks like a secret masked. **Move the exact session** copies one Claude Code session to a machine signed in
+  to the same account:
+  - The first machine's runner reads only that session's transcript, by its exact path in the agent's settings
+    folder. It never reads the login (`.credentials.json`), the settings or another session, and never
+    follows a link.
+  - The transcript holds everything the session saw, file contents and command output included. It goes to
+    the hub as it is: masking would break it.
+  - The hub keeps it in memory and hands it once to the runner of the job it was made for. Then it is gone.
+    It is also gone after 10 minutes, when that job ends, or when the hub restarts.
+  - The other machine writes it into its own agent's settings folder, readable only by the runner's user. An
+    older copy of the same session there is set aside, not overwritten.
 - **Tags and account labels are claims a machine makes.** A machine reports its own tags and labels, so they
   count for tasks aimed at a tag and for subtasks only after you accept them on its page. The operating-system
   tag counts at once. A task for a tag runs under the one account it was made for, and only on a machine with
@@ -199,6 +227,14 @@ and API keys on each machine, in their own folders. The hub only starts them thr
   (`allow_remote_control`). It stops after 8 hours, on **Stop**, when the setting is turned off, and when
   the runner stops. Its error messages reach the hub with at most its last 5 lines, masked, and with e-mail
   addresses hidden.
+- **Sign-in status and Sign out.** To show whether a Claude agent is signed in, the runner runs that agent's
+  own `claude auth status --json` and keeps only whether it is signed in, the sign-in method, the API
+  provider, the plan and when the sign-in ends. The account's email and organization stay on the machine. The runner never reads a
+  login's files or the macOS Keychain. Signing in is never relayed: no sign-in link, code or token goes
+  through the hub, and the page only shows the command to run on the machine itself. **Sign out…** runs the
+  agent's own `claude auth logout` as a machine action. It's off unless the machine allows it
+  (`allow_remote_sign_out`), needs the dashboard password, and is refused while that agent runs a job or
+  Remote Control.
 - **Projects can carry instructions.** In headless mode Claude Code runs a project's own hooks and MCP servers
   without asking. Only add project folders you trust.
 - **Notes are instructions too.** Pinned notes go into every agent's context. Only the dashboard can pin, and

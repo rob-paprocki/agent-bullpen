@@ -107,8 +107,8 @@ DESCRIPTIONS = {
     "approve": ("Used by Claude Code as its permission prompt tool. Asks the user on the hub's dashboard whether "
                 "a tool call may run, and waits for the answer. Don't call it yourself."),
     "list_machines": ("The machines and projects the user lets this task hand subtasks to: online or not, "
-                      "operating system, tags, how busy, and which agents (with their accounts) and projects each "
-                      "offers. Use it before delegate_task."),
+                      "paused or not (a paused machine takes no subtasks), operating system, tags, how busy, and "
+                      "which agents (with their accounts) and projects each offers. Use it before delegate_task."),
     "delegate_task": ("Hand a self-contained subtask to an agent on one of the user's machines that list_machines "
                       "shows. Name the machine OR a tag (any online machine with that tag), and always name the "
                       "agent. Returns a job id at once; the subtask runs in the background. Then call task_status "

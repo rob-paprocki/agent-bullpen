@@ -24,18 +24,29 @@ to **List**. Each machine shows:
 - its tags, if it has any; dimmed ones count only once you accept them on its page
   ([guide 5](05-linux-and-macos-machines.md#tags-and-subtasks));
 - an **update** badge when the machine's runner is older than the hub's;
+- a **Paused** chip when you have taken it out of service on its page ([below](#pausing-a-machine));
 - a warning when two computers check in under the same name, naming the other computer.
 
 **Add a machine** makes a one-time code and shows the command to paste on the new machine, one for Linux and
 macOS and one for Windows ([guide 5](05-linux-and-macos-machines.md), [guide 6](06-windows-machines.md)).
-Codes you didn't use are listed there too, with **Revoke**. **Forget this machine** (on an offline
-machine's card, or at the bottom of its page) removes it and revokes its own token.
+You can also give the machine's tags (such as `gpu build`) and account labels (such as `claude=Work`) there.
+They count as soon as the machine reports them in its `runner.json`, so you don't need to accept them on its page.
+Anything else it reports still waits for **Accept**. Give a label only when the agent is signed in to that
+very account: every machine with the same label counts as one account. Codes you didn't use are listed there
+too, with the tags and labels each one accepts and a **Revoke** button. **Forget this machine** (on an offline
+machine's card, or at the bottom of its page) removes it and revokes its own runner token and MCP token.
 
 Below the machines is **Recent work**: the tasks and councils you sent. Machine chores (syncs, updates, git
 actions) have their own folded list, so they don't push real work out of view. Click any row to open it. A
 job that stopped at a usage limit shows **Claude usage limit** or **Gemini quota hit** next to its status.
 When any machine is out of date, an **Update all runners** button appears. Both it and **Sync all** say which
-machines they reached and which they skipped, and why.
+machines they reached and which they skipped, and why. Both reach paused machines too.
+
+To sync or update only some machines, pick a tag in the **Machines tagged …** box next to those buttons.
+A button such as **Sync 3 machines tagged gpu** appears, and **Update 2 runners tagged gpu** when some of them
+are out of date. They reach the machines a task for that tag could go to: machines with their own token
+where the tag counts (you accepted it, or it's the operating-system tag). A machine that reports the tag but
+doesn't count yet is skipped, and the message says why.
 
 These notices show at the top of the page when they apply:
 
@@ -65,17 +76,21 @@ Click a machine's name to manage it without going to it:
 - **How it signs in:** with its own token, or with the shared one. For a machine on the shared token, **Make a
   setup command** gives it its own (run the command on that machine; it keeps its name and projects).
   Tasks for a tag and subtasks only go to machines with their own token.
-- **Tags** show in the page's header: dimmed ones are reported but not accepted. A **takes subtasks** chip
-  means the machine's `runner.json` lets agents on your other machines hand it subtasks.
+- **Tags** show in the page's header: dimmed ones are reported but not accepted. On a machine with its own
+  token, click a tag that counts to open the Overview with that tag picked for **Machines tagged …**. A
+  **takes subtasks** chip means the machine's `runner.json` lets agents on your other machines hand it
+  subtasks.
 - **Tags and account labels:** what the machine reports about itself counts for tasks aimed at a tag and for
   subtasks only once you accept it here.
   1. Under **To accept**, look at the tags and labels listed. Untick anything you don't recognise, and any
      label that isn't that very account.
   2. Click **Accept**.
 
-  **Accepted** lists what counts now. Click **×** next to one to withdraw it: tasks for that tag stop coming
-  here, and an agent whose label you withdraw counts as an account of its own again. The operating-system
-  tag (`linux`, `macos`, `windows`) counts without accepting.
+  **Accepted** lists what you've accepted, including the tags and labels you gave in **Add a machine**
+  (they're added at the machine's first check-in). One the machine doesn't report is marked "not reported
+  now" and doesn't count. Click **×** next to one to withdraw it: tasks for that tag stop
+  coming here, and an agent whose label you withdraw counts as an account of its own again. The
+  operating-system tag (`linux`, `macos`, `windows`) counts without accepting.
 - **Agents:** whether each one is ready, and its default model and model suggestions. For Claude agents
   there are two more columns:
   - **Account** is the agent's account label, or "(no label)" ([guide 5](05-linux-and-macos-machines.md#account-labels)).
@@ -88,6 +103,23 @@ Click a machine's name to manage it without going to it:
     has a **credits agent** chip under its name, with its organization and the state of its platform credits
     (available, reserve, used up, or not set up), as on the [Usage](#platform-credits) page. When it can't be
     used, the chip says why, for example that its account label isn't accepted yet.
+  - **Sign-in**, under each Claude agent's status, is what that agent's own Claude Code says about its
+    sign-in (`claude auth status`), for example "Signed in (Pro, subscription)", "Signed out", or "Unknown
+    (CLI too old)". The runner asks again every 10 minutes, and every minute while an agent is signed out,
+    so a new sign-in shows up within a minute or so. Agents that use an API key or a `setup-token` token,
+    Gemini agents and other CLIs show nothing here.
+  - **Signed out, or the sign-in ends within a week:** the page shows the command to run, such as
+    `claude auth login` or `claude-work auth login`, with a **Copy** button. Run it in a terminal on that
+    machine: at its keyboard or over SSH. On a Mac, use Terminal on the Mac itself, because over SSH the
+    login Keychain is locked. While the sign-in still works, a Remote Control session there
+    works too. Sign in with the same account as before. Claude Code opens Anthropic's own sign-in page, and the
+    hub never sees any of it.
+  - **Sign out…** signs a Claude agent out on its machine (it runs `claude auth logout`, or the agent's own
+    command). The button appears only when the machine's `runner.json` allows it (`allow_remote_sign_out`,
+    [guide 5](05-linux-and-macos-machines.md#signing-agents-out-from-the-dashboard)) and the hub has a
+    dashboard password. The page asks before it does anything. It is refused while that agent is running a
+    job or Remote Control. After a sign-out, the agent can't take jobs until someone signs in again on the
+    machine itself; the dashboard can't sign it back in.
 - **Check limits** (next to the agents) asks each Claude agent on the machine for its plan limits, with Claude
   Code's own `/usage` command. It opens the job, which lists what it read. The job starts with a "Not
   checked" line, with the reason, for each agent with a long-lived `setup-token` login: it can't ask those.
@@ -96,8 +128,9 @@ Click a machine's name to manage it without going to it:
 - **Remote Control** lists the Remote Control servers running on the machine, with **Open** (their
   claude.ai address) and **Stop**, and has the form to start one ([below](#live-interactive-sessions-remote-control)).
   While a server runs, anyone signed in to that Claude account can drive Claude in that project folder and
-  approve its commands, and none of that shows in the hub. A server stops by itself after 8 hours. Claude
-  agents that can't run it (an API key, a `setup-token` login) are listed with the reason.
+  approve its commands, and none of that shows in the hub. A server stops by itself after 8 hours. A
+  server you chose to start again when the runner starts says so under its state. Claude agents that can't
+  run it (an API key, a `setup-token` login) are listed with the reason.
 - **Projects:** every folder it offers, with **Pull** (`git pull --ff-only`) and **Remove**. Remove only stops
   offering the folder; nothing is deleted.
 - **Git accounts:** each account the machine has, with its host and kind, and the projects and machine it is
@@ -116,6 +149,29 @@ The page also lists the machine's recent work, with a link to all of it in **His
 
 If you don't want a machine to be managed remotely, answer "no" to those two questions in
 `runner.py init`. That sets `allow_remote_projects` / `allow_remote_update` to `false` in its `runner.json`.
+
+#### Pausing a machine
+
+Pause a machine to take it out of service, for example while you fix or upgrade it. The hub keeps the
+setting, so you can pause a machine that is offline.
+
+1. On the machine's page, click **Pause…**.
+2. Choose what happens to the jobs it is running: **Let running jobs finish** (the default) or **Cancel
+   running jobs**. Cancelling works as **Cancel** does on each job: its subtasks stop too, and a council
+   goes on without that step.
+3. Click **Pause** followed by the machine's name.
+
+While it is paused:
+
+- it gets no new tasks, council steps or subtasks;
+- work sent to it by name waits, and the job's page says "Waiting: build-box is paused";
+- tasks for one of its tags go to other machines with that tag;
+- you can still send it a task: the New task form says it is paused, and the task waits;
+- updates, syncs, git actions, **Check limits** and **Stop** for Remote Control still work, so you can fix it;
+- **Start Remote Control** is refused. Remote Control servers that were already running keep running; stop
+  them yourself if you need to.
+
+Click **Resume** to put it back in service. The work that waited starts then.
 
 ### New task: one prompt, one agent
 
@@ -264,7 +320,8 @@ When you tick it, you set the scope:
 
 - **Subtasks may go to:** the machines and tags subtasks may use. Nothing ticked means every machine that
   takes subtasks. A machine takes them only when its `runner.json` says so (`accept_delegated_tasks`,
-  [guide 5](05-linux-and-macos-machines.md#tags-and-subtasks)), and only with its own runner token.
+  [guide 5](05-linux-and-macos-machines.md#tags-and-subtasks)), and only with its own runner token. A paused
+  machine takes none: the agent sees it as paused, and the hub refuses a subtask for it.
 - **Projects:** by default only a project named like this task's, and `chat`. Choose **any project** to
   allow more.
 - **Accounts** and **Agents:** by default every one of your accounts and agents on those machines is ticked,
@@ -307,9 +364,28 @@ to run something: "claude-work wants to use Bash", then exactly what it wants to
    claim, not a check.
 3. Press **Allow** to let it run exactly what the card shows. Or type a **Reason** and press **Deny**; the
    agent gets your reason and can try another way.
+4. Or press **Allow for this job**, if the agent will need the same command again (`npm test` after each
+   change, say). It runs this time, and later requests in this job that are exactly the same run without a
+   card.
 
 The agent edits files in the project without asking. So a command that runs the project's own code (`npm
 test`, `make`, `pytest`) runs whatever the agent wrote there: allow it only for a task whose input you trust.
+With **Allow for this job** that matters more, because the same `npm test` runs whatever the agent has
+changed since you allowed it.
+
+How **Allow for this job** works:
+
+- "The same" means the same tool and exactly the same input, down to every space. There are no prefixes and
+  no patterns: `npm test -- --watch` or `npm run test` gets a card of its own. The one thing it ignores is the
+  agent's description of a command ("The agent says: …"), since that is never run.
+- It covers this job only, and ends when the job ends. A follow-up, a subtask, a council step or a job on
+  another machine asks again. In a live session it lasts until the session ends. It can't be taken back
+  while the job runs; to stop it, press **Cancel**.
+- Only the hub keeps it.
+- It isn't offered when the card says **hidden characters** or **blank lines**. Read those and press
+  **Allow** or **Deny**.
+- Each request it lets through is listed under **Approvals** as "allowed automatically", with the number of
+  the question you allowed, and gets a line in the job's log.
 
 If you don't answer by the time the card shows (10 minutes by default), the hub denies it. Several cards can
 appear at once when the agent runs tools in parallel. Answered questions are listed under **Approvals**. A
@@ -330,6 +406,10 @@ the session had ended". Once a session has ended, **Follow up** continues the co
 
 **A task waiting for a tag.** Until a machine takes it, a task for a tag says what it waits for, for example
 "Waiting for a free machine tagged gpu with claude (personal) and myapp. 2 machines match; 1 is online."
+Paused machines are counted on their own ("… 1 is online and 1 is paused").
+
+**A task waiting for a paused machine** says "Waiting: build-box is paused", with a link to the machine. A
+council step and a subtask's row in the **Subtasks** card say so too. It starts when you resume the machine.
 
 **Subtasks.** A task that handed out subtasks lists them in a **Subtasks** card: number, title, machine,
 agent, account and status, each linked to its own page. The page keeps refreshing while any of them runs. A
@@ -354,6 +434,9 @@ below it:
   error, a cancel or a time-out too, as long as the agent had started its session, and on a council's steps.
   You choose again what the agent may do. Leave the model box blank to keep the job's model, or pick
   another.
+- **Continue on another machine.** Carries the conversation on somewhere else: any agent with the
+  conversation so far, or the same Claude Code session on another machine with the same account. See
+  [Continue on another machine](#continue-on-another-machine) below.
 - **Show as a conversation.** Once a job has follow-ups, or is one, this link shows the whole chain on one
   page: each prompt and each answer, with a link to each job.
 - **Tokens.** When the job has finished, a line shows the tokens it used: tokens in (with how many were read
@@ -373,6 +456,54 @@ below it:
   and in History. A retry says "retried on credits" with a link to the job that stopped, and that job links
   to its retry. A task that stopped at a usage limit, and wasn't retried by itself because it may have
   changed files, shows a **Retry on credits** button when its machine has a credits agent with credit left.
+
+### Continue on another machine
+
+A finished task's conversation can continue on another machine, for example one with the right hardware or
+operating system for the next step. Only you start this; the hub never moves work on its own. There are two
+ways:
+
+| Way | What happens | Works with |
+|---|---|---|
+| **Carry the conversation** | A new task on the machine, agent and project you pick. Its prompt starts with the conversation so far (your prompts and the agent's answers, live-session messages included), then your new message. The agent starts a new session. | Any agent, on any system. |
+| **Move the exact session** | The same Claude Code session continues on the other machine. The first machine sends the session's transcript to the hub, the hub hands it once to the other machine, and that machine resumes the session. | Claude agents on the same account (the same account label, accepted on [each machine's page](#a-machines-own-page)), with a project of the same name on both machines. |
+
+1. Open the finished task's page.
+2. Under **Follow up**, open **Continue on another machine**.
+3. Pick the **Machine**, the **Agent** and the **Project**. Each agent shows its account in brackets.
+4. Pick **Carry the conversation** or **Move the exact session**. If the exact session can't go to that agent,
+   the line under the choice says why.
+5. Type your next message and choose what the agent may do.
+6. Press **Continue there**.
+
+The new job's page opens. It says "continued from #12 on build-box" (or "session moved from" for an exact
+move), and the first job's page says "Continued on #15".
+
+**Files stay where they were changed.** A move takes only the conversation along. If the
+job recorded a diff ("Show me a diff of what changed afterwards"), the form lists the files it changed. To
+work on them on the other machine, commit and push them on the first machine, then pull them on the other
+one.
+
+**How much is carried.** A carried conversation keeps its newest messages, up to 60,000 characters in all and
+12,000 for one message. The prompt says how many of the oldest messages were left out. Anything in the
+answers that looks like a secret, such as an API key, is masked first, as in the job's log.
+
+**After a usage limit.** If the conversation stopped at a usage limit, or an earlier turn of it did in the
+last week, it can continue only on the same account: the hub refuses a carry to another account. Usage limits
+aren't a reason to switch accounts ([guide 1](01-accounts-and-rules.md#more-than-one-claude-account)); wait
+for the reset.
+
+**What an exact move needs.**
+
+- Both machines run this version of the runner, and the first machine is online.
+- The move starts from the session's newest turn. After it, follow up on the new job, not the old one:
+  otherwise the two copies of the session go separate ways.
+- The first machine's history shows a machine action, "Send a session to …". It reads only that session's
+  file from the agent's settings folder, nothing else there.
+- The new job waits until the copy arrives ("Waiting for build-box to send this session"). The hub keeps the
+  copy in memory for at most 10 minutes and deletes it once the other machine has taken it. A session larger
+  than 32 MB can't move (`HUB_SESSION_MOVE_MAX_MB`, [guide 4](04-proxmox-hub.md#running-it)).
+- If the copy can't be made, the new job fails and says why ([guide 9](09-troubleshooting.md#claude-code)).
 
 ### Council: agents working together and against each other
 
@@ -549,10 +680,19 @@ Anthropic's own **Remote Control**. Claude runs on your machine, and you drive i
 default ([guide 5](05-linux-and-macos-machines.md#remote-control)).
 
 1. Open the machine's page.
-2. Under **Remote Control**, pick the agent and the project, and press **Start Remote Control**.
-3. When it is running, the page shows the server with an **Open** link. Open claude.ai/code or the Claude
+2. Under **Remote Control**, pick the agent and the project.
+3. If the server should come back after the computer restarts, tick **Start again when the runner starts**.
+4. Press **Start Remote Control**.
+5. When it is running, the page shows the server with an **Open** link. Open claude.ai/code or the Claude
    app, signed in to that agent's Claude account, and start a session on that server.
-4. Press **Stop** when you're done. Otherwise it stops by itself after 8 hours, and when the runner stops.
+6. Press **Stop** when you're done. Otherwise it stops by itself after 8 hours, and when the runner stops.
+
+**Start again when the runner starts.** With this ticked, a server stopped by a restart of the computer or
+of the runner comes back by itself. The runner starts it again once it has checked in with the hub. The 8
+hours still count from the first start, so it stops at the same time as before, and if that time has passed
+it stays off. The runner tries once. If the server doesn't start, the machine's page shows why, and the
+runner doesn't try again until you press **Start**. After **Stop**, the server doesn't come back on its
+own. The box shows only for machines whose runner is up to date (**Update now**).
 
 In a git project, one session works in the project folder itself and each new session gets its own git
 worktree; elsewhere every session works in the folder. Remote Control

@@ -151,8 +151,9 @@ if it crashes, and has no time limit.
 - **Don't sleep on AC power**, so the PC stays reachable.
 - **Shared context sync.** This runs by itself and asks nothing. It adds your pinned notes, the `/remember`
   and "second opinion" add-ons, and the servers from the hub's MCP page to every Claude account, Gemini CLI
-  and Antigravity on this PC ([guide 10](10-shared-memory-and-mcp.md)). If you answered "no" to letting the
-  hub manage agent settings in step 5, it changes nothing.
+  and Antigravity on this PC. The `remember` skill also goes to `%USERPROFILE%\.agents\skills`, for other
+  agent CLIs such as Codex and OpenCode ([guide 10](10-shared-memory-and-mcp.md)). If you answered "no" to
+  letting the hub manage agent settings in step 5, it changes nothing.
 
 ## Keeping a Windows machine available
 
@@ -191,6 +192,10 @@ The hub's other ways of working with an agent work on Windows too:
   them.
 - **Tags and subtasks** work as on Linux and macOS: the PC reports `windows` as a tag by itself, and
   [guide 5](05-linux-and-macos-machines.md#tags-and-subtasks) explains `tags` and `accept_delegated_tasks`.
+- **Sign-in and Sign out** work as on Linux and macOS. The login command the machine's page shows is
+  written for PowerShell, for example `$env:CLAUDE_CONFIG_DIR='C:\Users\you\.claude-work'; claude auth login`.
+  **Sign out…** is off unless `allow_remote_sign_out` is `true` in `%USERPROFILE%\.bullpen\runner.json`
+  ([guide 5](05-linux-and-macos-machines.md#signing-agents-out-from-the-dashboard)).
 
 ## Adding agents later
 
@@ -276,19 +281,56 @@ Things to know on Windows:
 | Re-run the setup questions | `py -3 $HOME\.bullpen\runner\runner.py init` |
 | Connect with a new code | `py -3 $HOME\.bullpen\runner\runner.py enroll --hub http://192.168.100.20:8080 --code K7QM-2XTA-9RFD-WP3H` |
 
-Stopping the runner also stops the Remote Control servers it started.
+Stopping the runner also stops the Remote Control servers it started. The ones started with **Start again
+when the runner starts** come back when the runner starts again (after you sign in, following a restart).
 
 A PC set up by hand with the hub's shared runner token works too.
 [Guide 5](05-linux-and-macos-machines.md#machines-set-up-with-the-shared-token) explains how to give one its
 own token. Guide 5 also covers
-[two computers with the same name](05-linux-and-macos-machines.md#two-computers-with-the-same-name) and
-[removing a machine](05-linux-and-macos-machines.md#removing-a-machine). On Windows, "stop the runner" means
-the **Stop it for good** line above; afterwards you can delete `%USERPROFILE%\.bullpen`.
+[two computers with the same name](05-linux-and-macos-machines.md#two-computers-with-the-same-name).
+
+## Removing a PC
+
+The runner can remove itself and what the setup and the hub added to the PC. In a normal PowerShell window
+(not "Run as administrator"):
+
+1. See what it would remove. This changes nothing:
+
+   ```powershell
+   py -3 $HOME\.bullpen\runner\runner.py uninstall --dry-run
+   ```
+
+2. Remove it. It shows the same list and asks before it changes anything:
+
+   ```powershell
+   py -3 $HOME\.bullpen\runner\runner.py uninstall
+   ```
+
+3. On the dashboard, wait until the PC shows as offline, then click **Forget this machine** on its card. This
+   also cancels its runner token.
+
+It stops and removes the scheduled task "Agent Bullpen Runner", and deletes `%USERPROFILE%\.bullpen`. It also
+removes `bullpen.cmd` and the commands made for extra Claude accounts (such as `claude-work.cmd`) from
+`%USERPROFILE%\.local\bin`, and whatever the hub added to the agents' own settings.
+[Guide 5](05-linux-and-macos-machines.md#removing-a-machine) has the full list.
+
+It leaves alone:
+
+- the agents' logins and settings: `%USERPROFILE%\.claude`, each `.claude-<name>`, and `.gemini`.
+- your projects, and Claude Code, Gemini CLI, Python, Git and Node.js.
+- `%USERPROFILE%\.local\bin` on your PATH, since Claude Code lives there too.
+- the sleep settings from step 8 of the setup. To let the PC sleep again, change them in Windows' power
+  settings.
+
+**By hand**, if the runner's files are already gone: run the **Stop it for good** line from
+[Managing the runner](#managing-the-runner), delete `%USERPROFILE%\.bullpen` and
+`%USERPROFILE%\.local\bin\bullpen.cmd`, then do steps 3 and 4 of the manual steps in
+[guide 5](05-linux-and-macos-machines.md#removing-a-machine).
 
 ## Updating
 
 Claude Code updates itself. For Gemini CLI, run `npm install -g @google/gemini-cli@latest`.
 
 For the runner, use **Update now** on the machine's page in the hub (or **Update all runners** on the
-Overview) after you've upgraded the hub. The hub hands out its own copy of the runner, so hub and runners stay
+Overview, for every machine or only those with a tag) after you've upgraded the hub. The hub hands out its own copy of the runner, so hub and runners stay
 on the same version.

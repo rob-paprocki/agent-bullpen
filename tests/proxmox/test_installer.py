@@ -39,7 +39,7 @@ ALLOWED_URL = re.compile(
     r"|https://pkg\.cloudflare\.com/cloudflare-main\.gpg$)")
 SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules"}
 SHELL_FILES = ["ct/bullpen.sh", "misc/build.func", "misc/core.func", "misc/install.func",
-               "install/bullpen-install.sh", "scripts/linux/install-hub.sh",
+               "install/bullpen-install.sh", "scripts/linux/install-hub.sh", "scripts/linux/uninstall-hub.sh",
                "scripts/proxmox/create-hub-lxc.sh", "scripts/proxmox/upgrade-hub-lxc.sh"]
 
 
@@ -702,6 +702,60 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("BULLPEN_SOURCE_KIND='release'", release)
         self.assertIn("BULLPEN_SOURCE_REF='v1.0.0'", release)
         self.assertNotIn(token, run.out)
+        self.assert_clean_logs(run)
+
+    def test_uninstall_hub(self):
+        self.install_default()
+        root = self.rootfs()
+        token = "eyJhIjoiYWJjZGVmZ2hpamtsbW5vcCIsInQiOiJ1bmluc3RhbGwifQ"
+        self.secrets.append(token)
+        run = self.run_cmd(f"bash {root}/opt/bullpen/src/scripts/linux/install-hub.sh",
+                           self.env(container="100", BULLPEN_NONINTERACTIVE="1", CF_TUNNEL_TOKEN=token))
+        self.assert_ok(run)
+        (root / "var/lib/bullpen/hub.db").write_text("my job history")
+        (root / "etc/cloudflared/config.yml").write_text("someone else's tunnel settings")
+        script = f"bash {REPO}/scripts/linux/uninstall-hub.sh"
+        env = self.env(container="100")
+        installed = ("opt/bullpen/app/app.py", "etc/systemd/system/bullpen.service", "usr/bin/update",
+                     "etc/profile.d/00_bullpen-details.sh", "etc/systemd/system/cloudflared.service",
+                     "etc/cloudflared/bullpen-tunnel.env")
+        for rel in installed:
+            self.assertTrue((root / rel).exists(), rel)
+
+        run = self.run_cmd(f"{script} --dry-run", env)
+        self.assert_ok(run)
+        for text in ("the bullpen service (/etc/systemd/system/bullpen.service), stopped first",
+                     "/opt/bullpen: the hub's code", "the Cloudflare Tunnel connector", "the update command",
+                     "Only if you say so", "/var/lib/bullpen: the hub's data", "Dry run: nothing was changed."):
+            self.assertIn(text, run.out)
+        run = self.run_cmd(script, env)  # no keyboard and no --yes: it doesn't guess
+        self.assertEqual(run.rc, 1, run.out)
+        self.assertIn("Nothing was changed.", run.out)
+        for rel in installed:
+            self.assertTrue((root / rel).exists(), rel)
+
+        run = self.run_cmd(f"{script} --yes", env)
+        self.assert_ok(run)
+        for rel in installed + ("opt/bullpen",):
+            self.assertFalse((root / rel).exists(), rel)
+        calls = self.read(self.state / "calls.log")
+        self.assertIn(f"systemctl [{root}] disable --now bullpen", calls)
+        self.assertIn(f"systemctl [{root}] disable --now cloudflared", calls)
+        self.assertNotIn("userdel", calls)
+        # The data, the settings and the user who owns them stay unless you ask.
+        self.assertEqual(self.read(root / "var/lib/bullpen/hub.db"), "my job history")
+        self.assertTrue((root / "etc/bullpen/hub.env").exists() and (root / ".stub-users/bullpen").exists())
+        self.assertEqual(self.read(root / "etc/cloudflared/config.yml"), "someone else's tunnel settings")
+        self.assertIn("kept /var/lib/bullpen, /etc/bullpen and the service user 'bullpen'", run.out)
+
+        run = self.run_cmd(f"{script} --yes --delete-data", env)
+        self.assert_ok(run)
+        for rel in ("var/lib/bullpen", "etc/bullpen", ".stub-users/bullpen"):
+            self.assertFalse((root / rel).exists(), rel)
+        self.assertIn(f"userdel [{root}] bullpen", self.read(self.state / "calls.log"))
+        run = self.run_cmd(f"{script} --yes", env)
+        self.assert_ok(run)
+        self.assertIn("nothing of the hub is left on this machine", run.out)
         self.assert_clean_logs(run)
 
     def test_update_follows_a_branch(self):

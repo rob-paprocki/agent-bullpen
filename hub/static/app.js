@@ -211,14 +211,21 @@ function authBadge(r) {
 const agentChips = (r) => (r.agents || []).map((a) => `<span class="chip ${a.ready ? 'ok' : 'warn'}" title="${esc(a.note || 'ready')}">${esc(a.name)}${a.ready ? '' : ' ⚠'}</span>`).join('')
   || '<span class="muted small">no agents</span>';
 const machineState = (r) => (r.online ? 'online' : `offline · ${ago(r.last_seen)}`);
+// Paused on its page: it takes no new tasks, council steps or subtasks; machine actions still run.
+const PAUSED_TITLE = 'Paused: it takes no new tasks, council steps or subtasks until you resume it. Updates, syncs and git actions still run.';
+const pausedChip = (r) => (r && r.paused ? `<span class="chip warn" title="${esc(PAUSED_TITLE)}">Paused</span>` : '');
 const machineLink = (r) => `<a href="#/machine/${encodeURIComponent(r.name)}">${esc(r.name)}</a>`;
 
 // A machine's tags as chips: those that count first, then, dimmed, those it reports that you haven't
-// accepted. '' when it has none.
-function tagChips(r) {
+// accepted. '' when it has none. With `links` (the machine page), a counted tag on a machine with its own
+// token opens the Overview with that tag picked, to sync or update every machine tagged so.
+function tagChips(r, links = false) {
   const counted = Array.isArray(r.accepted_tags) ? r.accepted_tags.filter((t) => typeof t === 'string') : [];
   const waiting = (Array.isArray(r.tags) ? r.tags : []).filter((t) => typeof t === 'string' && !counted.includes(t));
-  return counted.map((t) => `<span class="chip tag">${esc(t)}</span>`)
+  const linked = links && r.auth === 'machine';
+  return counted.map((t) => (linked
+    ? `<a class="chip tag" href="#/?tag=${encodeURIComponent(t)}" title="Sync or update every machine tagged ${esc(t)}">${esc(t)}</a>`
+    : `<span class="chip tag">${esc(t)}</span>`))
     .concat(waiting.map((t) => `<span class="chip tag dim" title="It reports this tag, but you haven't accepted it">${esc(t)} · not accepted</span>`))
     .join('');
 }
@@ -227,7 +234,7 @@ function machineCard(r) {
   const clash = clashOf(r);
   return `<div class="card machine">
     <div class="m-head"><h3><span class="dot ${r.online ? 'on' : ''}"></span> ${machineLink(r)}</h3>
-      <span class="muted small m-state">${machineState(r)}</span></div>
+      <span class="muted small m-state">${pausedChip(r)} ${machineState(r)}</span></div>
     ${clash ? `<div class="clash small">Two computers use this name: ${esc(r.hostname || '?')} and ${esc(clash)}</div>` : ''}
     <div class="muted small">${esc(r.os)} · runner ${esc(r.version)} ${outdated(r) ? `<span class="chip warn">update to ${esc(state.runner_latest)}</span>` : ''} ${authBadge(r)}</div>
     <div class="m-agents">${agentChips(r)}</div>
@@ -241,7 +248,7 @@ function machineRow(r) {
   const clash = clashOf(r);
   return `<tr><td class="ml-name"><span class="dot ${r.online ? 'on' : ''}"></span> ${machineLink(r)}
       ${clash ? `<span class="chip warn" title="Two computers use this name: ${esc(r.hostname || '?')} and ${esc(clash)}">name clash</span>` : ''}</td>
-    <td class="ml-state small muted">${machineState(r)}</td>
+    <td class="ml-state small muted">${pausedChip(r)} ${machineState(r)}</td>
     <td class="ml-agents">${agentChips(r)}</td>
     <td class="ml-tags">${tagChips(r) ? `<span class="phone-only muted small">tags: </span>${tagChips(r)}` : ''}</td>
     <td class="ml-busy small">${busyOf(r)}/${slotsOf(r)} busy</td>
@@ -475,7 +482,8 @@ const overageReason = (r) => own(OVERAGE_REASONS, r) || String(r || '').replace(
 // ---------------------------------------------------------------- overview
 // The page is drawn once; every 5 seconds only the machine and job lists are redrawn, so the
 // filter box keeps what you type and where the cursor is.
-const overview = { filter: '', stopping: new Set() };
+// groupTag is the tag picked for "Machines tagged …" (#/?tag=gpu, from a machine page, picks one).
+const overview = { filter: '', stopping: new Set(), groupTag: '' };
 const isOverview = () => location.hash === '' || location.hash === '#/' || location.hash === '#';
 
 function viewMode(count) {
@@ -492,8 +500,50 @@ function fleetMsg(html, isError, boxId = 'fleet-msg') {
   box.hidden = false;
 }
 
+// Ask every machine, or every machine tagged `tag`, to sync ('sync') or to update its runner
+// ('update'). The answer names how many it reached, and which it skipped and why.
+async function fleetAction(action, tag) {
+  const body = tag ? { tag } : {};
+  const tagged = tag ? ` tagged ${esc(tag)}` : '';
+  if (action === 'sync') {
+    const r = await api('/api/runners-sync-all', { method: 'POST', body });
+    return `${r.queued.length ? `Asked ${plural(r.queued.length, 'machine')}${tagged} to sync now.` : `No machine${tagged} was asked to sync.`}${skippedText(r)}`;
+  }
+  const r = await api('/api/runners-update-all', { method: 'POST', body });
+  return `${r.queued.length ? `Queued the update to ${esc(r.version)} on ${plural(r.queued.length, 'machine')}${tagged}. You can follow it under Machine admin below.`
+    : `No update was queued${tag ? ` for machines${tagged}` : ''}.`}${skippedText(r)}`;
+}
+
+// The "Machines tagged …" picker: the tags tasks can be aimed at (tagMachines), each with its machine count.
+// The list is only rebuilt when it changes, so a redraw doesn't close it while you pick.
+function drawGroupPicker() {
+  const groups = tagMachines();
+  const box = document.getElementById('m-group');
+  const sel = document.getElementById('group-tag');
+  if (overview.groupTag && !groups.has(overview.groupTag)) overview.groupTag = '';
+  box.hidden = !groups.size;
+  const options = `<option value="">Machines tagged …</option>${[...groups].map(([t, list]) => `<option value="${esc(t)}">${esc(t)} (${list.length})</option>`).join('')}`;
+  if (sel.dataset.options !== options) { sel.innerHTML = options; sel.dataset.options = options; }
+  sel.value = overview.groupTag;
+  const members = overview.groupTag ? groups.get(overview.groupTag) : [];
+  const sync = document.getElementById('group-sync');
+  const online = members.filter((r) => r.online).length;
+  sync.hidden = !online;
+  sync.textContent = `Sync ${plural(online, 'machine')} tagged ${overview.groupTag}`;
+  const upd = document.getElementById('group-update');
+  const behind = members.filter(outdated).length;
+  upd.hidden = !behind;
+  upd.textContent = `Update ${plural(behind, 'runner')} tagged ${overview.groupTag} to ${state.runner_latest}`;
+}
+
 async function renderOverview() {
   stopTimer();
+  // #/?tag=gpu (a tag on a machine's page) opens the Overview with that tag picked.
+  const asked = location.hash.match(/^#\/\?(?:.*&)?tag=([^&]*)/);
+  if (asked) {
+    try { overview.groupTag = decodeURIComponent(asked[1]); } catch (e) { /* not a tag: nothing picked */ }
+    window.history.replaceState(null, '', '#/');
+  }
   await loadState();
   view.innerHTML = `
     <h1>Overview</h1>
@@ -508,6 +558,9 @@ async function renderOverview() {
         <button type="button" class="ghost small" data-view="cards" aria-pressed="false">Cards</button><button type="button" class="ghost small" data-view="list" aria-pressed="false">List</button></div>
       <button type="button" class="ghost small" id="sync-all" title="Ask every online machine to pick up the latest notes, add-ons and MCP servers now">Sync all</button>
       <button type="button" class="ghost small" id="update-all" hidden></button>
+      <span class="m-group" id="m-group" hidden><select id="group-tag" aria-label="Sync or update the machines with a tag"></select>
+        <button type="button" class="ghost small" id="group-sync" hidden></button>
+        <button type="button" class="ghost small" id="group-update" hidden></button></span>
     </div>
     <div id="fleet-msg" class="notice" hidden></div>
     <div id="m-clash"></div>
@@ -545,22 +598,19 @@ async function renderOverview() {
     } catch (e) { overview.stopping.delete(key); fleetMsg(esc(e.message), true); drawOverview(); }
   });
 
-  document.getElementById('sync-all').addEventListener('click', async (ev) => {
+  // Sync all and Update all runners, for every machine or (with a tag) for the machines tagged so.
+  const fleetButton = (id, action, tagOf) => document.getElementById(id).addEventListener('click', async (ev) => {
     const b = ev.currentTarget; b.disabled = true;
     try {
-      const r = await api('/api/runners-sync-all', { method: 'POST', body: {} });
-      fleetMsg(`${r.queued.length ? `Asked ${plural(r.queued.length, 'machine')} to sync now.` : 'No machine was asked to sync.'}${skippedText(r)}`);
+      fleetMsg(await fleetAction(action, tagOf()));
       await loadState(); drawOverview();
     } catch (e) { fleetMsg(esc(e.message), true); } finally { b.disabled = false; }
   });
-  document.getElementById('update-all').addEventListener('click', async (ev) => {
-    const b = ev.currentTarget; b.disabled = true;
-    try {
-      const r = await api('/api/runners-update-all', { method: 'POST', body: {} });
-      fleetMsg(`${r.queued.length ? `Queued the update to ${esc(r.version)} on ${plural(r.queued.length, 'machine')}. You can follow it under Machine admin below.` : 'No update was queued.'}${skippedText(r)}`);
-      await loadState(); drawOverview();
-    } catch (e) { fleetMsg(esc(e.message), true); } finally { b.disabled = false; }
-  });
+  fleetButton('sync-all', 'sync', () => '');
+  fleetButton('update-all', 'update', () => '');
+  fleetButton('group-sync', 'sync', () => overview.groupTag);
+  fleetButton('group-update', 'update', () => overview.groupTag);
+  document.getElementById('group-tag').addEventListener('change', (ev) => { overview.groupTag = ev.target.value; drawOverview(); });
 
   drawOverview();
   every(5000, async () => {
@@ -637,6 +687,7 @@ function drawOverview() {
   const behind = all.filter(outdated).length;
   upd.hidden = !behind;
   if (behind) upd.textContent = `Update ${behind === all.length ? 'all runners' : plural(behind, 'runner')} to ${state.runner_latest}`;
+  drawGroupPicker();
   document.getElementById('m-tools').hidden = !all.length;
   setRegion(document.getElementById('o-approvals'), approvalsNoticeHtml());
   setRegion(document.getElementById('o-accept'), acceptNoticeHtml(all));
@@ -706,6 +757,42 @@ async function copyText(text, btn) {
 
 function minutes(sec) { const m = Math.max(1, Math.round((sec || 0) / 60)); return plural(m, 'minute'); }
 
+// Tags and account labels typed into Add a machine, accepted up front for the new machine. Tags are words
+// with commas or spaces between them. Labels are agent=label pairs with commas or line breaks between them
+// (neither a name nor a label can hold ',' or '='). The hub checks both with the rules Accept uses.
+function parseEnrollTags(text) {
+  return [...new Set(String(text || '').toLowerCase().split(/[\s,]+/).filter(Boolean))];
+}
+function parseEnrollLabels(text) {
+  const accounts = new Map();
+  const bad = [];
+  for (const part of String(text || '').split(/[,\n]+/)) {
+    const item = part.trim();
+    if (!item) continue;
+    const at = item.indexOf('=');
+    const agent = at > 0 ? item.slice(0, at).trim() : '';
+    const label = at > 0 ? item.slice(at + 1).trim() : '';
+    if (!agent || !label || label.includes('=')) bad.push(item); else accounts.set(agent, label);
+  }
+  return { accounts: Object.fromEntries(accounts), bad };
+}
+
+// A code's tags and account labels accepted up front (code_view's `accepted`), as chips; '' when it has none.
+function enrollPresetChips(c) {
+  const acc = acceptedOf(c);
+  return acc.tags.map((t) => `<span class="chip tag">${esc(t)}</span>`)
+    .concat(Object.entries(acc.accounts).map(([agent, label]) => `<span class="chip">${esc(agent)} → ${esc(label)}</span>`))
+    .join('');
+}
+
+// One line of Add a machine's list of unused codes.
+function enrollCodeItemHtml(c) {
+  const chips = enrollPresetChips(c);
+  return `<li class="row spread"><span><code>${esc(c.code_hint)}…</code>
+      ${c.name ? `for <strong>${esc(c.name)}</strong>` : 'any name'} · expires in ${minutes(c.expires_in)}${chips ? ` · accepted up front: ${chips}` : ''}</span>
+      <button type="button" class="ghost small" data-revoke="${esc(c.code_hint)}">Revoke</button></li>`;
+}
+
 function openAddMachine(name) {
   const body = document.getElementById('add-machine-body');
   const lastUrl = prefs.get('enrollHubUrl', '') || state.runner_url || '';
@@ -715,6 +802,13 @@ function openAddMachine(name) {
     <form id="am-form">
       <label for="am-name">Machine name <span class="muted">optional; blank uses the computer's own name</span></label>
       <input type="text" id="am-name" maxlength="64" placeholder="e.g. build-box" autocomplete="off" value="${esc(name || '')}">
+      <label for="am-tags">Tags <span class="muted">optional; accepted for this machine up front</span></label>
+      <input type="text" id="am-tags" placeholder="e.g. gpu build" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="am-labels">Account labels <span class="muted">optional; agent=label, with commas between them</span></label>
+      <input type="text" id="am-labels" placeholder="e.g. claude=Work" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p class="muted small">Tags and labels you enter here count as soon as the machine reports them in its runner.json, with no
+        Accept on its page. Anything else it reports still waits for Accept. Only enter a label if the agent really is signed in
+        to that account: every machine with the same label counts as one account.</p>
       <label for="am-url">Hub address for machines <span class="muted">how the machine reaches this hub</span></label>
       <input type="text" id="am-url" placeholder="blank: the hub's own setting (HUB_RUNNER_URL)" autocomplete="off" value="${esc(lastUrl)}">
       <p class="muted small">Usually the hub's address on your network, such as <code>http://192.168.100.20:8080</code>.
@@ -728,6 +822,8 @@ function openAddMachine(name) {
   if (!addDialog.open) addDialog.showModal();
   const nameIn = document.getElementById('am-name');
   const urlIn = document.getElementById('am-url');
+  const tagsIn = document.getElementById('am-tags');
+  const labelsIn = document.getElementById('am-labels');
   (name ? urlIn : nameIn).focus();
   let made = null;  // the last code made here, so editing the form can offer a fresh one
 
@@ -737,9 +833,7 @@ function openAddMachine(name) {
       const data = await api('/api/enroll-codes');
       const codes = data.codes || [];
       if (!urlIn.value && codes.length && codes[0].hub_url) urlIn.placeholder = codes[0].hub_url;
-      box.innerHTML = codes.length ? `<ul class="codes">${codes.map((c) => `<li class="row spread"><span><code>${esc(c.code_hint)}…</code>
-          ${c.name ? `for <strong>${esc(c.name)}</strong>` : 'any name'} · expires in ${minutes(c.expires_in)}</span>
-          <button type="button" class="ghost small" data-revoke="${esc(c.code_hint)}">Revoke</button></li>`).join('')}</ul>`
+      box.innerHTML = codes.length ? `<ul class="codes">${codes.map(enrollCodeItemHtml).join('')}</ul>`
         : 'None. Codes you make here stay listed until they are used or expire.';
     } catch (e) {
       box.textContent = /HTTP 404|Not Found/i.test(e.message) ? '' : e.message;
@@ -760,8 +854,7 @@ function openAddMachine(name) {
     loadCodes();
   };
   const stale = () => { if (made) document.getElementById('am-make').textContent = 'Make a new code with these settings'; };
-  nameIn.addEventListener('input', stale);
-  urlIn.addEventListener('input', stale);
+  [nameIn, urlIn, tagsIn, labelsIn].forEach((input) => input.addEventListener('input', stale));
 
   document.getElementById('am-form').addEventListener('submit', async (ev) => {
     ev.preventDefault();
@@ -771,6 +864,11 @@ function openAddMachine(name) {
       const reqBody = {};
       if (nameIn.value.trim()) reqBody.name = nameIn.value.trim();
       if (urlIn.value.trim()) reqBody.hub_url = urlIn.value.trim();
+      const tags = parseEnrollTags(tagsIn.value);
+      const labels = parseEnrollLabels(labelsIn.value);
+      if (labels.bad.length) throw new Error(`Write each account label as agent=label, such as claude=Work. Not understood: ${labels.bad.join(', ')}`);
+      if (tags.length) reqBody.tags = tags;
+      if (Object.keys(labels.accounts).length) reqBody.accounts = labels.accounts;
       made = await api('/api/enroll-codes', { method: 'POST', body: reqBody });
       if (made.hub_url) { urlIn.value = made.hub_url; if (reqBody.hub_url) prefs.set('enrollHubUrl', made.hub_url); }
       const until = new Date(Date.now() + (made.expires_in || 3600) * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -782,7 +880,8 @@ function openAddMachine(name) {
         <div class="cmd"><code>${esc(made.windows)}</code><button type="button" class="small" data-copy="windows">Copy</button></div>
         <p class="small">Code <code>${esc(made.code)}</code>${made.name ? ` for <strong>${esc(made.name)}</strong>` : ''}. It works <strong>once</strong>, on one machine,
           and expires in ${minutes(made.expires_in || 3600)} (at ${esc(until)}). Make a new code for each machine.
-          The machine has to reach <code>${esc(made.hub_url || '')}</code>.</p>`;
+          The machine has to reach <code>${esc(made.hub_url || '')}</code>.</p>
+        ${enrollPresetChips(made) ? `<p class="small">Accepted up front: ${enrollPresetChips(made)}. They count once the machine reports them.</p>` : ''}`;
       res.hidden = false;
       res.scrollIntoView({ block: 'start', behavior: 'smooth' });  // on a phone the commands start below the form
       res.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', () => copyText(made[b.dataset.copy], b)));
@@ -798,9 +897,10 @@ function openAddMachine(name) {
 // machine, a seat can name a tag (value "tag:gpu"): the job then runs on the first free machine
 // with that tag, the agent and the project.
 function machineLabel(r) {
-  if (!r.online) return r.name;
+  const paused = r.paused ? ' · paused' : '';
+  if (!r.online) return r.name + paused;
   const busy = busyOf(r);
-  return busy ? `${r.name} · busy ${busy}/${slotsOf(r)}` : r.name;
+  return (busy ? `${r.name} · busy ${busy}/${slotsOf(r)}` : r.name) + paused;
 }
 
 // The tags a job can be aimed at, each with its machines: the tags that count (accepted ones and
@@ -849,7 +949,8 @@ function machineOptions(selected, filter) {
   const tags = [...tagMachines()].filter(([t]) => t === chosen || words.every((w) => `tag tagged ${t}`.includes(w)));
   if (chosen && !tags.some(([t]) => t === chosen)) tags.push([chosen, []]);
   const tagGroup = tags.length ? `<optgroup label="Any machine tagged…">${tags.map(([t, rs]) => {
-    const label = rs.length ? `Any machine tagged ${t} (${plural(rs.length, 'machine')}, ${rs.filter((r) => r.online).length} online)`
+    const paused = rs.filter((r) => r.paused).length;
+    const label = rs.length ? `Any machine tagged ${t} (${plural(rs.length, 'machine')}, ${rs.filter((r) => r.online && !r.paused).length} online${paused ? `, ${paused} paused` : ''})`
       : `Any machine tagged ${t} (no machine now)`;
     return `<option value="${esc(TAG_VALUE + t)}" ${t === chosen ? 'selected' : ''}>${esc(label)}</option>`;
   }).join('')}</optgroup>` : '';
@@ -890,6 +991,7 @@ function seatHtml(id, tag, opts = {}) {
     ${solo ? '' : `<div class="rm">${opts.removable ? '<button type="button" class="ghost small" data-remove>Remove</button>' : ''}</div>`}
     <label class="part seat-acct" hidden><span>Account <span class="muted">this agent is a different account on different machines with this tag</span></span><select data-part="account" disabled></select></label>
     <p class="muted small seat-note" hidden>${esc(TAG_SEAT_NOTE)}</p>
+    <p class="notice small seat-paused" hidden></p>
   </div>`;
 }
 
@@ -897,6 +999,7 @@ function wireSeat(el, preset = {}) {
   const [rSel, aSel, pSel, mIn, cSel] = ['runner', 'agent', 'project', 'model', 'account'].map((p) => el.querySelector(`[data-part="${p}"]`));
   const list = el.querySelector('datalist');
   const note = el.querySelector('.seat-note');
+  const pausedNote = el.querySelector('.seat-paused');
   const keepBlank = pSel.querySelector('option[value=""]') !== null;
   rSel.innerHTML = machineOptions(preset.tag ? TAG_VALUE + preset.tag : (preset.runner || ''), finderText(el));
   const tagOf = () => seatTag(rSel.value);
@@ -930,6 +1033,10 @@ function wireSeat(el, preset = {}) {
   };
   const fill = () => {
     const tag = tagOf();
+    // A paused machine can be picked: the work waits for it until you resume it (textContent: no HTML).
+    const paused = !tag && !!machine().paused;
+    pausedNote.hidden = !paused;
+    pausedNote.textContent = paused ? `${rSel.value} is paused. You can still send this; it waits until you resume ${rSel.value} on its page.` : '';
     if (tag) {
       // Every agent on the machines with the tag, with the account it is there.
       const rs = tagMachines().get(tag) || [];
@@ -991,8 +1098,9 @@ function seatOwnKey(s) {
 // used less (or idle), so a council spreads out instead of piling onto the first machine.
 function suggestSeat(taken = []) {
   const tiers = [
-    (r, a) => r.online && a.ready && a.name !== 'selftest',
-    (r, a) => r.online && a.name !== 'selftest',
+    (r, a) => r.online && !r.paused && a.ready && a.name !== 'selftest',
+    (r, a) => r.online && !r.paused && a.name !== 'selftest',
+    (r) => r.online && !r.paused,
     (r) => r.online,
     () => true,
   ];
@@ -1316,10 +1424,13 @@ function stageBar(meta, status) {
   }).join('')}</div>`;
 }
 
-function stepCard(s) {
+// "Waiting: build-box is paused…" for a job queued for a paused machine (the hub's paused_machines).
+const pausedWait = (name) => `Waiting: ${esc(name)} is paused. It starts once you resume <a href="#/machine/${encodeURIComponent(name)}">${esc(name)}</a>.`;
+function stepCard(s, paused = []) {
+  const waiting = s.status === 'queued' && s.runner && paused.includes(s.runner) ? pausedWait(s.runner) : 'Waiting for the machine to pick this up…';
   const body = s.status === 'done' ? `<div class="md">${md(s.result)}</div>`
     : s.status === 'error' || s.status === 'cancelled' ? `<p class="error">${esc(s.error || s.status)}</p>`
-    : `<p class="muted">${s.status === 'queued' ? 'Waiting for the machine to pick this up…' : 'Working…'} <a href="#/job/${s.id}">watch the live log</a></p>`;
+    : `<p class="muted">${s.status === 'queued' ? waiting : 'Working…'} <a href="#/job/${s.id}">watch the live log</a></p>`;
   return `<details ${s.status !== 'done' ? 'open' : ''}><summary>${esc(s.label)} · <code>${esc(s.agent)}</code> on ${whereRunner(s)}${creditsShort(s)} ${statusChip(s.status)} <span class="muted small">${duration(s)}</span></summary>
     ${body}
     <p class="small"><a href="#/job/${s.id}">open step #${s.id}</a></p></details>`;
@@ -1476,7 +1587,7 @@ function delegateHtml(id, want, ctx) {
   }
   const box = (kind, value, on, label) => `<label class="check"><input type="checkbox" data-dg="${kind}" data-dg-focus="${esc(`${kind}:${value}`)}" value="${esc(value)}"${on ? ' checked' : ''}> <span>${label}</span></label>`;
   const tags = [...new Set(all.flatMap((r) => (r.accepted_tags || []).filter((t) => typeof t === 'string')))].sort();
-  const toBoxes = all.map((r) => box('to', `machine:${r.name}`, want.to.has(`machine:${r.name}`), esc(r.name)))
+  const toBoxes = all.map((r) => box('to', `machine:${r.name}`, want.to.has(`machine:${r.name}`), `${esc(r.name)}${r.paused ? ' <span class="muted">(paused)</span>' : ''}`))
     .concat(tags.map((t) => box('to', `tag:${t}`, want.to.has(`tag:${t}`), `any machine tagged ${esc(t)}`)));
   // Agents that can take subtasks report 'levels' (the hub can check what they may do).
   const able = inScope.flatMap((r) => (r.agents || []).filter((a) => hasFeature(a, 'levels')).map((a) => ({ r, a })));
@@ -1884,7 +1995,9 @@ function jobShell(j) {
     <div id="job-usage"></div>
     <div id="job-subtasks"></div>
     <div id="job-continue"></div>
+    <div id="job-moved"></div>
     <div id="job-follow"></div>
+    <div id="job-move"></div>
     <div id="job-thread"></div>
     ${j.kind !== 'admin' ? `<details><summary>Prompt</summary><pre>${esc(j.prompt)}</pre></details>` : ''}
     <details ${jobIsLive(j) || j.status === 'error' ? 'open' : ''}><summary>Live log</summary><pre class="log" id="job-log"><span class="muted">(nothing yet)</span></pre></details></div>`;
@@ -1915,6 +2028,7 @@ function jobMetaHtml(j) {
     ${j.kind === 'task' && opts.delegate && !j.delegated_by ? ' · may hand out subtasks' : ''}
     ${jobGitHtml(j, opts)}${jobMcpHtml(opts)}${jobHandoffHtml(j, opts)}
     ${j.follow_up_of ? ` · follow-up to <a href="#/job/${Number(j.follow_up_of)}">#${Number(j.follow_up_of)}</a>` : ''}
+    ${j.continued_from ? ` · ${movedFromHtml(j, opts)}` : ''}
     ${own(ERROR_KINDS, j.error_kind) ? ` · ${errorKindChip(j.error_kind, true)}` : ''}${creditsMetaHtml(j)}`;
 }
 
@@ -1949,9 +2063,11 @@ function jobUsageHtml(j) {
 
 function jobNoticesHtml(p, j) {
   const runner = j.runner ? state.runners.find((r) => r.name === j.runner) : null;
-  const offline = j.status === 'queued' && runner && !runner.online
-    ? `<div class="notice">${esc(j.runner)} is offline. The job will start when its runner checks in.</div>` : '';
-  return offline + mcpWarningHtml(j.options && typeof j.options === 'object' ? j.options : {})
+  const paused = j.status === 'queued' && j.runner && (p.pausedMachines || []).includes(j.runner);
+  const offline = paused ? `<div class="notice paused-wait">${pausedWait(j.runner)}</div>`
+    : j.status === 'queued' && runner && !runner.online
+      ? `<div class="notice">${esc(j.runner)} is offline. The job will start when its runner checks in.</div>` : '';
+  return offline + moveWaitingHtml(j) + mcpWarningHtml(j.options && typeof j.options === 'object' ? j.options : {})
     + tagWaitingHtml(j, p.tagCandidates) + (p.creditsData ? creditsRetryHtml(j, p.creditsData) : '')
     + (p.actionError ? `<p class="error">${esc(p.actionError)}</p>` : '');
 }
@@ -1960,15 +2076,15 @@ function jobNoticesHtml(p, j) {
 function tagWaitingHtml(j, cand) {
   if (j.status !== 'queued' || j.runner || !j.target_tag || !cand) return '';
   const account = j.options && typeof j.options.account === 'string' ? ` (${esc(j.options.account)})` : '';
-  const n = Number(cand.match) || 0; const m = Number(cand.online) || 0;
-  const counts = `${plural(n, 'machine')} ${n === 1 ? 'matches' : 'match'}; ${m} ${m === 1 ? 'is' : 'are'} online.`;
+  const n = Number(cand.match) || 0; const m = Number(cand.online) || 0; const k = Number(cand.paused) || 0;
+  const counts = `${plural(n, 'machine')} ${n === 1 ? 'matches' : 'match'}; ${m} ${m === 1 ? 'is' : 'are'} online${k ? ` and ${k} ${k === 1 ? 'is' : 'are'} paused` : ''}.`;
   const none = n ? '' : " Accept the tag on a machine's page, or check that the machine has this agent and project and an up-to-date runner.";
   return `<div class="notice tag-wait">Waiting for a free machine tagged <strong>${esc(j.target_tag)}</strong> with ${esc(j.agent)}${account}
     and ${esc(j.project)}. ${counts}${none}</div>`;
 }
 
 // The subtasks this job handed out, oldest first, each linked to its own page.
-function subtasksHtml(j, list) {
+function subtasksHtml(j, list, paused = []) {
   if (!Array.isArray(list) || !list.length) return '';
   const prefix = `Subtask of #${Number(j.id)}: `;
   const rows = list.map((t) => {
@@ -1979,7 +2095,8 @@ function subtasksHtml(j, list) {
       <td class="st-where small"><span class="phone-only muted">on </span>${whereRunner(t)}</td>
       <td class="st-agent small"><span class="phone-only muted">agent </span>${esc(t.agent)}${t.named_agent ? ` <span class="muted">(on credits instead of ${esc(t.named_agent)})</span>` : ''}</td>
       <td class="st-account small">${t.account ? `<span class="phone-only muted">account </span>${esc(t.account)}` : ''}</td>
-      <td class="st-status">${statusChip(t.status)}${own(ERROR_KINDS, t.error_kind) ? ` ${errorKindChip(t.error_kind, false)}` : ''}</td></tr>`;
+      <td class="st-status">${statusChip(t.status)}${t.status === 'queued' && t.runner && paused.includes(t.runner)
+        ? ` <span class="status warn" title="Waiting: ${esc(t.runner)} is paused">machine paused</span>` : ''}${own(ERROR_KINDS, t.error_kind) ? ` ${errorKindChip(t.error_kind, false)}` : ''}</td></tr>`;
   }).join('');
   return `<div class="card subtasks"><h3>Subtasks (${list.length})</h3>
     <div class="table-wrap"><table class="stack subtasks"><thead><tr><th>#</th><th>Title</th><th>Machine</th><th>Agent</th><th>Account</th><th>Status</th></tr></thead>
@@ -2229,6 +2346,10 @@ function approvalCardHtml(j, a, byAgent) {
   const expires = Number(a.expires_at) || 0;
   const flags = (seen.hidden ? '<span class="status bad">hidden characters</span>' : '')
     + (seen.blank ? '<span class="status warn">blank lines</span>' : '');
+  // "Allow for this job" only for a request with nothing flagged: the hub checks the whole input
+  // (can_allow_for_job) and refuses it otherwise, and the card's own flags hide it too.
+  const forJob = a.can_allow_for_job === true && !seen.hidden && !seen.blank
+    ? `<button type="button" class="ghost" data-allow-job="${id}" title="Allow this, and allow exactly the same request again without asking until this job ends">Allow for this job</button>` : '';
   return `<div class="card approval" data-approval="${id}">
     <div class="a-head"><h3>${esc(j.agent)} wants to use ${tool}</h3>${flags ? `<span class="a-flags">${flags}</span>` : ''}</div>
     ${origin}
@@ -2239,7 +2360,7 @@ function approvalCardHtml(j, a, byAgent) {
     <p class="small a-when">Denied automatically at ${esc(clock(expires))} if you don't answer <span class="muted" data-countdown="${expires}"></span></p>
     <label for="a-reason-${id}">Reason <span class="muted">(sent to the agent if you deny)</span></label>
     <input type="text" id="a-reason-${id}" maxlength="2000" autocomplete="off">
-    <div class="row a-buttons"><button type="button" data-allow="${id}">Allow</button><button type="button" class="danger" data-deny="${id}">Deny</button></div>
+    <div class="row a-buttons"><button type="button" data-allow="${id}">Allow</button>${forJob}<button type="button" class="danger" data-deny="${id}">Deny</button></div>
     <p class="error small" data-a-error hidden></p></div>`;
 }
 
@@ -2256,7 +2377,7 @@ function tickCountdowns() {
     const expires = Number(el.dataset.countdown) || 0;
     el.textContent = countdownText(expires);
     if (expires && expires <= Date.now() / 1000) {
-      el.closest('.approval')?.querySelectorAll('[data-allow], [data-deny]').forEach((b) => { b.disabled = true; });
+      el.closest('.approval')?.querySelectorAll('[data-allow], [data-allow-job], [data-deny]').forEach((b) => { b.disabled = true; });
     }
   });
 }
@@ -2284,9 +2405,13 @@ function pastApprovalsHtml(list) {
     const input = a.tool_input && typeof a.tool_input === 'object' && !Array.isArray(a.tool_input) ? a.tool_input : null;
     const shown = input && typeof input.command === 'string' ? `$ ${input.command}`
       : typeof a.tool_input === 'string' ? a.tool_input : JSON.stringify(a.tool_input, null, 2);
-    const word = own(APPROVAL_STATUS, a.status) || a.status;
+    let word = own(APPROVAL_STATUS, a.status) || a.status;
+    if (a.status === 'allowed' && a.for_job === true) word = 'allowed for this job';
+    else if (a.status === 'allowed' && a.same_as) word = 'allowed automatically';
     const why = a.message ? `<div class="small${a.status === 'denied' ? '' : ' muted'}">${a.status === 'denied' ? 'Reason: ' : ''}${visible(a.message)}</div>` : '';
+    // Numbered, so "Same as question #12" can be found in the list.
     return `<div class="a-old"><div class="small"><span class="status ${esc(a.status)}">${esc(word)}</span> <strong>${visible(a.tool_name)}</strong>
+      <span class="muted">question #${Number(a.id)}</span>
       <span class="muted" title="${esc(fullDate(a.decided_at || a.created_at))}">${ago(a.decided_at || a.created_at)}</span></div>
       ${why}<pre class="a-text">${visible(shown ?? '')}</pre></div>`;
   }).join('')}</details>`;
@@ -2295,11 +2420,12 @@ function pastApprovalsHtml(list) {
 async function answerApproval(p, b, decision) {
   const card = b.closest('.approval');
   const err = card.querySelector('[data-a-error]'); err.hidden = true;
-  const buttons = card.querySelectorAll('[data-allow], [data-deny]');
+  const buttons = card.querySelectorAll('[data-allow], [data-allow-job], [data-deny]');
   buttons.forEach((x) => { x.disabled = true; });
   const message = decision === 'deny' ? card.querySelector('input[type=text]').value.trim() : '';
+  const aid = Number({ allow: b.dataset.allow, allow_job: b.dataset.allowJob, deny: b.dataset.deny }[decision]);
   try {
-    await api(`/api/jobs/${p.id}/approvals/${Number(b.dataset[decision])}`, { method: 'POST', body: { decision, message } });
+    await api(`/api/jobs/${p.id}/approvals/${aid}`, { method: 'POST', body: { decision, message } });
     card.remove();
   } catch (e) {
     err.textContent = e.message; err.hidden = false;
@@ -2369,6 +2495,161 @@ function wireFollow(p, j) {
   });
 }
 
+// ------------------------------------------------- continue on another machine
+// The owner's own pick (hub/moves.py): carry the conversation to any agent, as a new session that starts with it, or
+// move the exact Claude Code session to an agent on the same account. Never offered as a way around a usage limit:
+// after one, the hub lets the conversation go on only on the account that hit it, and the form says so.
+const canMove = (j) => j.kind === 'task' && !jobIsLive(j);
+const moveOf = (opts) => (opts && opts.move && typeof opts.move === 'object' ? opts.move : {});
+
+function movedFromHtml(j, opts) {
+  const m = moveOf(opts);
+  const id = Number(j.continued_from);
+  const from = typeof m.from_runner === 'string' ? ` on ${esc(m.from_runner)}` : '';
+  return `${m.mode === 'exact' ? 'session moved from' : 'continued from'} <a href="#/job/${id}">#${id}</a>${from}`;
+}
+
+function continuedOnHtml(list) {
+  if (!Array.isArray(list) || !list.length) return '';
+  return `<div class="notice">${list.map((c) => `Continued on <a href="#/job/${Number(c.id)}">#${Number(c.id)}</a>
+    (${esc(c.agent)} on ${esc(c.runner)}${c.mode === 'exact' ? ', the same session' : ''}) · ${statusChip(c.status)}`).join('<br>')}</div>`;
+}
+
+function moveWaitingHtml(j) {
+  const m = moveOf(j.options);
+  if (j.status !== 'queued' || m.mode !== 'exact' || !m.waiting) return '';
+  return `<div class="notice">Waiting for ${esc(m.from_runner || 'the first machine')} to send this session to the hub.
+    It starts once the copy is here.</div>`;
+}
+
+function moveBoxHtml() {
+  return `<details class="card move" id="move-box"><summary>Continue on another machine</summary>
+    <div id="move-body" class="muted small">Loading…</div></details>`;
+}
+
+function moveFormHtml(j, info) {
+  const files = Array.isArray(info.files) ? info.files.filter((f) => typeof f === 'string') : [];
+  const shown = files.slice(0, 40).map((f) => `<code>${esc(f)}</code>`).join(', ') + (files.length > 40 ? ` and ${files.length - 40} more` : '');
+  const where = `<strong>${esc(j.runner)}</strong>`;
+  const filesNote = files.length
+    ? `<div class="notice">Files changed on ${where} stay there: ${shown}. To keep working on them elsewhere, commit and push them on ${where}, then pull them on the other machine.</div>`
+    : `<p class="muted small">Files changed on ${where} stay there. To keep working on them elsewhere, commit and push them first, then pull them on the other machine.</p>`;
+  const machines = (info.machines || []).filter((m) => (m.agents || []).length);
+  const pick = (machines.find((m) => m.name !== j.runner && m.online) || machines[0] || {}).name;
+  return `<form id="move-form">
+    <p class="muted small" style="margin-top:0">Pick where this conversation goes next. <strong>Carry the conversation</strong> starts a new session on any agent,
+      with the conversation so far at the top of its prompt. <strong>Move the exact session</strong> resumes this Claude Code session itself
+      on another machine signed in to the same account.</p>
+    ${filesNote}
+    <div class="row">
+      <div><label for="move-runner">Machine</label><select id="move-runner">${machines.map((m) => `<option value="${esc(m.name)}"${m.name === pick ? ' selected' : ''}>${esc(m.name)}${m.online ? '' : ' (offline)'}</option>`).join('')}</select></div>
+      <div><label for="move-agent">Agent</label><select id="move-agent"></select></div>
+      <div><label for="move-project">Project</label><select id="move-project"></select></div>
+    </div>
+    <label>How</label>
+    <div class="radio-row">
+      <label><input type="radio" name="move-mode" id="move-mode-carry" value="carry" checked> Carry the conversation</label>
+      <label><input type="radio" name="move-mode" id="move-mode-exact" value="exact"> Move the exact session</label>
+    </div>
+    <p class="muted small" id="move-why" hidden></p>
+    <label for="move-text">Your next message</label>
+    <textarea id="move-text" required></textarea>
+    <label>What the agent may do</label>
+    <div id="move-autonomy-box"></div>
+    <p class="error" id="move-error" hidden></p>
+    <div class="row" style="margin-top:10px"><button type="submit" id="move-send">Continue there</button></div></form>`;
+}
+
+function wireMove(p, j) {
+  const box = document.getElementById('move-box');
+  if (!box) return;
+  box.addEventListener('toggle', async () => {
+    if (!box.open || p.moveLoaded) return;
+    p.moveLoaded = true;
+    const body = document.getElementById('move-body');
+    try {
+      const info = await api(`/api/jobs/${j.id}/move`);
+      body.className = '';
+      body.innerHTML = moveFormHtml(j, info);
+      wireMoveForm(j, info);
+    } catch (e) {
+      if (e instanceof StaleNav) return;
+      p.moveLoaded = false;
+      body.textContent = e.message;
+    }
+  });
+}
+
+function wireMoveForm(j, info) {
+  const form = document.getElementById('move-form');
+  if (!form) return;
+  const runnerSel = document.getElementById('move-runner');
+  const agentSel = document.getElementById('move-agent');
+  const projectSel = document.getElementById('move-project');
+  const exactRadio = document.getElementById('move-mode-exact');
+  const carryRadio = document.getElementById('move-mode-carry');
+  const why = document.getElementById('move-why');
+  const send = document.getElementById('move-send');
+  const source = info.source || {};
+  const machine = () => (info.machines || []).find((m) => m.name === runnerSel.value) || { agents: [], projects: [] };
+  const agentEntry = () => (machine().agents || []).find((a) => a.name === agentSel.value) || null;
+  let autonomyFor = '';
+
+  function fillAgents() {
+    const m = machine();
+    const keep = agentSel.value || source.agent;
+    agentSel.innerHTML = (m.agents || []).map((a) => `<option value="${esc(a.name)}"${a.name === keep ? ' selected' : ''}>${esc(a.label || a.name)} (${esc(a.account)})</option>`).join('');
+  }
+  function fillProjects(exact) {
+    const projects = (machine().projects || []).filter((x) => typeof x === 'string');
+    const keep = exact ? source.project : (projectSel.value || source.project);
+    projectSel.innerHTML = projects.map((x) => `<option value="${esc(x)}"${x === keep ? ' selected' : ''}>${esc(x)}</option>`).join('');
+    projectSel.disabled = exact;
+  }
+  function refresh() {
+    const a = agentEntry();
+    const exactWhy = a ? String(a.exact || '') : 'Pick an agent.';
+    exactRadio.disabled = !!exactWhy;
+    if (exactWhy && exactRadio.checked) carryRadio.checked = true;
+    const exact = exactRadio.checked;
+    fillProjects(exact);
+    const carryWhy = a ? String(a.carry || '') : '';
+    const text = exact ? '' : carryWhy || (exactWhy && a ? `Move the exact session: not here. ${exactWhy}` : '');
+    why.textContent = text;
+    why.hidden = !text;
+    why.className = carryWhy && !exact ? 'error' : 'muted small';
+    send.disabled = !a || (!exact && !!carryWhy);
+    const key = `${runnerSel.value}/${agentSel.value}`;
+    if (key !== autonomyFor) {
+      autonomyFor = key;
+      document.getElementById('move-autonomy-box').innerHTML = autonomyRadios('move-autonomy', j.autonomy, agentInfo(runnerSel.value, agentSel.value));
+    }
+  }
+  runnerSel.addEventListener('change', () => { fillAgents(); refresh(); });
+  agentSel.addEventListener('change', refresh);
+  form.addEventListener('change', (ev) => {
+    if (ev.target && ev.target.name === 'move-mode') refresh();
+    syncChoiceHints(form, 'move-autonomy');
+  });
+  fillAgents();
+  refresh();
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const err = document.getElementById('move-error'); err.hidden = true;
+    send.disabled = true;
+    const exact = exactRadio.checked;
+    try {
+      const res = await api(`/api/jobs/${j.id}/move`, { method: 'POST', body: {
+        mode: exact ? 'exact' : 'carry', runner: runnerSel.value, agent: agentSel.value,
+        project: exact ? (source.project || 'chat') : projectSel.value,
+        autonomy: form.querySelector('input[name="move-autonomy"]:checked')?.value || 'readonly',
+        prompt: document.getElementById('move-text').value,
+      } });
+      location.hash = `#/job/${Number(res.id)}`;
+    } catch (e) { err.textContent = e.message; err.hidden = false; } finally { send.disabled = false; }
+  });
+}
+
 // ------------------------------------------------------------------ councils
 function councilBodyHtml(j, data) {
   const m = j.meta || {};
@@ -2380,9 +2661,10 @@ function councilBodyHtml(j, data) {
   if (j.error) html += `<p class="error">${esc(j.error)}</p>`;
   html += `<details><summary>The request</summary><pre>${esc(j.prompt)}</pre></details>`;
   const steps = data.steps || [];
+  const paused = Array.isArray(data.paused_machines) ? data.paused_machines : [];
   for (const stage of STAGES[m.mode] || []) {
     const inStage = steps.filter((s) => s.stage === stage);
-    if (inStage.length) html += `<h2>${esc(stage)}</h2>${inStage.map(stepCard).join('')}`;
+    if (inStage.length) html += `<h2>${esc(stage)}</h2>${inStage.map((s) => stepCard(s, paused)).join('')}`;
   }
   return html;
 }
@@ -2440,6 +2722,7 @@ async function drawJob(p) {
   setRegion(document.getElementById('job-meta'), jobMetaHtml(j));
   drawApprovals(p, j, data);
   p.tagCandidates = data.tag_candidates || null;
+  p.pausedMachines = Array.isArray(data.paused_machines) ? data.paused_machines : [];
   p.creditsData = { retried_as: data.retried_as || null, credits_retry: data.credits_retry || null };
   setRegion(document.getElementById('job-notices'), jobNoticesHtml(p, j));
   setRegion(document.getElementById('job-messages'), isLiveSession(j) ? liveChatHtml(p, j)
@@ -2456,9 +2739,16 @@ async function drawJob(p) {
   setRegion(document.getElementById('job-summary'), jobSummaryHtml(j));
   setRegion(document.getElementById('job-usage'), jobUsageHtml(j));
   const subtasks = Array.isArray(data.subtasks) ? data.subtasks : [];
-  setRegion(document.getElementById('job-subtasks'), subtasksHtml(j, subtasks));
+  setRegion(document.getElementById('job-subtasks'), subtasksHtml(j, subtasks, p.pausedMachines));
   p.continueCommand = data.continue_command || '';
   setRegion(document.getElementById('job-continue'), continueHtml(j, p.continueCommand));
+  setRegion(document.getElementById('job-moved'), continuedOnHtml(data.continued_on));
+  if (!p.moveShown && canMove(j)) {
+    // Built once, like the follow-up form, so nothing typed into it is lost.
+    document.getElementById('job-move').innerHTML = moveBoxHtml();
+    p.moveShown = true;
+    wireMove(p, j);
+  }
   if (!p.followShown && canFollowUp(j)) {
     // Built once and never redrawn, so nothing typed into it is lost.
     document.getElementById('job-follow').innerHTML = followHtml(j);
@@ -2499,6 +2789,8 @@ function wireJobPage(p) {
       try { await drawJob(p); } catch (e) { /* the next refresh shows it */ }
     } else if (b.dataset.allow !== undefined) {
       await answerApproval(p, b, 'allow');
+    } else if (b.dataset.allowJob !== undefined) {
+      await answerApproval(p, b, 'allow_job');
     } else if (b.dataset.deny !== undefined) {
       await answerApproval(p, b, 'deny');
     } else if (b.id === 'rerun') {
@@ -2544,6 +2836,82 @@ async function renderJob(id) {
 }
 
 // ----------------------------------------------------------------- machine
+// Pause and Resume (POST /api/runners/<name>/pause and /resume). Paused, the machine takes no new tasks, council
+// steps or subtasks; machine actions (update, sync, git, Check limits, Stop Remote Control) still run.
+function pauseCardHtml(r) {
+  if (r.paused) {
+    return `<div class="card pause-card paused row spread"><div><span class="chip warn">Paused</span>
+      ${r.paused_at ? `<span class="small">since <span title="${esc(fullDate(r.paused_at))}">${ago(r.paused_at)}</span></span>` : ''}
+      <p class="small flush-bottom">It takes no new tasks, council steps or subtasks. Work sent to it by name waits; tasks for one of
+      its tags go to other machines with the tag. Updates, syncs, git actions and Check limits still run, and Remote Control servers
+      already running keep running.</p></div>
+      <button type="button" class="small" id="resume">Resume</button></div>`;
+  }
+  return `<div class="card pause-card"><div class="row spread"><span class="small">Taking new work.
+      Pause it to take it out of service, for example while you fix or upgrade it.</span>
+    <button type="button" class="ghost small" id="pause-open">Pause…</button></div>
+    <form id="pause-form" hidden>
+      <div class="radio-row">
+        <label><input type="radio" name="pause-running" value="finish" checked> <span>Let running jobs finish</span></label>
+        <label><input type="radio" name="pause-running" value="cancel"> <span>Cancel running jobs</span></label>
+      </div>
+      <p class="muted small">Either way, jobs queued for it wait until you resume it. Updates, syncs, git actions and Check limits still run.</p>
+      <div class="row"><button type="submit" class="small">Pause ${esc(r.name)}</button>
+        <button type="button" class="ghost small" id="pause-cancel">Back</button></div>
+    </form></div>`;
+}
+
+function wirePause(r) {
+  const err = () => document.getElementById('m-error');
+  const fail = (e) => { const box = err(); box.textContent = e.message; box.hidden = false; box.scrollIntoView({ block: 'nearest' }); };
+  const path = (what) => `/api/runners/${encodeURIComponent(r.name)}/${what}`;
+  const form = document.getElementById('pause-form');
+  document.getElementById('pause-open')?.addEventListener('click', (ev) => { form.hidden = false; ev.currentTarget.hidden = true; });
+  document.getElementById('pause-cancel')?.addEventListener('click', () => { form.hidden = true; document.getElementById('pause-open').hidden = false; });
+  form?.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const cancel = form.querySelector('input[name=pause-running]:checked')?.value === 'cancel';
+    if (cancel && busyOf(r) && !confirm(`Cancel the ${plural(busyOf(r), 'job')} ${r.name} is running?`)) return;
+    try {
+      await api(path('pause'), { method: 'POST', body: { cancel_running: cancel } });
+      await renderMachine(r.name);
+    } catch (e) { fail(e); }
+  });
+  document.getElementById('resume')?.addEventListener('click', async (ev) => {
+    const b = ev.currentTarget; b.disabled = true;
+    try {
+      await api(path('resume'), { method: 'POST', body: {} });
+      await renderMachine(r.name);
+    } catch (e) { b.disabled = false; fail(e); }
+  });
+}
+
+// Which MCP token this machine's agents use (r.mcp_auth from the hub; the token itself is never on the page).
+function mcpTokenHtml(r) {
+  if (r.mcp_auth === 'own') {
+    return `<div class="row spread small" style="margin-top:8px"><span><span class="chip ok">own MCP token</span> Its agents reach the hub's MCP servers with a token of this machine's own. Forget stops it, and no other machine is affected.</span>
+      <button type="button" class="ghost small" id="mcp-rotate">New MCP token</button></div>`;
+  }
+  if (r.mcp_auth === 'waiting') {
+    return '<div class="small" style="margin-top:8px"><span class="chip warn">new MCP token on its way</span> The old one no longer works. The machine gets a new one at its next sync.</div>';
+  }
+  if (r.auth === 'machine') {
+    return '<div class="small muted" style="margin-top:8px">Its agents still use the hub\'s shared MCP token. Update the runner and it gets one of its own.</div>';
+  }
+  return '';
+}
+
+function wireMcpRotate(r) {
+  document.getElementById('mcp-rotate')?.addEventListener('click', async (ev) => {
+    if (!confirm(`Make a new MCP token for ${r.name}? The old one stops working now. The machine writes the new one into its agents' settings at its next sync. Sessions open on it need a restart.`)) return;
+    const b = ev.currentTarget; b.disabled = true;
+    try {
+      await api(`/api/runners/${encodeURIComponent(r.name)}/mcp-token/rotate`, { method: 'POST', body: {} });
+      await renderMachine(r.name);
+    } catch (e) { b.disabled = false; alert(e.message); }
+  });
+}
+
 function authCard(r) {
   if (r.auth === 'machine') {
     return `<div class="small" style="margin-top:8px"><span class="chip ok">own token</span> It signs in to the hub with its own token.
@@ -2612,9 +2980,11 @@ const rcKey = (runner, agent, project) => `${runner}\n${agent}\n${project}`;
 const rcTime = (ts) => (Number(ts) ? whenLocal(Number(ts)) : '-');
 const CLAUDE_URL_RE = /^https:\/\/claude\.ai\//;
 
-// Queue Start or Stop Remote Control on a machine; the admin job's id.
-async function rcAction(runner, action, agent, project) {
-  const res = await api(`/api/runners/${encodeURIComponent(runner)}/actions`, { method: 'POST', body: { action, params: { agent, project } } });
+// Queue Start or Stop Remote Control on a machine; the admin job's id. `again`: start it again when the
+// runner starts (sent only when ticked).
+async function rcAction(runner, action, agent, project, again = false) {
+  const params = again ? { agent, project, start_with_runner: '1' } : { agent, project };
+  const res = await api(`/api/runners/${encodeURIComponent(runner)}/actions`, { method: 'POST', body: { action, params } });
   return Number(res.id);
 }
 
@@ -2652,6 +3022,7 @@ function rcTableHtml(r) {
         ? `<details class="rc-more"><summary class="small">More</summary><div class="small rc-detail">${esc(rest.join('\n').trim())}</div></details>` : ''}`;
     }
     else if (e.note) detail = `<div class="muted small rc-detail">${esc(e.note)}</div>`;
+    if (e.start_with_runner === true) detail += '<div class="muted small rc-detail">Starts again when the runner starts</div>';
     return `<tr><td><strong>${esc(e.agent)}</strong></td><td><span class="phone-only muted small">in </span>${esc(e.project)}</td>
       <td><span class="status ${esc(state)}">${esc(state)}</span>${detail}</td>
       <td class="small"><span class="phone-only muted">since </span><span title="${esc(fullDate(e.since))}">${ago(e.since)}</span></td>
@@ -2669,6 +3040,7 @@ function rcSectionHtml(r) {
   if (!able.length && !why.length) return '';
   const info = r.info || {};
   const hours = Number(info.remote_control_max_hours) || 8;
+  const again = info.remote_control_start_with_runner === true; // older runners can't start them again
   let start = '';
   if (able.length && info.allow_remote_control !== true) {
     start = `<p class="small">This machine doesn't allow Remote Control from the dashboard. To change that, set
@@ -2677,9 +3049,13 @@ function rcSectionHtml(r) {
     start = `<form id="rc-form" class="rc-form">
       <label class="part"><span>Agent</span><select id="rc-agent">${able.map((a) => `<option value="${esc(a.name)}">${esc(a.label || a.name)}</option>`).join('')}</select></label>
       <label class="part"><span>Project</span><select id="rc-project">${(r.projects || []).map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('')}</select></label>
-      <button type="submit" ${r.online ? '' : 'disabled title="The machine is offline"'}>Start Remote Control</button></form>
-      <p class="muted small">${r.online ? '' : 'The machine is offline, so Remote Control can\'t start now. '}Each server stops by itself after ${plural(hours, 'hour')}
-        (<code>remote_control_max_hours</code> in its runner.json), when you press Stop, or when the runner stops.</p>`;
+      <button type="submit" ${r.paused ? 'disabled title="The machine is paused"' : r.online ? '' : 'disabled title="The machine is offline"'}>Start Remote Control</button>
+      ${again ? '<label class="check rc-again"><input type="checkbox" id="rc-again"> Start again when the runner starts</label>' : ''}</form>
+      <p class="muted small">${r.paused ? 'The machine is paused, so Remote Control can\'t start. Servers already running keep running. '
+        : r.online ? '' : 'The machine is offline, so Remote Control can\'t start now. '}Each server stops by itself after ${plural(hours, 'hour')}
+        (<code>remote_control_max_hours</code> in its runner.json), when you press Stop, or when the runner stops.${again
+        ? ` With <strong>Start again when the runner starts</strong> ticked, the runner starts the server again after a restart of the
+        computer, until those ${plural(hours, 'hour')} from the first start are up.` : ''}</p>`;
   }
   return `<h2>Remote Control</h2>
     <div class="card rc" id="rc-card">
@@ -2714,10 +3090,10 @@ function wireRemoteControl(name) {
   machinePage = mp;
   const msgBox = document.getElementById('rc-msg');
   const show = () => setRegion(msgBox, rcMsgHtml(mp.msg), true);
-  const run = async (action, agent, project, waiting) => {
+  const run = async (action, agent, project, waiting, again = false) => {
     mp.msg = { waiting: 'Sending…' }; show();
     try {
-      const id = await rcAction(name, action, agent, project);
+      const id = await rcAction(name, action, agent, project, again);
       mp.job = id; mp.msg = { id, waiting };
     } catch (e) { mp.job = null; mp.msg = { error: e.message }; }
     show();
@@ -2732,7 +3108,8 @@ function wireRemoteControl(name) {
     ev.preventDefault();
     const btn = ev.currentTarget.querySelector('button[type=submit]'); btn.disabled = true;
     const agent = document.getElementById('rc-agent').value; const project = document.getElementById('rc-project').value;
-    await run('rc.start', agent, project, `Starting Remote Control for ${agent} in ${project}… This takes up to 15 seconds once the machine picks it up.`);
+    const again = Boolean(document.getElementById('rc-again')?.checked);
+    await run('rc.start', agent, project, `Starting Remote Control for ${agent} in ${project}… This takes up to 15 seconds once the machine picks it up.`, again);
     btn.disabled = false;
   });
   every(3000, async () => {
@@ -2767,9 +3144,9 @@ function acceptedOf(r) {
       ? Object.fromEntries(Object.entries(acc.accounts).filter(([, v]) => typeof v === 'string')) : {} };
 }
 
-// " · tags: linux gpu build · not accepted" for the machine page's header line (tagChips).
+// " · tags: linux gpu build · not accepted" for the machine page's header line (tagChips, the counted tags as links).
 function machineTagsHtml(r) {
-  const chips = tagChips(r);
+  const chips = tagChips(r, true);
   return chips ? ` · <span class="m-tags">tags: ${chips}</span>` : '';
 }
 
@@ -2843,6 +3220,96 @@ function wireAccept(r) {
   });
 }
 
+// ------------------------------------------------------- sign-in (Claude agents)
+// What each Claude agent's own CLI says about its sign-in ("claude auth status"), as the runner
+// reports it. Signing in is done on the machine itself; the hub only shows the command to run there.
+const SIGN_IN_PLANS = { free: 'Free', pro: 'Pro', max: 'Max', team: 'Team', enterprise: 'Enterprise' };
+const SIGN_IN_TIERS = { max_5x: 'Max 5x', max_20x: 'Max 20x' };
+const SIGN_IN_METHODS = { 'claude.ai': 'subscription', api_key: 'API key', oauth_token: 'token' };
+const SIGN_IN_SOON = 7 * 86400;  // a sign-in that ends within this many seconds shows the command too
+
+function signInOf(a) {
+  const s = a && a.sign_in;
+  return s && typeof s === 'object' && ['in', 'out', 'unknown'].includes(s.state) ? s : null;
+}
+
+// "Signed in (Max 20x, subscription)", "Signed out", "Unknown (CLI too old)".
+function signInWords(s) {
+  if (s.state === 'out') return 'Signed out';
+  if (s.state === 'unknown') return s.why === 'old' ? 'Unknown (CLI too old)' : 'Unknown (couldn\'t check)';
+  const word = (table, v) => own(table, v) || (typeof v === 'string' ? v : '');
+  const plan = own(SIGN_IN_TIERS, s.tier) || word(SIGN_IN_PLANS, s.plan);
+  const parts = [plan, word(SIGN_IN_METHODS, s.method)].filter(Boolean);
+  return parts.length ? `Signed in (${parts.join(', ')})` : 'Signed in';
+}
+
+// The CLI command an agent's login command starts with ("claude-work" in "claude-work auth login").
+const signInCli = (s) => (typeof s.command === 'string' ? s.command.replace(/ auth login$/, '') : 'claude');
+
+// The sign-in line under an agent's status on the machine page: what its CLI says, the command to
+// sign in again on the machine when it is signed out or its sign-in ends soon, and Sign out… where
+// the machine allows it. A runner too old to report it shows nothing.
+function agentSignInHtml(r, a, now) {
+  const s = signInOf(a);
+  if (!s) return '';
+  const ends = Number(s.expires_at) || 0;
+  const soon = s.state === 'in' && ends > 0 && ends - now < SIGN_IN_SOON;
+  const cls = s.state === 'in' ? (soon ? 'warn' : 'ok') : s.state === 'out' ? 'bad' : '';
+  let html = `<div class="sign-in small"><span class="chip ${cls}">${esc(signInWords(s))}</span>`;
+  if (soon) {
+    const left = ends - now;
+    html += ` <span class="muted">· its sign-in ends ${left <= 0 ? 'now' : left < 86400 ? 'within a day' : `in ${plural(Math.floor(left / 86400), 'day')}`}</span>`;
+  }
+  if (s.state === 'unknown' && s.why === 'old') html += ` <span class="muted">Update Claude Code on ${esc(r.name)} to see it here.</span>`;
+  if ((s.state === 'out' || soon) && typeof s.command === 'string' && s.command) {
+    html += `<div class="sign-in-cmd row"><code>${esc(s.command)}</code>
+      <button type="button" class="ghost small" data-copy-cmd="${esc(s.command)}">Copy</button></div>
+      <p class="muted small flush">Run this in a terminal on ${esc(r.name)} itself: at its keyboard or over SSH${soon
+        ? ', or from a Remote Control session there while the sign-in still works' : ''}. Sign in with the same account as before.
+      Claude Code signs in through Anthropic's own page; the hub never sees it.</p>`;
+  }
+  if (s.state === 'in' && hasFeature(a, 'sign_out') && (r.info || {}).allow_remote_sign_out === true && state.password_enabled) {
+    html += ` <button type="button" class="ghost small" data-sign-out="${esc(a.name)}" ${r.online ? '' : 'disabled title="The machine is offline"'}>Sign out…</button>`;
+  }
+  return `${html}</div>`;
+}
+
+// One line under the agents table when a Claude agent here could be signed out from the dashboard
+// but the machine or the hub doesn't allow it, saying how to turn it on.
+function signOutNoteHtml(r) {
+  if (!(r.agents || []).some((a) => hasFeature(a, 'sign_out') && signInOf(a))) return '';
+  if ((r.info || {}).allow_remote_sign_out !== true) {
+    return `<p class="muted small">Signing an agent out from the dashboard is off for this machine. To allow it, set
+      <code>allow_remote_sign_out</code> to <code>true</code> in its runner.json (guide 5).</p>`;
+  }
+  if (!state.password_enabled) return '<p class="muted small">Signing an agent out from the dashboard needs a dashboard password: set <code>HUB_UI_PASSWORD</code> on the hub.</p>';
+  return '';
+}
+
+// What the Sign out… dialog says.
+function signOutConfirmHtml(r, a) {
+  const s = signInOf(a) || {};
+  const cli = signInCli(s);
+  return `<p>This runs <code>${esc(cli)} auth logout</code> on ${esc(r.name)}.</p>
+    <p>${esc(a.name)} can't take jobs until someone signs in again on ${esc(r.name)} itself, with
+      <code>${esc(typeof s.command === 'string' && s.command ? s.command : `${cli} auth login`)}</code>. The dashboard can't sign it back in.</p>`;
+}
+
+// A yes/no question in the page's own dialog; resolves true for the OK button.
+function askConfirm(title, bodyHtml, okLabel) {
+  const dlg = document.getElementById('confirm-dialog');
+  if (!dlg || typeof dlg.showModal !== 'function') return Promise.resolve(false);
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-body').innerHTML = bodyHtml;
+  document.getElementById('confirm-ok').textContent = okLabel;
+  dlg.returnValue = '';
+  return new Promise((resolve) => {
+    dlg.addEventListener('close', () => resolve(dlg.returnValue === 'ok'), { once: true });
+    dlg.showModal();
+    dlg.querySelector('button[value=cancel]').focus();
+  });
+}
+
 async function renderMachine(name) {
   stopTimer();
   await loadState();
@@ -2861,7 +3328,7 @@ async function renderMachine(name) {
   const canCheck = agents.some((a) => hasFeature(a, 'usage_check'));
   const credit = ((state.credits || {}).machines || []).find((m) => m.runner === r.name) || null;
   const agentRows = agents.map((a) => `<tr><td><strong>${esc(a.name)}</strong><div class="muted small">${esc(a.label || '')}</div>${credit && credit.agent === a.name ? machineCreditHtml(credit) : ''}</td>
-    <td>${a.ready ? '<span class="chip ok">ready</span>' : '<span class="chip warn">not ready</span>'} <span class="muted small">${esc(a.note || '')}</span></td>
+    <td>${a.ready ? '<span class="chip ok">ready</span>' : '<span class="chip warn">not ready</span>'} <span class="muted small">${esc(a.note || '')}</span>${agentSignInHtml(r, a, now)}</td>
     <td class="m-account"><span class="phone-only muted small">Account: </span>${agentAccountHtml(r, a)}</td>
     <td class="m-limits">${hasFeature(a, 'limits') ? `<span class="phone-only muted small">Limits: </span>${agentLimitsHtml(a, now)}` : ''}</td>
     <td class="small">${a.default_model ? `default <code>${esc(a.default_model)}</code>` : 'CLI default'}${(a.models || []).length ? ` · suggestions: ${(a.models || []).map((m) => `<code>${esc(m)}</code>`).join(' ')}` : ''}</td></tr>`).join('');
@@ -2875,6 +3342,7 @@ async function renderMachine(name) {
       Give one of them another name: click Add a machine, type a new name, and run the command it shows on that
       computer. (Editing the name in its runner.json only works for a computer on the shared token.)</div>` : ''}
     ${gitProblemsHtml(r)}
+    ${pauseCardHtml(r)}
 
     <h2>Runner</h2>
     <div class="card">
@@ -2891,15 +3359,17 @@ async function renderMachine(name) {
     <h2>Shared context</h2>
     <div class="card">
       <div class="row spread"><div>${info.manage_agent_settings === false ? '<span class="chip warn">off on this machine</span> Shared notes, skills and MCP servers aren\'t added to its agents (manage_agent_settings).'
-        : info.context_synced === state.context_token ? '<span class="chip ok">up to date</span> Pinned notes, /remember, add-ons and MCP servers are in place.'
+        : info.context_synced === (r.context_token || state.context_token) ? '<span class="chip ok">up to date</span> Pinned notes, /remember, add-ons and MCP servers are in place.'
         : '<span class="chip warn">behind</span> It picks up the latest changes within about 15 seconds of checking in.'}</div>
         <button class="ghost small" id="sync" ${r.online ? '' : 'disabled'}>Sync now</button></div>
       ${(info.sync_notes || []).length ? `<ul class="small muted">${info.sync_notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
+      ${mcpTokenHtml(r)}
     </div>
 
     <div class="row spread"><h2>Agents</h2>${canCheck ? `<button class="ghost small" id="check-limits" ${r.online ? 'title="Run Claude Code\'s /usage for each Claude agent here that can read its plan limits"' : 'disabled title="The machine is offline"'}>Check limits</button>` : ''}</div>
     <div class="card table-wrap"><table class="stack agents"><thead><tr><th>Agent</th><th>Status</th><th>Account</th><th>Limits</th><th>Models</th></tr></thead><tbody>${agentRows || '<tr><td colspan="5" class="muted">none</td></tr>'}</tbody></table>
-      <p class="muted small">Agents, logins, account labels and model suggestions are set on the machine itself (<code>runner.py init</code> or <code>runner.json</code>).${anyLimits ? ' Limits shows how much of each Claude plan window is used, from the last job or Check limits; the <a href="#/usage">Usage page</a> shows them per account.' : ''}</p></div>
+      <p class="muted small">Agents, logins, account labels and model suggestions are set on the machine itself (<code>runner.py init</code> or <code>runner.json</code>).${anyLimits ? ' Limits shows how much of each Claude plan window is used, from the last job or Check limits; the <a href="#/usage">Usage page</a> shows them per account.' : ''}</p>
+      ${signOutNoteHtml(r)}</div>
     ${gitAccountsHtml(r)}
 
     <h2>Projects</h2>
@@ -2942,8 +3412,19 @@ async function renderMachine(name) {
   document.getElementById('update')?.addEventListener('click', () => act('runner.update', {}));
   document.getElementById('sync')?.addEventListener('click', () => act('sync', {}));
   document.getElementById('check-limits')?.addEventListener('click', () => act('usage.check', {}));
+  // Copy a sign-in command, or sign an agent out after the page's own dialog says what that means.
+  view.querySelector('table.agents')?.addEventListener('click', async (ev) => {
+    const copy = ev.target.closest('[data-copy-cmd]');
+    if (copy) { copyText(copy.dataset.copyCmd, copy); return; }
+    const b = ev.target.closest('[data-sign-out]');
+    const a = b && (r.agents || []).find((x) => x.name === b.dataset.signOut);
+    if (!a) return;
+    if (await askConfirm(`Sign out ${a.name} on ${r.name}?`, signOutConfirmHtml(r, a), 'Sign out')) act('auth.logout', { agent: a.name });
+  });
   document.getElementById('re-enroll')?.addEventListener('click', () => openAddMachine(r.name));
+  wirePause(r);
   wireAccept(r);
+  wireMcpRotate(r);
   document.getElementById('forget').addEventListener('click', async () => {
     try { if (await forgetMachine(r.name)) location.hash = '#/'; } catch (e) { const err = document.getElementById('m-error'); err.textContent = e.message; err.hidden = false; }
   });
@@ -3304,7 +3785,7 @@ async function renderMcp(editId) {
   await loadState();
   const data = await api('/api/mcp');
   const editing = editId ? await api(`/api/mcp/${editId}`) : null;
-  const behind = state.runners.filter((r) => r.online && (r.info || {}).context_synced !== state.context_token);
+  const behind = state.runners.filter((r) => r.online && (r.info || {}).context_synced !== (r.context_token || state.context_token));
   let publicHint = '';
   try {
     if (data.hub.public_url && new URL(data.hub.public_url).origin !== location.origin) {
@@ -3323,7 +3804,10 @@ async function renderMcp(editId) {
       <div class="row spread"><h3 style="margin:0">bullpen: the hub's shared memory</h3>
         ${data.hub.enabled ? '<span class="chip ok">on</span>' : '<span class="chip warn">off: install the mcp package</span>'}</div>
       <p class="small">Tools <code>remember</code>, <code>recall</code>, <code>list_notes</code> at <code>/mcp</code> on this hub. Added to every agent automatically.
-        Token <code id="tok">${esc(data.hub.token_hint)}</code> <button class="ghost small" id="reveal">Show</button> <button class="ghost small" id="rotate">Rotate</button></p>
+        ${data.hub.shared_token === false
+          ? 'Shared token <span class="chip">off</span> (<code>HUB_MCP_SHARED_TOKEN=0</code>): only machines with an MCP token of their own reach it.'
+          : `Shared token <code id="tok">${esc(data.hub.token_hint)}</code> <button class="ghost small" id="reveal">Show</button> <button class="ghost small" id="rotate">Rotate</button>`}</p>
+      <p class="muted small">Machines with their own runner token get an MCP token of their own when their runner is up to date. Forget stops it; <strong>New MCP token</strong> on the machine's page replaces it. The shared token is for the other machines and for clients you set up yourself.</p>
       ${data.hub.trust_access ? '<p class="muted small">Requests through Cloudflare Access are accepted without the token (HUB_MCP_TRUST_ACCESS=1), for a claude.ai connector. They reach the shared memory only.</p>' : ''}
     </div>
     <h2>Central list</h2>
@@ -3466,11 +3950,11 @@ async function renderMcp(editId) {
   showParts();
   if (editing) document.getElementById('mcp-form').scrollIntoView({ behavior: 'smooth', block: 'start' });
   document.getElementById('m-cancel')?.addEventListener('click', () => renderMcp());
-  document.getElementById('reveal').addEventListener('click', async () => {
+  document.getElementById('reveal')?.addEventListener('click', async () => {
     try { document.getElementById('tok').textContent = (await api('/api/mcp/token')).token; } catch (e) { fail(e); }
   });
-  document.getElementById('rotate').addEventListener('click', async () => {
-    if (!confirm('Make a new token? Machines pick it up on their next sync; anything else using the old one stops working.')) return;
+  document.getElementById('rotate')?.addEventListener('click', async () => {
+    if (!confirm('Make a new shared token? Machines that use it pick it up on their next sync; anything else using the old one stops working.')) return;
     try { await api('/api/mcp/token/rotate', { method: 'POST', body: {} }); renderMcp(); } catch (e) { fail(e); }
   });
   document.getElementById('sync-all').addEventListener('click', async (ev) => {
@@ -3811,7 +4295,7 @@ async function route() {
   const hash = location.hash || '#/';
   document.querySelectorAll('#nav a').forEach((a) => {
     const r = a.dataset.route;
-    a.classList.toggle('active', (r === 'overview' && (hash === '#/' || hash === '')) || hash.startsWith(`#/${r}`));
+    a.classList.toggle('active', (r === 'overview' && (hash === '#/' || hash === '' || hash.startsWith('#/?'))) || hash.startsWith(`#/${r}`));
   });
   try {
     let m;

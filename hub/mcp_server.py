@@ -10,9 +10,10 @@ connector) can call:
 Built on the official MCP Python SDK (package `mcp`, v2). Tested with mcp 2.3.0,
 which serves both the 2026-07-28 protocol and older 2025 clients.
 
-Authentication: `Authorization: Bearer <token>`. The token lives in the hub's
-database and is handed to each runner, which writes it into its agents'
-MCP settings. Optionally (HUB_MCP_TRUST_ACCESS=1 plus HUB_CF_ACCESS_TEAM and
+Authentication: `Authorization: Bearer <token>`. A machine with its own runner
+token gets an MCP token of its own (app.machine_mcp_token; the hub keeps only its
+sha256), other machines the hub's shared one. Each runner writes its token into
+its agents' MCP settings. Optionally (HUB_MCP_TRUST_ACCESS=1 plus HUB_CF_ACCESS_TEAM and
 HUB_CF_ACCESS_AUD) a request carrying a valid, signed Cloudflare Access token is
 accepted without the bearer token, so a claude.ai connector protected by Access
 Managed OAuth works.
@@ -24,7 +25,6 @@ only ask, which tags the note for the user to review on the Memory page.
 from __future__ import annotations
 
 import contextvars
-import hmac
 import logging
 from typing import Any, Callable
 
@@ -144,18 +144,22 @@ def access_verifier_from_env(env: dict) -> "AccessVerifier | None":
 
 class McpAuth:
     """ASGI middleware: /mcp and everything under it (the servers the hub relays, /mcp/s/<name>)
-    need the hub's MCP bearer token. A valid Cloudflare Access token, when that is configured, is
-    accepted for the shared memory at /mcp itself only: anyone the Access policy lets in would
-    otherwise also get the keys and sign-ins of every relayed server.
+    need an MCP bearer token: the hub's shared one or a machine's own. `check(token)` says whose it
+    is: "" for the shared token, the machine's name for a machine's own, None for no valid token.
+    It may read the database, so it runs in a worker thread. With a machine's own token, the caller
+    (the note source) is the agent named in X-Bullpen-Agent at that machine, whatever machine the
+    header names. A valid Cloudflare Access token, when that is configured, is accepted for the
+    shared memory at /mcp itself only: anyone the Access policy lets in would otherwise also get the
+    keys and sign-ins of every relayed server.
 
     `exempt` names endpoints that check a token of their own (the job tools at /mcp/job): exactly
     that path, with or without a trailing slash, is passed through untouched. Every other path
     under the prefix keeps the check."""
 
-    def __init__(self, app: ASGIApp, get_token: Callable[[], str],
+    def __init__(self, app: ASGIApp, check: Callable[[str], "str | None"],
                  access: "AccessVerifier | None" = None, prefix: str = "/mcp",
                  exempt: "tuple[str, ...] | list[str]" = ()) -> None:
-        self.app, self.get_token, self.access, self.prefix = app, get_token, access, prefix
+        self.app, self.check, self.access, self.prefix = app, check, access, prefix
         self.exempt = {p.rstrip("/") for p in exempt if p.rstrip("/")}
         self.exempt |= {p + "/" for p in self.exempt}
 
@@ -171,8 +175,15 @@ class McpAuth:
             return
         headers = Headers(scope=scope)
         scheme, _, cred = headers.get("authorization", "").partition(" ")
-        ok = scheme.lower() == "bearer" and hmac.compare_digest(cred.strip().encode(), self.get_token().encode())
+        cred = cred.strip()
+        whose = None
+        if scheme.lower() == "bearer" and cred:
+            import anyio
+            whose = await anyio.to_thread.run_sync(self.check, cred)
+        ok = whose is not None
         caller = headers.get("x-bullpen-agent", "")[:100] or "mcp client"
+        if whose:  # a machine's own token: the machine is known, only the agent's name comes from the header
+            caller = f"{caller.rsplit('@', 1)[0][:60] or 'mcp client'}@{whose}"[:100]
         if not ok and self.access is not None and headers.get("cf-access-jwt-assertion") \
                 and path in (self.prefix, self.prefix + "/"):
             import anyio

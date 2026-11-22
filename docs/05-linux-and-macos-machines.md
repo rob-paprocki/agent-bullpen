@@ -175,7 +175,8 @@ start by itself:
 
 **8. Shared context sync.** This runs by itself and asks nothing. It adds your pinned notes, the `/remember`
 command, the "second opinion" add-on and the servers from the hub's MCP page to every Claude account, Gemini
-CLI and Antigravity on this machine. After that the runner keeps them up to date. If you answered "no" to
+CLI and Antigravity on this machine. The `remember` skill also goes to `~/.agents/skills`, for other agent
+CLIs such as Codex and OpenCode. After that the runner keeps them up to date. If you answered "no" to
 letting the hub manage agent settings in step 5, it changes nothing. See
 [guide 10](10-shared-memory-and-mcp.md) and
 [second opinions](08-daily-use.md#second-opinions-inside-an-interactive-session).
@@ -524,6 +525,9 @@ The Overview says when a machine has something new to accept. The operating-syst
 accepting. To withdraw a tag or a label, click its **×** under **Accepted**. A tag the machine stops
 reporting stops counting at once; if it reports it again later, it counts again without a new Accept.
 
+For a new machine you can skip the Accept: give its tags and labels in **Add a machine** when you make its
+setup command ([guide 8](08-daily-use.md#overview)).
+
 **The machine needs its own runner token.** Tasks for a tag, tasks that hand out subtasks, and subtasks
 themselves only go to machines that check in with their own token, never with the shared
 `HUB_RUNNER_TOKEN`. A machine set up by hand with the shared one needs its own first
@@ -557,29 +561,129 @@ For example, to allow it with servers that stop after 4 hours:
 - Setting `allow_remote_control` back to `false` stops the running servers within about 15 seconds. **Stop**
   on the machine's page always works, whatever the setting says.
 - The servers stop with the runner. After **Update now**, the new runner starts them again, and their 8
-  hours still count from the first start. After a restart of the computer they stay off until you press
-  **Start** again.
+  hours still count from the first start. After a restart of the computer, or of the runner, they stay off
+  unless you ticked **Start again when the runner starts** when you started them. If you did, the runner
+  starts them again once it has checked in with the hub. Their hours still count from the first start, so
+  a server whose time is up stays off. The runner doesn't start them again if `allow_remote_control` is now
+  `false`, or if the machine is paused on the dashboard; the runner's log says why.
 - The first time on each machine, Claude Code asks two questions that need a terminal. **Start** then says
   so and shows the commands to run once ([guide 9](09-troubleshooting.md#claude-code)).
 
+## Signing agents out from the dashboard
+
+**Sign out…** on a machine's page signs one of its Claude agents out, with that agent's own
+`claude auth logout` ([guide 8](08-daily-use.md#a-machines-own-page)). It is off unless the machine
+allows it, in `~/.bullpen/runner.json`:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `allow_remote_sign_out` | `false` | `true` lets the dashboard sign this machine's Claude agents out |
+
+To allow it, add this line to `runner.json`:
+
+```json
+"allow_remote_sign_out": true
+```
+
+- The runner picks the change up within 15 seconds.
+- The hub needs a dashboard password (`HUB_UI_PASSWORD`) for it, like approvals.
+- Signing in again always happens on the machine itself: run the command the machine's page shows, such as
+  `claude auth login`, at the machine or over SSH. On a Mac, sign in at the Mac itself: Claude Code keeps
+  the login in the Keychain, which is locked in an SSH session. Claude Code signs in through Anthropic's
+  own page, and nothing about it goes through the hub.
+
 ## Keeping a Mac available
 
-A launchd agent runs while you're logged in to the Mac, including when the screen is locked. That's
-deliberate: Claude Code keeps its login in your Keychain, which needs your session.
+On a Mac the runner is a launchd agent, and it runs only while you're logged in. When you log out, macOS
+stops it. When you log in again, it starts. This is on purpose. Claude Code keeps its claude.ai login in your
+login Keychain, which belongs to your login session. A LaunchDaemon would run with nobody logged in, but
+outside any user's session, where that login isn't available, so subscription agents wouldn't work in it
+([Apple's TN2083 on daemons and agents](https://developer.apple.com/library/archive/technotes/tn2083/_index.html),
+last checked 17 November 2026). The setup doesn't offer one.
 
-- **Local network permission (macOS 15 and later).** The first time the runner starts, macOS asks whether
-  Python may find devices on your local network. Click **Allow**, or the runner can't reach a hub on your
-  network. If you set the Mac up over SSH, the question appears on the Mac's screen; you can also allow it
-  later in **System Settings → Privacy & Security → Local Network**.
+What keeps it running, and what doesn't, as seen on an Apple silicon Mac with macOS 27 on 20 November
+2026:
 
-- **After a restart**, someone has to log in again. To make that automatic, turn on **System Settings →
-  Users & Groups → Automatically log in as**. macOS doesn't offer this while FileVault is on, and anyone
-  with the Mac in front of them then gets your desktop, so decide based on where the Mac lives.
-- **Sleep.** A sleeping Mac can't take jobs. On a desktop Mac, turn on **System Settings → Energy →
-  Prevent automatic sleeping when the display is off**. On a laptop, keep it on power and use the
-  **Battery → Options** settings, or run `sudo pmset -c sleep 0`.
-- **The dashboard can't see a Mac's Claude login**, because it is in the Keychain. Hovering over the agent's
-  chip says so, and `python3 ~/.bullpen/runner/runner.py test claude` checks the login for real.
+| Situation | The runner |
+|---|---|
+| Logged in, screen in use | runs |
+| Screen locked, or the screen saver on | keeps running. Claude jobs still work: Claude Code reads its login from the Keychain while the screen is locked. |
+| Another user logged in with fast user switching, your session still open | keeps running, and Claude jobs still work |
+| You logged out | stops, and starts again when you log in |
+| The Mac restarted | starts when someone logs in, or by itself with automatic login (see **After a restart** below) |
+| The Mac is asleep, or a MacBook's lid is closed | paused; the dashboard shows the Mac offline until it wakes, and it comes back by itself (see **Sleep** below) |
+
+- **Background items.** In **System Settings → General → Login Items & Extensions**, under **App
+  Background Activity**, the runner may be listed, probably as `python3`. On older macOS versions this is
+  **System Settings → General → Login Items**, under **Allow in the Background**. If you switch it off
+  there, the runner stops starting. The name it shows needs checking on a real Mac
+  ([Apple's Login Items settings](https://support.apple.com/guide/mac-help/change-login-items-extensions-settings-mtusr003/mac),
+  last checked 17 November 2026).
+- **Python from Homebrew.** The launchd agent starts the exact Python the setup found. If you upgrade or
+  remove that Python with Homebrew and the runner stops starting, run the setup again.
+- **Apple's own Python.** This Python lives inside Xcode or the Command Line Tools, and that path breaks
+  when Xcode is moved or switched. So for this Python the setup writes `/usr/bin/python3` into the
+  launchd agent. It runs the Python of whichever Xcode or Command Line Tools `xcode-select` points to
+  ([Apple's steps](https://developer.apple.com/documentation/xcode/configuring-command-line-tools-settings),
+  last checked 17 November 2026).
+- **Apple silicon and Rosetta.** Run the setup in a Terminal that doesn't use Rosetta, so Python and
+  Claude Code are installed as Apple silicon programs. The setup warns you when it is running under Rosetta.
+- **Local network permission (macOS 15 and later).** The first time the runner tries to reach a hub on your
+  network, macOS asks whether Python may find devices on your local network. Click **Allow**. Until you
+  do, the Mac shows offline on the dashboard, and `runner.log` says `cannot reach the hub` with `No route
+  to host` every minute. If you set the Mac up over SSH, the question appears on the Mac's screen. You can
+  also allow it later: in **System Settings → Privacy & Security → Local Network**, turn on **Python**.
+
+- **After a restart**, the runner starts only when someone logs in. With FileVault on, unlocking the disk
+  doesn't count as logging in. On the Mac checked for the table above, FileVault could be unlocked over SSH
+  at startup. The Mac then waited at the login window, and the runner stayed offline until someone logged
+  in, at the keyboard or with Screen Sharing. Programs installed as system LaunchDaemons start without a
+  login, but the runner is a launchd agent, so it waits.
+
+  To have the Mac log in by itself, turn FileVault off, then turn on **System Settings → Users & Groups →
+  Automatically log in as**. macOS doesn't offer automatic login while FileVault is on
+  ([Apple's steps](https://support.apple.com/en-us/102316), last checked 20 November 2026). With it on, the
+  runner was running about 20 seconds after a restart, and a Claude job worked with nobody at the Mac. Know
+  what you give up:
+  - With FileVault off, anyone who takes the Mac, or its disk, can read what is on it.
+  - Automatic login logs in as you, which also unlocks your login Keychain and the Claude login in it.
+    Anyone at the Mac gets your desktop. Apple's own words: "Automatic login allows anyone to access your Mac
+    simply by restarting it." Apple also advises against it for an administrator account
+    ([Users & Groups settings](https://support.apple.com/guide/mac-help/change-users-groups-settings-mtusr001/mac),
+    last checked 20 November 2026).
+
+  Use automatic login only for a Mac in a place you trust, and only for a standard account, not an
+  administrator.
+- **Sleep.** A sleeping Mac can't take jobs, and after about 45 seconds the dashboard shows it offline. A
+  job that was running pauses with the Mac and carries on when it wakes. The runner's time limit for the job
+  doesn't count the time asleep, but the hub's does: once the time limit plus 5 minutes has passed by the
+  clock, the job can no longer use the hub's tools, such as approvals and subtasks. In the check for the
+  table above, the Mac slept for three and a half minutes in the middle of a job. About 25 seconds after it
+  woke, the same runner was back online, and the job finished normally. Right after waking, `runner.log` may
+  show one `Network is unreachable` warning; that is harmless. To keep the Mac awake
+  ([Apple's sleep settings](https://support.apple.com/guide/mac-help/set-sleep-and-wake-settings-mchle41a6ccd/mac),
+  last checked 17 November 2026):
+  - On a desktop Mac, turn on **System Settings → Energy → Prevent automatic sleeping when the display is
+    off**.
+  - On a MacBook, keep it on power and turn on **System Settings → Battery → Options → Prevent automatic
+    sleeping on power adapter when the display is off**. Closing the lid still puts it to sleep, unless it
+    has an external display, keyboard and power connected.
+  - To keep it awake only for a while, without changing any setting, leave this running in a Terminal
+    window. Ctrl+C ends it ([caffeinate](https://ss64.com/mac/caffeinate.html), last checked 17 November
+    2026):
+
+    ```bash
+    caffeinate -i
+    ```
+
+- **The Claude login is in the Keychain.** The runner never reads the Keychain. It asks Claude Code itself
+  (`claude auth status`), so the machine's page shows whether each agent is signed in. With Claude Code
+  older than 2.1.317 the page says "Unknown (CLI too old)"; update Claude Code, or run
+  `python3 ~/.bullpen/runner/runner.py test claude` to check the login for real.
+- **Check the login at the Mac, not over SSH.** Run `claude auth status` and `runner.py test` in Terminal
+  on the Mac itself. Over SSH the login Keychain is locked, so Claude Code says it is signed out
+  (`loggedIn` false) even when it isn't. The machine's page comes from the runner, which runs in your
+  login session, so it shows the real state.
 
 ## Managing the runner
 
@@ -598,20 +702,23 @@ deliberate: Claude Code keeps its login in your Keychain, which needs your sessi
 |---|---|
 | Status | `launchctl print gui/$(id -u)/bullpen.runner` |
 | Live log | `tail -f ~/.bullpen/runner.log` |
+| Errors from before the log opens (a wrong Python path, a crash at start) | `cat ~/.bullpen/launchd.log` |
 | Restart | `launchctl kickstart -k gui/$(id -u)/bullpen.runner` |
 | Stop it (until you log in again) | `launchctl bootout gui/$(id -u)/bullpen.runner` |
-| Stop it for good | the line above, then `rm ~/Library/LaunchAgents/bullpen.runner.plist` |
+| Start it again after stopping it | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/bullpen.runner.plist` |
+| Stop it for good | the line above, then `rm ~/Library/LaunchAgents/bullpen.runner.plist` (or remove the runner altogether: [Removing a machine](#removing-a-machine)) |
 
 **Both:**
 
 | Task | Command |
 |---|---|
 | Re-run the setup questions | `python3 ~/.bullpen/runner/runner.py init` |
-| Test an agent without the hub | `python3 ~/.bullpen/runner/runner.py test claude-work` |
+| Test an agent without the hub (on a Mac, in Terminal on the Mac itself) | `python3 ~/.bullpen/runner/runner.py test claude-work` |
 | Show the last plan-limit readings | `python3 ~/.bullpen/runner/runner.py limits` |
 | Connect with a new code | `python3 ~/.bullpen/runner/runner.py enroll --hub http://192.168.100.20:8080 --code K7QM-2XTA-9RFD-WP3H` |
 
-Stopping or restarting the runner also stops the [Remote Control](#remote-control) servers it started.
+Stopping or restarting the runner also stops the [Remote Control](#remote-control) servers it started. The
+ones started with **Start again when the runner starts** come back when the runner starts again.
 
 ## Machines set up with the shared token
 
@@ -619,9 +726,9 @@ A machine you set up by hand can connect with the hub's shared runner token, `HU
 settings. It works for jobs aimed at it by name. Tasks for a tag, tasks that hand out subtasks, and subtasks
 go only to machines with their own token. To give one its own token, click **Add a machine** with that
 machine's name, or **Make a setup command** on its page, and run the command on that machine. The hub
-recognizes it by its host name and switches it over. After that, the shared token no longer works for that
-machine. Once every machine has its own token, you can empty `HUB_RUNNER_TOKEN` in the hub's settings, so the
-shared token stops working altogether.
+recognizes the machine by its install id (an older runner by its host name) and switches it over. After
+that, the shared token no longer works for that machine. Once every machine has its own token, you can empty
+`HUB_RUNNER_TOKEN` in the hub's settings, so the shared token stops working altogether.
 
 ## Two computers with the same name
 
@@ -631,24 +738,78 @@ hub notices and flags that machine, naming the other computer. To fix it, give o
 it is left over. A machine with its own token can't take a name that belongs to another computer: enrolling
 refuses it unless the code was made for exactly that machine (**Make a setup command** on its page).
 
+The hub tells computers apart by an install id that the runner makes once and keeps in
+`~/.bullpen/install-id`. Host names don't work for this, because some computers, Macs among them, change
+theirs by themselves. If you copy `~/.bullpen` from one computer to another, delete `install-id` on the copy
+before its runner starts.
+
 ## Removing a machine
 
-1. On the machine, stop the runner and stop it from starting by itself (see
-   [Managing the runner](#managing-the-runner)).
-2. On the dashboard, wait until the machine shows as offline, then click **Forget this machine** on its card.
+The runner can remove itself and what the setup and the hub added to the machine.
+
+1. See what it would remove. This changes nothing:
+
+   ```bash
+   python3 ~/.bullpen/runner/runner.py uninstall --dry-run
+   ```
+
+2. Remove it. It shows the same list and asks before it changes anything:
+
+   ```bash
+   python3 ~/.bullpen/runner/runner.py uninstall
+   ```
+
+3. On the dashboard, wait until the machine shows as offline, then click **Forget this machine** on its card.
    This also cancels its runner token, so it can't connect again with it. To add it back later, use **Add a
    machine** again.
-3. If you like, delete `~/.bullpen` on the machine. Your agents' own logins and settings (`~/.claude`,
-   `~/.claude-<name>`, `~/.gemini`) are left alone.
+
+**What goes:**
+
+- the service that starts the runner (on Linux, the systemd user service `bullpen-runner`; on a Mac, the
+  launchd agent `bullpen.runner`). It is stopped first.
+- `~/.bullpen`: the runner, its settings and token, its logs and the chat workspace.
+- the `bullpen` command in `~/.local/bin`, and the commands the setup made for extra Claude accounts, such as
+  `claude-work`.
+- what the hub added to your agents' own settings: the Agent Bullpen block in each `CLAUDE.md` and in
+  `GEMINI.md`, the `/remember` and "second opinion" add-ons, and the hub's MCP servers.
+
+Only files and settings marked as Agent Bullpen's are removed. Files you made yourself stay, even with the same
+name, and so do the MCP servers you added. A service that starts a runner from a different folder stays too.
+
+**What stays:**
+
+- your agents' logins, sessions and settings: `~/.claude`, each `~/.claude-<name>` (such as `~/.claude-work`)
+  and `~/.gemini`. The Gemini API key in `~/.gemini/.env` stays too.
+- your projects, and Claude Code, Gemini CLI, Python and Git.
+- the PATH line the setup added to `~/.bashrc` and `~/.zshrc`, and "linger" on Linux. Other programs may use
+  them. To turn linger off: `loginctl disable-linger`.
+
+Add `--yes` to skip the question, for example in a script. If something can't be removed, the command says
+what and why. Run it again once that's fixed: it only removes what is left.
+
+**By hand**, if the runner's files are already gone:
+
+1. Stop the runner and stop it from starting by itself (see [Managing the runner](#managing-the-runner)).
+2. Delete `~/.bullpen`, and `~/.local/bin/bullpen`.
+3. In `~/.claude/CLAUDE.md`, in each `~/.claude-<name>/CLAUDE.md` and in `~/.gemini/GEMINI.md`, delete the
+   lines from `<!-- bullpen:begin` to `<!-- bullpen:end -->`.
+4. Remove the hub's MCP server from each Claude account. For the first account:
+
+   ```bash
+   claude mcp remove -s user bullpen
+   ```
+
+   For an extra account, use its own command, for example `claude-work mcp remove -s user bullpen`.
 
 If the machine is lost or stolen:
 
-1. **Forget** it (step 2). With its own token, that shuts its runner out of the hub. A machine on the shared
-   token can only be shut out by changing `HUB_RUNNER_TOKEN` in the hub's settings, which every other machine
-   on the shared token then needs too.
-2. On the **MCP** page, press **Rotate** next to the hub's token. The machine's agents have a copy of it in
-   their settings, and it gives access to the shared memory and to every MCP server routed through the hub.
-   Your other machines pick up the new token on their next sync.
+1. **Forget** it (step 2). With its own token, that shuts its runner out of the hub and stops its own MCP
+   token. A machine on the shared token can only be shut out by changing `HUB_RUNNER_TOKEN` in the hub's
+   settings, which every other machine on the shared token then needs too.
+2. On the **MCP** page, press **Rotate** next to the hub's shared token. The machine's agents may have a copy
+   of it: they used it if the machine was on the shared runner token, or before its runner got an MCP token
+   of its own. It gives access to the shared memory and to every MCP server routed through the hub. Your other
+   machines pick up the new token on their next sync. If you turned the shared token off, skip this step.
 3. Sign its agents' accounts out on the providers' websites: the machine still has their logins.
 
 ## Updating
@@ -660,5 +821,5 @@ npm install -g @google/gemini-cli@latest
 ```
 
 For the runner, use **Update now** on the machine's page in the hub (or **Update all runners** on the
-Overview) after you've upgraded the hub. The hub hands out its own copy of the runner, so hub and runners stay
+Overview, for every machine or only those with a tag) after you've upgraded the hub. The hub hands out its own copy of the runner, so hub and runners stay
 on the same version.

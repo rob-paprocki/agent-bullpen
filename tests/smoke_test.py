@@ -40,6 +40,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import home_guard
+from home_guard import home_env
+
 ROOT = Path(__file__).resolve().parent.parent
 PASSWORD = "smoke-test"
 TOKEN = "smoke-token"
@@ -81,7 +84,25 @@ class Client:
             if data["job"]["status"] not in ("queued", "running"):
                 return data
             time.sleep(0.5)
+        show_logs_for(data)
         raise AssertionError(f"job {job_id} did not finish in {timeout}s: {data['job']['status']}")
+
+
+SMOKE_TMP: list[Path] = []  # the run's temporary folder, set by main(), for show_logs_for()
+
+
+def show_logs_for(data: dict) -> None:
+    """A job that never finishes: print what explains it (the job's own log, and the end of each runner's log)."""
+    job = data.get("job") or {}
+    print(f"--- job {job.get('id')} on {job.get('runner')}: {job.get('status')}, kind {job.get('kind')}, "
+          f"options {json.dumps(job.get('options'))[:300]}")
+    for line in (data.get("log") or [])[-20:]:
+        print("    log:", (line.get("text") if isinstance(line, dict) else line))
+    for path in sorted(SMOKE_TMP[0].glob("*-home/.bullpen/runner.log")) if SMOKE_TMP else []:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-25:]
+        print(f"--- last lines of {path.relative_to(SMOKE_TMP[0])}:")
+        for line in lines:
+            print("   ", line)
 
 
 def fake_gemini_models_server() -> tuple[str, Any]:
@@ -208,7 +229,7 @@ def credits_checks(tmp: Path, procs: list) -> None:
     path.write_text(json.dumps(cfg))
     home = tmp / "gamma-home"
     home.mkdir(exist_ok=True)
-    run_env = dict(os.environ, HOME=str(home), BULLPEN_HOME=str(home / ".bullpen"))
+    run_env = home_env(home)
     for key in CLAUDE_SIGN_IN_VARS:
         run_env.pop(key, None)
     run_env.pop("BULLPEN_TEST_IDLE_SECONDS", None)
@@ -384,7 +405,11 @@ def main() -> int:
         print("Install the hub's requirements first:  pip install -r hub/requirements.txt")
         return 2
 
+    # Every runner and agent here gets a home of its own (home_env). If one ever reaches the real home folder
+    # anyway, the test fails at the end and names what changed there.
+    real_home = home_guard.snapshot()
     tmp = Path(tempfile.mkdtemp(prefix="bullpen-smoke-"))
+    SMOKE_TMP.append(tmp)
     procs: list[subprocess.Popen] = []
     port = free_port()
     try:
@@ -445,7 +470,8 @@ def main() -> int:
             "alpha": {"agents": {"one": {"preset": "selftest", "account": "shared-acct"},
                                  "two": {"preset": "selftest", "env": {"SELFTEST_DELAY": "0.5"}}},
                       "projects": {"chat": str(tmp / "chat-a"), "proj": str(proj)}, "max_parallel": 2,
-                      "allow_remote_control": True, "accept_delegated_tasks": True, "tags": ["gpu", "pool"]},
+                      "allow_remote_control": True, "allow_remote_sign_out": True, "accept_delegated_tasks": True,
+                      "tags": ["gpu", "pool"]},
             "beta": {"agents": {"three": {"preset": "selftest", "account": "shared-acct",
                                           "env": {"SELFTEST_UTIL": "0.55"}},
                                 "slow": {"preset": "selftest", "env": {"SELFTEST_DELAY": "60"}}},
@@ -468,7 +494,8 @@ def main() -> int:
         runners["alpha"]["agents"]["shared"] = {"preset": "selftest", "account": "a1", "env": {"SELFTEST_DELAY": "0.2"}}
         runners["alpha"]["agents"]["nolabel"] = {"preset": "selftest"}
         runners["beta"]["agents"]["shared"] = {"preset": "selftest", "account": "b1"}
-        runners["beta"]["agents"]["nolabel"] = {"preset": "selftest"}
+        # Its fake CLI says it is too old to be asked whether it is signed in (SELFTEST_AUTH).
+        runners["beta"]["agents"]["nolabel"] = {"preset": "selftest", "env": {"SELFTEST_AUTH": "old"}}
         # For plan limits and tokens per job: the fake in Gemini CLI's format; Claude agents that sign
         # in with an API key and with a long-lived token (neither can check plan limits); one whose
         # login can't read plan usage; one that leaves out the per-turn figures.
@@ -483,6 +510,8 @@ def main() -> int:
         runners["alpha"]["agents"]["nosince"] = {"preset": "selftest", "env": {"SELFTEST_NO_SINCE": "1"}}
         # Remote Control on a machine where Claude Code still wants its one-time answers in a terminal.
         runners["alpha"]["agents"]["rcfresh"] = {"preset": "selftest", "env": {"SELFTEST_RC": "untrusted"}}
+        # ... and where `claude remote-control` already runs in a terminal in that folder.
+        runners["alpha"]["agents"]["rcbusy"] = {"preset": "selftest", "env": {"SELFTEST_RC": "busy"}}
         # A CLI that takes the prompt as an argument, reads its folder from PWD, has a setting per
         # autonomy level, gets a fresh session id, and has a key on its command line (which the
         # runner's log must not show).
@@ -510,6 +539,7 @@ def main() -> int:
         (ahome / ".gemini" / "config" / "mcp_config.json").write_text(
             '{\n  // my servers\n  "mcpServers": {"mine": {"serverUrl": "https://example.invalid/mcp"},},\n}\n')
         runner_procs: dict[str, subprocess.Popen] = {}
+        runner_launch: dict[str, tuple] = {}  # how each runner was started (argv, env), to start one again
         for name, cfg in runners.items():
             for p in cfg["projects"].values():
                 Path(p).mkdir(exist_ok=True)
@@ -521,19 +551,16 @@ def main() -> int:
             shutil.copytree(ROOT / "runner", code_dir, ignore=shutil.ignore_patterns("__pycache__"))
             home = tmp / f"{name}-home"
             home.mkdir(exist_ok=True)
-            run_env = dict(os.environ, HOME=str(home), BULLPEN_HOME=str(home / ".bullpen"),
-                           BULLPEN_GEMINI_MODELS_URL=models_url)
-            run_env.pop("GEMINI_CLI_HOME", None)
+            run_env = home_env(home, BULLPEN_GEMINI_MODELS_URL=models_url)  # GEMINI_CLI_HOME left out too
             # How the fake Claude agents sign in comes from their own settings, not from this computer's.
             for key in CLAUDE_SIGN_IN_VARS:
                 run_env.pop(key, None)
             run_env.pop("BULLPEN_TEST_IDLE_SECONDS", None)
             if name == "beta":
                 run_env["BULLPEN_TEST_IDLE_SECONDS"] = "3"  # live sessions there end after 3 quiet seconds
-            runner_procs[name] = subprocess.Popen(
-                [sys.executable, str(code_dir / "runner.py"), "--config", str(path), "run"],
-                env=run_env,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            runner_launch[name] = ([sys.executable, str(code_dir / "runner.py"), "--config", str(path), "run"], run_env)
+            runner_procs[name] = subprocess.Popen(runner_launch[name][0], env=run_env,
+                                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             procs.append(runner_procs[name])
 
         c = Client(hub)
@@ -602,6 +629,45 @@ def main() -> int:
         c.call(f"/api/jobs/{body['id']}/cancel", {})
         job = c.wait_job(body["id"], timeout=30)["job"]
         check(job["status"] == "cancelled", "a running job can be cancelled")
+
+        print("pausing a machine")
+        # beta, paused while it runs a minute-long job: the job goes on, new work for beta waits, machine
+        # actions still run, and Start Remote Control is refused. Pausing again with "Cancel running jobs"
+        # stops the job. Resumed in `finally`, so the checks after this one find beta in service.
+        _, body = c.call("/api/tasks", {"runner": "beta", "agent": "slow", "prompt": "take your time"})
+        slow_job = body["id"]
+        check(wait_for(lambda: c.call(f"/api/jobs/{slow_job}")[1]["job"]["status"] == "running", 30),
+              "the job to keep running has started")
+        try:
+            status, paused = c.call("/api/runners/beta/pause", {})
+            check(status == 200 and paused["running"] == 1 and paused["cancelled"] == 0
+                  and paused["runner"]["paused"] is True, "Pause lets the running job finish by default")
+            state = c.call("/api/state")[1]
+            check([r["paused"] for r in state["runners"] if r["name"] == "beta"] == [True],
+                  "the Overview lists beta as paused")
+            _, body = c.call("/api/tasks", {"runner": "beta", "agent": "three", "prompt": "Reply with pong"})
+            waiting = body["id"]
+            _, body = c.call("/api/runners/beta/actions", {"action": "sync", "params": {}})
+            check(c.wait_job(body["id"], timeout=30)["job"]["status"] == "done", "a paused machine still syncs")
+            _, data = c.call(f"/api/jobs/{waiting}")
+            check(data["job"]["status"] == "queued" and data["paused_machines"] == ["beta"],
+                  "a task for a paused machine waits, and its page says why")
+            check(c.call(f"/api/jobs/{slow_job}")[1]["job"]["status"] == "running", "the running job carries on")
+            status, body = c.call("/api/runners/beta/actions", {"action": "rc.start",
+                                                                "params": {"agent": "three", "project": "chat"}})
+            check(status == 409 and "paused" in body.get("detail", ""), "Start Remote Control is refused while paused")
+            beta_log = tmp / "beta-home" / ".bullpen" / "runner.log"
+            check(wait_for(lambda: "this machine is paused on the hub" in beta_log.read_text(), 25),
+                  "the runner logs that it is paused")
+            status, paused = c.call("/api/runners/beta/pause", {"cancel_running": True})
+            check(status == 200 and paused["cancelled"] == 1, "Pause with 'Cancel running jobs' cancels it")
+            check(c.wait_job(slow_job, timeout=30)["job"]["status"] == "cancelled", "the running job is cancelled")
+            check(c.call(f"/api/jobs/{waiting}")[1]["job"]["status"] == "queued", "the waiting task still waits")
+        finally:
+            status, resumed = c.call("/api/runners/beta/resume", {})
+        check(status == 200 and resumed["runner"]["paused"] is False, "Resume puts beta back in service")
+        done = c.wait_job(waiting, timeout=30)["job"]
+        check(done["status"] == "done" and done["result"] == "pong", "the task that waited runs once beta is resumed")
 
         print("models")
         status, _ = c.call("/api/tasks", {"runner": "alpha", "agent": "one", "prompt": "x", "model": "--evil"})
@@ -694,8 +760,7 @@ def main() -> int:
         check(st == 429 and "another machine" in body.get("detail", ""),
               "... and once every 5 minutes per account, on any machine")
         res = subprocess.run([sys.executable, str(ROOT / "runner" / "runner.py"), "--config", str(tmp / "alpha.json"),
-                              "limits", "one"], capture_output=True, text=True, timeout=60,
-                             env=dict(os.environ, HOME=str(ahome), BULLPEN_HOME=str(ahome / ".bullpen")))
+                              "limits", "one"], capture_output=True, text=True, timeout=60, env=home_env(ahome))
         check(res.returncode == 0 and "one (account shared-acct)" in res.stdout and "5-hour session" in res.stdout
               and "31% used" in res.stdout and "Week (Fable)" in res.stdout,
               "'runner.py limits' prints the machine's last plan-limit readings")
@@ -821,12 +886,12 @@ def main() -> int:
         mcp_url = hub + "/mcp"
         token = c.call("/api/mcp/token")[1]["token"]
 
-        def rpc(method, params, ident, auth=True, url=None):
+        def rpc(method, params, ident, auth=True, url=None, bearer=None):
             req = urllib.request.Request(url or mcp_url, method="POST", data=json.dumps(
                 {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}).encode(), headers={
                 "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
                 "MCP-Protocol-Version": "2025-11-25", "X-Bullpen-Agent": "smoke@test",
-                **({"Authorization": f"Bearer {token}"} if auth else {})})
+                **({"Authorization": f"Bearer {bearer or token}"} if auth else {})})
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     raw = resp.read().decode()
@@ -985,6 +1050,10 @@ def main() -> int:
         check((ahome / ".gemini" / "commands" / "remember.toml").exists()
               and (ahome / ".gemini" / "config" / "skills" / "remember" / "SKILL.md").exists(),
               "/remember is installed for Gemini CLI and Antigravity")
+        check((ahome / ".agents" / "skills" / "remember" / "SKILL.md").exists()
+              and not (ahome / ".agents" / "skills" / "second-opinion").exists()
+              and not (ahome / ".gemini" / "skills" / "remember").exists(),
+              "the remember skill is in the shared skills folder, which Gemini CLI reads, so not in ~/.gemini/skills")
         check((ahome / ".local" / "bin" / "bullpen").exists(), "the bullpen command is installed")
         if claude_bin:
             for d, cj in ((ahome / ".claude", ahome / ".claude.json"),
@@ -1126,8 +1195,7 @@ def main() -> int:
               "a follow-up chain reads as one conversation")
 
         res = subprocess.run([sys.executable, str(ROOT / "runner" / "runner.py"), "--config", str(tmp / "alpha.json"),
-                              "test", "one"], capture_output=True, text=True, timeout=120,
-                             env=dict(os.environ, HOME=str(ahome), BULLPEN_HOME=str(ahome / ".bullpen")))
+                              "test", "one"], capture_output=True, text=True, timeout=120, env=home_env(ahome))
         if res.returncode != 0:
             print("    test output:\n" + (res.stdout + res.stderr)[-2000:])
         check(res.returncode == 0 and "OK" in res.stdout, "runner.py test still works")
@@ -1298,6 +1366,21 @@ def main() -> int:
         check(st_deny == 200 and "approval: deny (The owner denied this: not now)" in (denied["result"] or "")
               and log_line(deny_id, "✖ You denied Bash: not now"), "Deny sends your reason to the agent")
 
+        # "Allow for this job": the same command again in this job runs without asking; another one asks.
+        again_id = ask_task("SELFTEST: ask Bash npm test\nSELFTEST: ask Bash npm test\nSELFTEST: ask Bash npm run lint\n"
+                            "Test it twice")
+        first_q = (wait_for(lambda: pending_of(again_id), 30) or [{}])[0]
+        st_job = answer(again_id, first_q.get("id", 0), "allow_job")
+        lint_q = (wait_for(lambda: pending_of(again_id), 30) or [{}])[0]
+        answer(again_id, lint_q.get("id", 0), "allow")
+        again = c.wait_job(again_id)["job"]
+        auto = [a for a in job_view(again_id).get("approvals") or [] if a.get("same_as") == first_q.get("id")]
+        check(st_job == 200 and (again["result"] or "").count("approval: allow (npm test)") == 2
+              and (lint_q.get("tool_input") or {}).get("command") == "npm run lint"
+              and [a["status"] for a in auto] == ["allowed"]
+              and log_line(again_id, f"✔ Allowed automatically: Bash: npm test (same as question #{first_q.get('id')}"),
+              "'Allow for this job' lets the same command run again in that job without asking, and only that one")
+
         expired = c.wait_job(expire_id, timeout=60)["job"]
         late = next((a for a in job_view(expire_id).get("approvals") or [] if a["id"] == unanswered[0].get("id")), {})
         check(late.get("status") == "expired" and "approval: deny (No answer" in (expired["result"] or "")
@@ -1391,6 +1474,14 @@ def main() -> int:
         check(st == 200 and fresh.get("status") == "error" and "one-time answer" in error
               and "remote-control" in error and 1 <= len(tail) <= 5,
               "a folder that needs a one-time terminal answer gets a clear message")
+        st, busy = rc_start("alpha", "rcbusy")
+        error = busy.get("error") or ""
+        busy_pid_file = ahome / ".bullpen" / "selftest" / "rc-alpha-proj-rcbusy.pid"
+        check(st == 200 and busy.get("status") == "error"
+              and "already running for this folder from a terminal" in error and "already served" in error
+              and wait_for(lambda: rc_entry("alpha", "rcbusy", "proj").get("state") == "failed", 20)
+              and wait_for(lambda: not busy_pid_file.exists(), 15),
+              "a folder already served from a terminal fails the start (not 'running') and the server is stopped")
         st, body = rc_action("alpha", "rc.start", "apikey")
         check(st == 400 and "API key" in body.get("detail", ""), "Remote Control is refused for an API-key agent")
         st_beta, body_beta = rc_action("beta", "rc.start", "three", "chat")
@@ -1406,6 +1497,46 @@ def main() -> int:
               and st == 409 and "offline" in body.get("detail", ""),
               "Remote Control is refused where the machine doesn't allow it, and for an offline machine")
         c.call("/api/runners/rcbox", method="DELETE")
+
+        print("sign-in status and sign out")
+
+        def agent_entry(machine: str, agent: str) -> dict:
+            runner = next(r for r in c.call("/api/state")[1]["runners"] if r["name"] == machine)
+            return next((a for a in runner.get("agents") or [] if a.get("name") == agent), {})
+
+        def sign_in_of(machine: str, agent: str) -> dict:
+            return agent_entry(machine, agent).get("sign_in") or {}
+
+        # The runner asks each fake Claude agent's CLI ("auth status --json") in the background.
+        seen = wait_for(lambda: sign_in_of("alpha", "nolabel").get("state") == "in" and sign_in_of("alpha", "nolabel"),
+                        30) or {}
+        allowed = {"state", "why", "method", "provider", "plan", "tier", "expires_at", "checked_at", "command"}
+        reported = [set(a.get("sign_in") or {}) for r in c.call("/api/state")[1]["runners"] for a in r.get("agents") or []]
+        check(seen.get("plan") == "pro" and seen.get("method") == "claude.ai" and seen.get("command") == "selftest auth login"
+              and all(keys <= allowed for keys in reported) and "Example Org" not in json.dumps(seen)
+              and "example.com" not in json.dumps(seen),
+              "the machine page shows each Claude agent's sign-in, without the account's email or organization")
+        old = wait_for(lambda: sign_in_of("beta", "nolabel").get("state") == "unknown" and sign_in_of("beta", "nolabel"),
+                       30) or {}
+        check(old.get("why") == "old" and agent_entry("beta", "nolabel").get("ready") is True,
+              "a CLI too old to say shows Unknown, and the agent stays ready")
+        check("sign_in" not in agent_entry("alpha", "apikey") and "sign_in" not in agent_entry("alpha", "gem"),
+              "an API key or Gemini agent shows no sign-in")
+        st_beta, body_beta = c.call("/api/runners/beta/actions", {"action": "auth.logout", "params": {"agent": "three"}})
+        st_key, body_key = c.call("/api/runners/alpha/actions", {"action": "auth.logout", "params": {"agent": "apikey"}})
+        check(st_beta == 400 and "allow_remote_sign_out" in body_beta.get("detail", "")
+              and st_key == 400 and "no claude.ai login" in body_key.get("detail", ""),
+              "Sign out is off unless the machine allows it, and only for a claude.ai login")
+        st, made = c.call("/api/runners/alpha/actions", {"action": "auth.logout", "params": {"agent": "nolabel"}})
+        signed_out = c.wait_job(made["id"], timeout=60)["job"] if st == 200 else {}
+        check(st == 200 and signed_out.get("status") == "done" and "is signed out now" in (signed_out.get("result") or "")
+              and wait_for(lambda: sign_in_of("alpha", "nolabel").get("state") == "out", 20)
+              and sign_in_of("alpha", "shared").get("state") == "in",
+              "Sign out runs the agent's own 'auth logout' and the page shows it signed out; other agents keep theirs")
+        # Sign it in again the way its owner would, on the machine itself (the fake's login only forgets the logout).
+        subprocess.run([sys.executable, str(ROOT / "runner" / "selftest_agent.py"), "auth", "login"],
+                       env=home_env(ahome, BULLPEN_AGENT="nolabel"),
+                       capture_output=True, timeout=30)
 
         print("notifications")
 
@@ -1480,8 +1611,7 @@ def main() -> int:
         # Run the one-liner as a new machine would (it runs the stand-in setup script).
         ghome = tmp / "gamma-home"
         ghome.mkdir()
-        genv = dict(os.environ, HOME=str(ghome), BULLPEN_HOME=str(ghome / ".bullpen"), SMOKE_PYTHON=sys.executable,
-                    BULLPEN_ALLOW_ROOT="1")
+        genv = home_env(ghome, SMOKE_PYTHON=sys.executable, BULLPEN_ALLOW_ROOT="1")
         res = subprocess.run(["bash", "-c", made["linux"]], env=genv, capture_output=True, text=True, timeout=120)
         gcfg_path = ghome / ".bullpen" / "runner.json"
         gcfg = json.loads(gcfg_path.read_text()) if gcfg_path.exists() else {}
@@ -1497,6 +1627,7 @@ def main() -> int:
 
         gcfg["agents"] = {"four": {"preset": "selftest"}}
         gcfg_path.write_text(json.dumps(gcfg))
+        (ghome / ".gemini").mkdir()  # so its sync writes Gemini CLI's settings, with its own MCP token
         gamma = subprocess.Popen([sys.executable, str(ghome / ".bullpen" / "setup" / "runner" / "runner.py"),
                                   "--config", str(gcfg_path), "run"], env=genv,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1522,8 +1653,9 @@ def main() -> int:
             except urllib.error.HTTPError as err:
                 return err.code
 
-        def heartbeat(name: str, token: str, hostname: str = "smoke-host") -> int:
-            return as_runner("/api/runner/heartbeat", {"name": name, "hostname": hostname}, token)
+        def heartbeat(name: str, token: str, hostname: str = "smoke-host", install_id: str = "") -> int:
+            body = {"name": name, "hostname": hostname, **({"install_id": install_id} if install_id else {})}
+            return as_runner("/api/runner/heartbeat", body, token)
 
         alpha_job = c.call("/api/tasks", {"runner": "alpha", "agent": "one", "prompt": "Reply with pong"})[1]["id"]
         c.wait_job(alpha_job)
@@ -1532,9 +1664,64 @@ def main() -> int:
               and as_runner(f"/api/runner/jobs/{alpha_job}/finish", {"status": "error"}, gtoken) == 403,
               "a machine's token can't act as another machine or touch its jobs")
         check(heartbeat("gamma", TOKEN) == 403, "the shared token can't act for a machine that has its own token")
+
+        print("per-machine MCP tokens")
+        gmcp_file = ghome / ".bullpen" / "mcp-token.json"
+
+        def gamma_mcp_token(old: str = "") -> str:
+            """The MCP token gamma's runner keeps, once it is a new one (it syncs within seconds of a check-in)."""
+            for _ in range(90):
+                try:
+                    held = json.loads(gmcp_file.read_text()).get("token", "")
+                except (OSError, ValueError):
+                    held = ""
+                if held and held != old:
+                    return held
+                time.sleep(0.5)
+            return ""
+
+        def gemini_bearer() -> str:
+            try:
+                gs = json.loads((ghome / ".gemini" / "settings.json").read_text())
+            except (OSError, ValueError):
+                return ""
+            return gs.get("mcpServers", {}).get("bullpen", {}).get("headers", {}).get("Authorization", "")
+
+        def gamma_context(features: list) -> dict:
+            req = urllib.request.Request(hub + "/api/runner/context", method="POST",
+                                         data=json.dumps({"features": features}).encode(),
+                                         headers={"Authorization": f"Bearer {gtoken}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read())
+
+        gmcp = gamma_mcp_token()
+        check(gmcp.startswith("bpm_") and gmcp != token, "a machine with its own runner token gets an MCP token of its own")
+        for _ in range(20):
+            if gemini_bearer() == f"Bearer {gmcp}":
+                break
+            time.sleep(0.5)
+        check(gemini_bearer() == f"Bearer {gmcp}", "its agents' settings get that token, not the shared one")
+        check(rpc("tools/list", {}, 40, bearer=gmcp)[0] == 200 and rpc("tools/list", {}, 41)[0] == 200,
+              "/mcp takes the machine's own MCP token, and the shared one still")
+        check(as_runner("/api/runner/whoami", {}, gmcp) == 401, "an MCP token isn't a runner token")
+        check(gmcp not in json.dumps(c.call("/api/state")[1]) and gmcp not in json.dumps(c.call("/api/mcp")[1]),
+              "the dashboard never shows a machine's MCP token")
+        check(gamma_context(["hub-route", "on-demand"])["mcp_token"] == "",
+              "once a machine has its own MCP token, its runner token never fetches the shared one")
+        gview = next(r for r in c.call("/api/state")[1]["runners"] if r["name"] == "gamma")
+        check(gview.get("mcp_auth") == "own", "the machine page says it has its own MCP token")
+        st, _ = c.call("/api/runners/gamma/mcp-token/rotate", {})
+        check(st == 200 and rpc("tools/list", {}, 42, bearer=gmcp)[0] == 401,
+              "New MCP token stops the machine's old one at once")
+        gmcp2 = gamma_mcp_token(gmcp)
+        check(gmcp2 and rpc("tools/list", {}, 43, bearer=gmcp2)[0] == 200,
+              "the machine picks up its new MCP token at its next sync")
+        check(c.call("/api/runners/alpha/mcp-token/rotate", {})[0] == 400,
+              "a machine on the shared runner token has no MCP token of its own to rotate")
         check(c.call("/api/enroll", {"code": code, "hostname": "again"})[0] == 410, "a code works only once")
         st, used = fetch(f"{hub}/enroll/{code}/install.sh")
-        rerun = subprocess.run(["bash"], input=used.decode(), text=True, capture_output=True)
+        rerun = subprocess.run(["bash"], input=used.decode(), text=True, capture_output=True,
+                               env=home_env(tmp / "rerun-home"))
         check(st == 200 and rerun.returncode == 1 and "already used" in rerun.stderr,
               "running a used code's command explains that it was used")
         check(c.call("/api/enroll", {"code": "2345-6789-ABCD-EFGH", "hostname": "x"})[0] == 404, "an unknown code is refused")
@@ -1581,15 +1768,49 @@ def main() -> int:
         check(st == 200 and kept["name"] == "delta-box",
               "reconnecting with a new code keeps the machine's name instead of switching to its host name")
 
+        # Tags and account labels accepted up front, on the code: they count once the machine reports them,
+        # with no Accept; anything else it reports still waits.
+        st, bad = c.call("/api/enroll-codes", {"tags": ["not a tag"]})
+        check(st == 400 and "isn't a tag" in bad.get("detail", ""), "a code refuses a malformed tag")
+        st, preset = c.call("/api/enroll-codes", {"name": "theta", "tags": ["Nightly", "lab"],
+                                                  "accounts": {"one": "Night Shift"}})
+        up_front = {"tags": ["lab", "nightly"], "accounts": {"one": "Night Shift"}}
+        listed = {x["code_hint"]: x for x in c.call("/api/enroll-codes")[1]["codes"]}
+        check(st == 200 and preset["accepted"] == up_front and listed[preset["code"][:4]]["accepted"] == up_front,
+              "a code keeps the tags and account labels accepted up front, and the list shows them")
+        st, theta = c.call("/api/enroll", {"code": preset["code"], "hostname": "theta-host"})
+        theta_beat = {"name": "theta", "hostname": "theta-host", "tags": ["nightly", "spare"],
+                      "agents": [{"name": "one", "account": "Night Shift"}, {"name": "two", "account": "Day Shift"}]}
+        check(st == 200 and as_runner("/api/runner/heartbeat", theta_beat, theta["token"]) == 200,
+              "a machine enrolls with that code and checks in")
+        seen = next(r for r in c.call("/api/state")[1]["runners"] if r["name"] == "theta")
+        check(seen["accepted"] == up_front and "nightly" in seen["accepted_tags"] and "lab" not in seen["accepted_tags"]
+              and seen["accounts"]["one"] == "Night Shift"
+              and seen["to_accept"] == {"tags": ["spare"], "accounts": {"two": "Day Shift"}},
+              "what the code accepted counts once reported, without Accept; anything else still waits")
+        c.call("/api/runners/theta", method="DELETE")
+
         heartbeat("twin", TOKEN, "computer-one")
         heartbeat("twin", TOKEN, "computer-two")
-        twin = next(r for r in c.call("/api/state")[1]["runners"] if r["name"] == "twin")
-        check((twin.get("info") or {}).get("name_conflict") == "computer-one",
+        # With install ids (newer runners send one), the ids decide: a host name that changes by itself
+        # (a Mac's, with the network) is the same computer; two installs under one host name are not.
+        heartbeat("roamer", TOKEN, "build-box.local", "a" * 32)
+        heartbeat("roamer", TOKEN, "build-box.example.com", "a" * 32)
+        heartbeat("clones", TOKEN, "build-box", "a" * 32)
+        heartbeat("clones", TOKEN, "build-box", "b" * 32)
+        seen = {r["name"]: r for r in c.call("/api/state")[1]["runners"]}
+        check((seen["twin"].get("info") or {}).get("name_conflict") == "computer-one",
               "two computers checking in under one name are flagged")
+        check(not (seen["roamer"].get("info") or {}).get("name_conflict")
+              and (seen["clones"].get("info") or {}).get("name_conflict") == "build-box"
+              and not any("install_id" in r for r in seen.values()),
+              "one install whose host name changes isn't flagged, two installs are, and the dashboard never gets the id")
 
         st, forgot = c.call("/api/runners/gamma", method="DELETE")
         check(st == 200 and forgot.get("token_revoked") and heartbeat("gamma", gtoken) == 401,
               "Forget revokes the machine's token")
+        check(rpc("tools/list", {}, 44, bearer=gmcp2)[0] == 401 and rpc("tools/list", {}, 45)[0] == 200,
+              "Forget stops the machine's own MCP token too; the shared one still works for the others")
         gamma.terminate()
         check(heartbeat("alpha", TOKEN, socket.gethostname()) == 200, "the shared token still works for the others")
 
@@ -1608,9 +1829,8 @@ def main() -> int:
         _, scode = c.call("/api/enroll-codes", {"name": "epsilon"})
         res = subprocess.run(["bash", str(ROOT / "scripts" / "linux" / "setup-workstation.sh"), "--hub", hub],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300,
-                             env=dict(os.environ, HOME=str(shome), BULLPEN_HOME=str(shome / ".bullpen"),
-                                      BULLPEN_ALLOW_ROOT="1", BULLPEN_ENROLL_CODE=scode["code"],
-                                      PATH=f"{stand_ins}{os.pathsep}{os.environ.get('PATH', '')}"))
+                             env=home_env(shome, BULLPEN_ALLOW_ROOT="1", BULLPEN_ENROLL_CODE=scode["code"],
+                                          PATH=f"{stand_ins}{os.pathsep}{os.environ.get('PATH', '')}"))
         scfg = json.loads((shome / ".bullpen" / "runner.json").read_text()) \
             if (shome / ".bullpen" / "runner.json").exists() else {}
         if res.returncode != 0 or "All done." not in res.stdout:
@@ -1677,6 +1897,25 @@ def main() -> int:
               and views["beta"]["accounts"]["shared"] == "b1" and views["beta"]["accounts"]["nolabel"] == "beta/nolabel"
               and not views["alpha"]["to_accept"] and not views["beta"]["to_accept"],
               "a reported tag counts only after you accept it")
+
+        # Sync and Update all runners for a tag reach only the machines where the tag counts. Each
+        # sync is waited for, so the next press (and the checks below) don't find one still running.
+        st_k, kali_sync = c.call("/api/runners-sync-all", {"tag": "kali"})
+        for job_id in kali_sync.get("queued", []):
+            c.wait_job(job_id, timeout=120)
+        st_p, pool_sync = c.call("/api/runners-sync-all", {"tag": "pool"})
+        for job_id in pool_sync.get("queued", []):
+            c.wait_job(job_id, timeout=120)
+        check(st_k == 200 and kali_sync["machines"] == ["beta"] and not kali_sync["skipped"]
+              and st_p == 200 and sorted(pool_sync["machines"]) == ["alpha", "beta"] and not pool_sync["skipped"],
+              "Sync for a tag asks only the machines with that accepted tag")
+        st_u, pool_update = c.call("/api/runners-update-all", {"tag": "pool"})
+        check(st_u == 200 and pool_update["queued"] == [] and not pool_update["skipped"] and pool_update["tag"] == "pool",
+              "Update for a tag queues nothing when its machines are up to date")
+        check(c.call("/api/runners-sync-all", {"tag": "nosuchtag"})[0] == 404
+              and c.call("/api/runners-update-all", {"tag": "Not a tag"})[0] == 400
+              and Client(hub).call("/api/runners-sync-all", {"tag": "pool"})[0] == 401,
+              "a sync for a tag needs the dashboard login and a tag some machine reports")
 
         tagged = run_task({"target_tag": "kali", "agent": "three", "prompt": "Reply with pong"})
         again = run_task({"follow_up_of": tagged["id"], "runner": "x", "agent": "y", "prompt": "Reply with pong again"})
@@ -1899,6 +2138,64 @@ def main() -> int:
               and fix.get("runner") == "alpha" and fix.get("resume_session") == build.get("session_id"),
               "council seats can target a tag; the fix step stays on the machine that built")
 
+        print("continue on another machine")
+        # A conversation on alpha's "one" (the account shared-acct) goes on on beta: carried to "shared" there
+        # (another account, b1), and moved as the exact session to "three" (shared-acct too). Each runner keeps the
+        # fake's transcripts under its own BULLPEN_HOME, in the project folder named after its own path for chat.
+        first = run_task({"runner": "alpha", "agent": "one", "project": "chat", "prompt": "Remember the word kumquat"})
+        st, offer = c.call(f"/api/jobs/{first['id']}/move")
+        on_beta = {a["name"]: a for m in offer.get("machines", []) if m["name"] == "beta" for a in m["agents"]}
+        check(first["status"] == "done" and st == 200 and on_beta["three"]["exact"] == ""
+              and on_beta["three"]["carry"] == "" and on_beta["shared"]["carry"] == ""
+              and "stays on one account" in on_beta["shared"]["exact"],
+              "the job page offers a carry to any agent, and the exact session only on the same account")
+        _, carried = c.call(f"/api/jobs/{first['id']}/move", {"mode": "carry", "runner": "beta", "agent": "shared",
+                                                              "project": "chat", "prompt": "What was the word?"})
+        carried_job = c.wait_job(carried.get("id", 0), timeout=60)["job"]
+        check(carried_job["status"] == "done" and carried_job["runner"] == "beta"
+              and carried_job["continued_from"] == first["id"] and not carried_job["resume_session"]
+              and "Remember the word kumquat" in carried_job["prompt"]
+              and carried_job["prompt"].endswith("What was the word?"),
+              "a carry starts a new session on the other machine with the conversation so far")
+        _, moved = c.call(f"/api/jobs/{first['id']}/move", {
+            "mode": "exact", "runner": "beta", "agent": "three", "project": "chat",
+            "prompt": "SELFTEST: transcript\nWhat was the word?"})
+        moved_job = c.wait_job(moved.get("id", 0), timeout=90)["job"]
+        export = sql("SELECT id, status FROM jobs WHERE kind='admin' AND runner='alpha' AND options LIKE ?",
+                     (f"%{moved_job.get('options', {}).get('move', {}).get('copy', '-')}%",))
+        export_log = c.call(f"/api/jobs/{export[0][0]}")[1].get("logs", []) if export else []
+        beta_file = (tmp / "beta-home" / ".bullpen" / "selftest" / "claude" / "projects"
+                     / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(tmp / "chat-b")) / f"{first['session_id']}.jsonl")
+        alpha_file = (tmp / "alpha-home" / ".bullpen" / "selftest" / "claude" / "projects"
+                      / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(tmp / "chat-a")) / f"{first['session_id']}.jsonl")
+        check(moved_job["status"] == "done" and moved_job["runner"] == "beta"
+              and moved_job["resume_session"] == first["session_id"] and moved_job["session_id"] == first["session_id"]
+              and "transcript: 1 earlier turn, the first: Remember the word kumquat" in (moved_job["result"] or "")
+              and beta_file.is_file() and alpha_file.is_file()
+              and export and export[0][1] == "done" and not any("kumquat" in ln["line"] for ln in export_log),
+              "an exact move copies the session's transcript once and resumes it on the other machine")
+        again = run_task({"follow_up_of": moved_job["id"], "runner": "x", "agent": "y",
+                          "prompt": "SELFTEST: transcript\nAnd now?"})
+        check(again["status"] == "done" and again["runner"] == "beta"
+              and "transcript: 2 earlier turns" in (again["result"] or ""),
+              "a follow-up of the moved job continues the session there")
+        st_twice, twice = c.call(f"/api/jobs/{first['id']}/move", {"mode": "exact", "runner": "beta", "agent": "three",
+                                                                   "project": "chat", "prompt": "Again"})
+        st_other, other = c.call(f"/api/jobs/{again['id']}/move", {"mode": "exact", "runner": "alpha",
+                                                                   "agent": "shared", "project": "chat", "prompt": "x"})
+        check(st_twice == 409 and "continues this session" in str(twice.get("detail"))
+              and st_other == 409 and "stays on one account" in str(other.get("detail")),
+              "the exact session moves only from its newest turn, and only to the same account")
+        limited = run_task({"runner": "alpha", "agent": "one", "prompt": "SELFTEST: limit-rejected"})
+        st_lim, lim = c.call(f"/api/jobs/{limited['id']}/move", {"mode": "carry", "runner": "beta", "agent": "shared",
+                                                                 "project": "chat", "prompt": "Go on"})
+        st_same, same = c.call(f"/api/jobs/{limited['id']}/move", {"mode": "carry", "runner": "beta", "agent": "three",
+                                                                   "project": "chat", "prompt": "Go on"})
+        check(limited["error_kind"] == "claude_limit" and st_lim == 409
+              and "Usage limits aren't a reason to switch accounts" in str(lim.get("detail"))
+              and st_same == 200 and c.wait_job(same["id"], timeout=60)["job"]["status"] == "done",
+              "after a usage limit the conversation goes on only on the same account")
+
         print("git accounts and MCP picks")
         # A machine with two git accounts: "a", a machine account on github.com with a token, and "b", on a
         # self-hosted GitLab with an ssh key (a dummy file: no job here runs git against a host). Its project
@@ -1930,7 +2227,7 @@ def main() -> int:
             "project_git_accounts": {"gitproj": "b"}}))
         gbox_env = {k: v for k, v in os.environ.items()
                     if not k.upper().startswith(GIT_ENV_PREFIXES) and k not in CLAUDE_SIGN_IN_VARS}
-        gbox_env.update(HOME=str(gbox_home), BULLPEN_HOME=str(gbox_home / ".bullpen"))
+        gbox_env = home_env(gbox_home, base=gbox_env)
         gbox_env.pop("BULLPEN_TEST_IDLE_SECONDS", None)
         procs.append(subprocess.Popen([sys.executable, str(ROOT / "runner" / "runner.py"), "--config",
                                        str(tmp / "gitbox.json"), "run"], env=gbox_env,
@@ -2113,8 +2410,7 @@ def main() -> int:
         icfg_path = ihome / "runner.json"
         res = subprocess.run([sys.executable, str(ROOT / "runner" / "runner.py"), "--config", str(icfg_path), "init"],
                              input="\n".join(answers) + "\n", text=True, capture_output=True, timeout=60,
-                             env=dict(os.environ, HOME=str(ihome), BULLPEN_HOME=str(ihome / ".bullpen"),
-                                      PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"))
+                             env=home_env(ihome, PATH=f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"))
         icfg = json.loads(icfg_path.read_text()) if icfg_path.exists() else {}
         agents = icfg.get("agents", {})
         if res.returncode != 0 or not agents:
@@ -2141,7 +2437,7 @@ def main() -> int:
               "init asks for machine tags and whether to take subtasks")
         lines = subprocess.run([sys.executable, str(ROOT / "runner" / "runner.py"), "--config", str(icfg_path),
                                 "claude-accounts"], capture_output=True, text=True,
-                               env=dict(os.environ, HOME=str(ihome))).stdout.splitlines()
+                               env=home_env(ihome)).stdout.splitlines()
         check(lines == [f"claude\t{ihome / '.claude'}\tdefault\tlogin",
                         f"claude-work\t{ihome / '.claude-work'}\town\tlogin",
                         f"claude-api\t{ihome / '.claude-api'}\town\tkey"],
@@ -2149,8 +2445,7 @@ def main() -> int:
 
         print("one runner per machine")
         dup = subprocess.Popen([sys.executable, str(tmp / "alpha-code" / "runner.py"), "--config", str(tmp / "alpha.json"), "run"],
-                               env=dict(os.environ, HOME=str(ahome), BULLPEN_HOME=str(ahome / ".bullpen")),
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               env=home_env(ahome), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             dup.wait(timeout=60)
         except subprocess.TimeoutExpired:
@@ -2162,7 +2457,11 @@ def main() -> int:
 
         # Last, because it stops alpha's runner.
         print("Remote Control and the runner")
-        st, started = rc_start("alpha", "one")
+        st, made = c.call("/api/runners/alpha/actions", {"action": "rc.start", "params": {
+            "agent": "one", "project": "proj", "start_with_runner": "1"}})
+        started = c.wait_job(made["id"], timeout=60)["job"] if st == 200 else made
+        first = wait_for(lambda: rc_entry("alpha", "one", "proj").get("start_with_runner") is True
+                         and rc_entry("alpha", "one", "proj"), 20) or {}
         rc_pid = int(rc_pid_file.read_text().strip() or 0) if rc_pid_file.exists() else 0
         alive_before = pid_alive(rc_pid)
         runner_procs["alpha"].terminate()
@@ -2170,8 +2469,36 @@ def main() -> int:
             runner_procs["alpha"].wait(timeout=15)
         except subprocess.TimeoutExpired:
             pass
-        check(st == 200 and started.get("status") == "done" and alive_before
+        check(st == 200 and started.get("status") == "done" and alive_before and first.get("state") == "running"
               and wait_for(lambda: not pid_alive(rc_pid), 10), "Remote Control stops when the runner stops")
+        # "Start again when the runner starts" was ticked: the next runner (after a reboot, say) starts it again,
+        # and its hours still count from the first start.
+        argv, run_env = runner_launch["alpha"]
+        runner_procs["alpha"] = subprocess.Popen(argv, env=run_env, stdout=subprocess.DEVNULL,
+                                                 stderr=subprocess.DEVNULL)
+        procs.append(runner_procs["alpha"])
+        def started_again() -> dict:
+            """The server's row once a new one runs (the hub still shows the old row until the runner checks in;
+            the old server removed its pid file when it was stopped)."""
+            entry = rc_entry("alpha", "one", "proj")
+            fresh = pid_alive(int(rc_pid_file.read_text().strip() or 0))  # no file yet: OSError, so not yet
+            return entry if fresh and entry.get("state") == "running" and entry.get("since") == first.get("since") \
+                else {}
+
+        again = wait_for(started_again, 60) or {}
+        check(again.get("start_with_runner") is True,
+              "a server chosen to start with the runner is started again when the runner starts")
+        st, made = rc_action("alpha", "rc.stop", "one")
+        stopped = c.wait_job(made["id"], timeout=60)["job"] if st == 200 else {}
+        runner_procs["alpha"].terminate()
+        try:
+            runner_procs["alpha"].wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            pass
+        state_file = ahome / ".bullpen" / "remote-control.json"
+        saved = json.loads(state_file.read_text()) if state_file.exists() else {}
+        check(stopped.get("status") == "done" and saved.get("start_with_runner") == [],
+              "Stop clears the choice, so the next runner leaves it stopped")
 
         print("\nAll checks passed.")
         return 0
@@ -2184,6 +2511,9 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 p.kill()
         shutil.rmtree(tmp, ignore_errors=True)
+        leaked = home_guard.report(real_home, "The end-to-end test")
+        if leaked:
+            raise AssertionError(leaked)  # after any earlier failure, which Python prints first
 
 
 if __name__ == "__main__":

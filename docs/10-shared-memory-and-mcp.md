@@ -21,7 +21,7 @@ its machine, and redoes that within about 15 seconds of any change:
 |---|---|---|---|
 | **Pinned notes**, always in context | `@` import in each account's `CLAUDE.md` (`~/.claude/CLAUDE.md`, `~/.claude-<name>/CLAUDE.md`) | `@./bullpen-shared.md` import in `~/.gemini/GEMINI.md` | the same `GEMINI.md`, via Antigravity's `@[…](…)` include |
 | **`remember` / `recall` tools** | MCP server `bullpen`, added with `claude mcp add-json -s user` per account | `bullpen` in `~/.gemini/settings.json` | `bullpen` in `~/.gemini/config/mcp_config.json` |
-| **`/remember` command** | skill in `<config dir>/skills/remember/` | `/remember` and `/recall` in `~/.gemini/commands/` | skill in `~/.gemini/config/skills/remember/` |
+| **`/remember` command** | skill in `<config dir>/skills/remember/` | `/remember` and `/recall` in `~/.gemini/commands/`; the skill comes from `~/.agents/skills/remember/` ([below](#the-shared-skills-folder)) | skill in `~/.gemini/config/skills/remember/` |
 | **Your central MCP servers** (through the hub: `/mcp/s/<name>`) | `claude mcp add-json -s user`, per account | `mcpServers` in `settings.json` | `mcpServers` in `mcp_config.json` |
 | Fallback in any terminal | `bullpen remember …` / `bullpen recall …` | same | same |
 
@@ -40,6 +40,101 @@ don't add it anywhere, and the name `bullpenjob` (like `bullpen`) can't be used 
 hands it to each job that needs it, with that job's own short-lived token, and to no other session
 ([guide 2](02-architecture.md#job-tools-what-a-running-agent-can-ask-the-hub)).
 
+### The MCP token each machine uses
+
+Agents reach the hub's `bullpen` server and the servers it relays with a token in their settings. The runner
+writes it there when it syncs. Which token that is depends on the machine:
+
+| Machine | Its agents use |
+|---|---|
+| Added with **Add a machine** (its own runner token), with this runner version or newer | an MCP token of its own |
+| On the shared runner token, or with an older runner | the hub's shared MCP token, the one under **Show** on the MCP page |
+
+The hub keeps only a fingerprint of a machine's own MCP token. The runner keeps the token in
+`~/.bullpen/mcp-token.json`, and only its user can read that file. The machine's page says
+**own MCP token** under **Shared context**.
+
+- **Forget** stops the machine's own MCP token at once, along with its runner token. Your other machines
+  keep working.
+- **New MCP token**, under **Shared context** on the machine's page, stops the current one at once. Within
+  about 15 seconds of its next check-in, the machine gets a new one and writes it into its agents' settings.
+  Restart any agent session that was open on that machine.
+- Setting the machine up again with a new code gives it a new MCP token as well.
+- Once a machine has had a token of its own, the hub never gives it the shared token again.
+
+### Turning the shared MCP token off
+
+When every machine has its own runner token and an up-to-date runner, nothing needs the shared MCP token,
+except clients you set up by hand with it (such as the claude.ai setup [below](#claudeai-web-and-mobile-optional)).
+To turn it off:
+
+1. In the hub's container, open its settings:
+
+   ```bash
+   nano /etc/bullpen/hub.env
+   ```
+
+2. Add this line:
+
+   ```
+   HUB_MCP_SHARED_TOKEN='0'
+   ```
+
+3. Restart the hub:
+
+   ```bash
+   systemctl restart bullpen
+   ```
+
+The hub then refuses the shared token. Machines on the shared runner token, and machines with an older runner,
+get no MCP token, so their agents lose the shared memory and the servers through the hub. The MCP page shows
+the shared token as off. To turn it back on, remove the line and restart the hub.
+
+### The shared skills folder
+
+Many agent CLIs also read skills from one shared place in your home folder: `~/.agents/skills/` (on Windows,
+`%USERPROFILE%\.agents\skills\`). The runner puts the `remember` skill there as well. Those agents can then
+save and look up notes even before Agent Bullpen runs them as full agents. Their own settings don't have the
+hub's `bullpen` server yet, so the skill falls back to the `bullpen remember` command. "Second opinion"
+isn't copied there, because it is written for Claude Code.
+
+Which tools read `~/.agents/skills/` (last checked 21 November 2026):
+
+| Tool | Reads it | Source |
+|---|---|---|
+| Gemini CLI | yes, from version 0.28.0, as another name for `~/.gemini/skills/` | [docs](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/skills.md) |
+| OpenAI Codex CLI | yes | [docs](https://developers.openai.com/codex/skills) |
+| OpenCode | yes | [docs](https://opencode.ai/docs/skills) |
+| GitHub Copilot CLI | yes, except when `COPILOT_HOME` or `--config-dir` is set | [docs](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills), [changelog](https://github.com/github/copilot-cli/blob/main/changelog.md) |
+| Cursor | yes | [docs](https://cursor.com/docs/context/skills) |
+| Qwen Code | yes | [docs](https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/) |
+| Kimi CLI | yes, except when `~/.config/agents/skills/` exists | [docs](https://moonshotai.github.io/kimi-cli/en/customization/skills.html) |
+| Kimi Code | yes | [docs](https://moonshotai.github.io/kimi-code/en/customization/skills) |
+| Mistral Vibe | yes | [docs](https://docs.mistral.ai/vibe/code/cli/skills) |
+| Amp | yes | [docs](https://ampcode.com/docs/customize/skills) |
+| Claude Code | no, only `~/.claude/skills/` | [docs](https://code.claude.com/docs/en/skills) |
+| Antigravity | no, it reads `~/.gemini/config/skills/` | [docs](https://antigravity.google/docs/skills.md) |
+
+The runner keeps one copy of the skill per agent where it can:
+
+- **Gemini CLI** warns about a "skill conflict" when a skill is in both `~/.gemini/skills/` and
+  `~/.agents/skills/`. So the skill isn't put in `~/.gemini/skills/`, and the copy an earlier version of the
+  runner put there is removed. Gemini CLI older than 0.28.0 doesn't read `~/.agents/skills/`; there you still
+  have the `/remember` and `/recall` commands. If you moved Gemini's home with `GEMINI_CLI_HOME`, Gemini CLI
+  reads `.gemini/skills/` and `.agents/skills/` in that folder instead, so the skill goes to its
+  `.gemini/skills/` as before
+  ([source](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/utils/paths.ts)).
+- **The Antigravity CLI** reads `~/.gemini/skills/`, `~/.gemini/antigravity-cli/skills/` and
+  `~/.gemini/config/skills/`, but not `~/.agents/skills/`. It finds the skill in `~/.gemini/config/skills/`.
+  On a machine that has `~/.gemini/antigravity-cli/` but no `~/.gemini/config/`, the skill goes to
+  `~/.gemini/antigravity-cli/skills/` instead.
+- **Claude Code** reads only its own folder, so each account keeps its copy there. OpenCode, Amp and Kimi CLI
+  read `~/.claude/skills/` too, and pick one copy by name. Cursor reads both as well, and its docs don't say
+  what it does with two skills of the same name.
+- **A `remember` skill of your own** stays as it is, and Gemini CLI uses yours. If yours is in
+  `~/.gemini/skills/`, the runner leaves its own copy out of `~/.agents/skills/` too, and says so on the
+  machine's page. Other agents then don't get the runner's `remember` skill from that folder.
+
 ## Shared memory
 
 ### Adding notes
@@ -50,6 +145,8 @@ You can add a note in any of these places:
   Claude to remember something for all your agents.
 - **Gemini CLI:** `/remember …` (and `/recall …`).
 - **Antigravity:** the `/remember` skill.
+- **Other agent CLIs** that read [the shared skills folder](#the-shared-skills-folder), such as Codex or
+  OpenCode: the `remember` skill.
 - **Any terminal:**
   `bullpen remember --tags windows "The Windows machines keep their projects in C:\projects"`.
 - **The dashboard:** the **Memory** page.
@@ -221,7 +318,7 @@ For a remote server you pick one of two routes:
 
 | | **Through the hub** (the default) | **Directly from each machine** |
 |---|---|---|
-| What each agent gets | `http://<hub>:8080/mcp/s/<name>` plus the hub's own MCP token | the server's real URL and headers |
+| What each agent gets | `http://<hub>:8080/mcp/s/<name>` plus its machine's MCP token ([above](#the-mcp-token-each-machine-uses)) | the server's real URL and headers |
 | Where the server's key or sign-in lives | only on the hub | in every agent's settings file, on every machine, in plain text |
 | OAuth sign-in | once, on the dashboard (next section) | in every agent on every machine |
 | Changing a key | edit it on the MCP page; nothing to sync | every machine rewrites its settings on the next sync |
@@ -316,7 +413,7 @@ Claude Code's user settings, nor to Gemini CLI's or Antigravity's. It reaches an
 it.
 
 On demand changes which agents are set up with the server, not who can reach it. Through the hub, any agent
-that holds the MCP token can still call it. A server added directly still sends its keys to every machine.
+that holds an MCP token can still call it. A server added directly still sends its keys to every machine.
 
 ### Picking servers for a task
 
@@ -351,8 +448,8 @@ can do that in a Read only task. Because of this, the hub never retries such a t
 
 **The agent program enforces a narrowed task, not the hub.** The hub checks the names and hands them to the
 runner. Claude Code on the machine does the limiting, with `--strict-mcp-config`. The relay at
-`/mcp/s/<name>` accepts the hub's shared MCP token from any agent, and the token sits in every agent's
-settings on the machine ([Security notes](#security-notes)). So "only these servers" is a setting for the
+`/mcp/s/<name>` accepts any valid MCP token (the shared one or a machine's own) from any agent, and the
+token sits in every agent's settings on the machine ([Security notes](#security-notes)). So "only these servers" is a setting for the
 agent, not a lock on the hub. Don't count on it to stop an agent that you don't control, or a program on the
 same machine that reads the token.
 
@@ -364,7 +461,7 @@ servers can't hand out subtasks at all.
 
 ### Secrets in the job's file
 
-The file holds the hub's MCP token and, for a server added **directly**, its keys, headers and other
+The file holds the machine's MCP token and, for a server added **directly**, its keys, headers and other
 settings. The runner writes it so that only its user can read it. It also hides the secrets it finds there in
 the job's log, answer and diff, where each one shows as `***`. The job token, and anything shaped like one,
 is always hidden. The other values follow these rules:
@@ -490,7 +587,8 @@ internet with a sign-in claude.ai understands (OAuth). The cleanest route reuses
    - auth: **bearer**
    - headers: `Authorization: Bearer <hub MCP token>`, `CF-Access-Client-Id: …`, `CF-Access-Client-Secret: …`
 
-   The hub MCP token is on the MCP page, under **Show**.
+   The hub MCP token is the shared one, on the MCP page under **Show**. This needs the shared token on
+   ([above](#turning-the-shared-mcp-token-off)).
 4. In the portal's Managed OAuth settings, add `https://claude.ai/api/mcp/auth_callback` to the allowed
    redirect URIs.
 5. In claude.ai, for **each** account, go to **Customize → Connectors → Add custom connector**, enter
@@ -528,19 +626,21 @@ turn on **Protect with Access** for the hub's tunnel route, so cloudflared check
 
 ## Security notes
 
-- **The hub MCP token is the key to your shared memory and to every server routed through the hub.** Anyone
-  holding it can call those servers' tools with your keys and sign-ins. It sits in each agent's settings on
-  each machine, so keep the hub on your LAN, a VPN, or behind a login wall such as Cloudflare Access, and
-  rotate the token if a machine is lost (below).
+- **An MCP token is the key to your shared memory and to every server routed through the hub.** Anyone
+  holding one can call those servers' tools with your keys and sign-ins. Every agent on every machine has one
+  in its settings: the machine's own, or the shared one ([above](#the-mcp-token-each-machine-uses)). Keep the
+  hub on your LAN, a VPN, or behind a login wall such as Cloudflare Access.
 - **Keys and sign-ins for servers routed through the hub stay on the hub**, in its database
   (`/var/lib/bullpen/hub.db`). They never reach the machines. Back the database up like a password store.
-- **If a machine is lost**, rotating the MCP token alone isn't enough, because a runner token can fetch the
-  new one. Do all of this:
-  1. **Forget** the lost machine on the Overview page. That revokes its own runner token straight away.
-     If it used the shared token, also change `HUB_RUNNER_TOKEN` in
+- **If a machine is lost**, rotating the shared MCP token alone isn't enough, because a runner token can fetch
+  the new one. Do all of this:
+  1. **Forget** the lost machine on the Overview page. That revokes its own runner token and its own MCP
+     token straight away. If it used the shared runner token, also change `HUB_RUNNER_TOKEN` in
      `/etc/bullpen/hub.env`, restart the hub, and give each remaining machine its own token with **Add a
      machine** ([guide 5](05-linux-and-macos-machines.md#machines-set-up-with-the-shared-token)).
-  2. Rotate the MCP token on the MCP page. The remaining machines pick up the new one by themselves.
+  2. Press **Rotate** next to the shared token on the MCP page (skip this if the shared token is off). The
+     lost machine had a copy if it used the shared runner token, or if it was set up before its runner got an
+     MCP token of its own. The machines that use the shared token pick up the new one by themselves.
   3. Change the keys of servers you added **directly** (those were on the machine). Servers routed through
      the hub are safe once steps 1 and 2 are done.
   4. Sign the lost machine's agent accounts out on the providers' websites: their logins were on it.

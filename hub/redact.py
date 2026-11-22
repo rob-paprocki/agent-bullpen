@@ -25,9 +25,10 @@ SECRET_VALUE_RES = [
     # gldt deploy, glrt/glrtr runner (glrtr: made from a registration token), glptt trigger, glft feed, glimt incoming email, glagent Kubernetes agent,
     # gloas OAuth application secret, glcbt CI job, glsoat SCIM, glffct feature flags client, glwt workspace.
     re.compile(r"\bgl(?:pat|dt|rtr?|ptt|ft|imt|agent|oas|cbt|soat|ffct|wt)-[A-Za-z0-9_-]{20,}"),
-    # Agent Bullpen machine and job tokens: "bp_" or "bpj_" and secrets.token_urlsafe(32), which is always
-    # 43 URL-safe characters. Only that exact shape, so names like bp_admin_routes are left alone.
-    re.compile(r"\bbpj?_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
+    # Agent Bullpen machine, job and per-machine MCP tokens: "bp_", "bpj_" or "bpm_" and
+    # secrets.token_urlsafe(32), which is always 43 URL-safe characters. Only that exact shape, so names
+    # like bp_admin_routes are left alone.
+    re.compile(r"\bbp[jm]?_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
     # JWTs. Tried once per run of key characters (the run must end in ".xxxxxxxx."), so a long run can't
     # make it backtrack; a word joined to the token by a hyphen is masked with it.
     re.compile(r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{8,}\.)[A-Za-z0-9_-]*?\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"),

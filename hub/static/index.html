@@ -41,6 +41,15 @@
     <div id="add-machine-body"></div>
   </dialog>
 
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <div id="confirm-body" class="small"></div>
+      <div class="row dialog-actions"><button type="submit" value="cancel" class="ghost">Cancel</button>
+        <button type="submit" value="ok" class="danger" id="confirm-ok">OK</button></div>
+    </form>
+  </dialog>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
