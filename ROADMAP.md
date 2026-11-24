@@ -48,7 +48,7 @@ follow-ups, a readiness check, and the shared notes and MCP servers in their own
 | What | Why | Size | Status |
 |---|---|---|---|
 | **One file per agent** | Adding an agent touches about a dozen files today. A small adapter per agent (preset, parser, readiness check, settings wiring, add-on folder) would make it one file, and the hub could build its list of MCP targets from what machines report instead of a fixed three. | L | planned (with Codex) |
-| **User accounts on the dashboard** | Today there is one password, and whoever has it controls every machine. Accounts with roles (look only, read-only jobs, everything), and machines that belong to a person, would make the hub safer to share in a small team. | L | considered |
+| **User accounts on the dashboard** | Today there is one password, and whoever has it controls every machine. Accounts with roles (look only, read-only jobs, everything), and machines that belong to a person, would make the hub safer to share in a small team. | L | planned (soon) |
 | **Signed releases and runner updates** | Installers check a release against its `SHA256SUMS`, and runners check updates against checksums from the hub. Neither is signed, so whoever controls the GitHub account or the hub controls what runs. Sign the checksums, and let runners check a key they got when they enrolled. | M | planned |
 | **Lighter waiting for work** | Each waiting machine costs the hub two small database queries a second. Fine for dozens of machines; with hundreds, waking runners only when work arrives would be better. | M | planned |
 | **More Linux distributions** | The setup is written for Debian, Ubuntu and Kali first; Fedora, Arch and openSUSE are best effort. Needs testing there, and fixes for what breaks. | S each | considered |
@@ -64,11 +64,11 @@ labels given in **Add a machine** (see
 
 | What | Why | Size | Status |
 |---|---|---|---|
-| **Planner councils ("split")** | A read-only plan step writes subtasks, with their tags and which ones depend on which. You approve the plan. The hub runs the subtasks on matching machines, each on its own git branch, and a merge step combines them. Builds on machine tags and subtasks. | L | planned |
+| **Planner councils ("split")** | A read-only plan step writes subtasks, with their tags and which ones depend on which. You approve the plan. The hub runs the subtasks on matching machines, each on its own git branch, and a merge step combines them. Builds on machine tags and subtasks. | L | planned (next, after commit and push) |
 | **A cap per account** | At most a set number of runs at once per account label, across all machines. It would only hold jobs back, never move them to another account. Not wanted for now. | S | considered |
 | **Approvals for Gemini CLI** | Gemini CLI has no hook like Claude Code's permission prompt tool, so "ask me before commands" is Claude only. | - | waiting (for Gemini CLI) |
 | **Checking limits on a timer** | Today **Check limits** runs only when you press it, on purpose. A slow timer (an hour or more) may come once `/usage` in print mode and its report are no longer marked experimental. | S | considered |
-| **Commit and push between machines** | Branches named by the hub, so a subtask's or a builder's work can move to another machine without manual steps. **Continue on another machine** moves the conversation but leaves changed files on the first machine; this would bring them along. | M | considered |
+| **Commit and push between machines** | Branches named by the hub, so a subtask's or a builder's work can move to another machine without manual steps. **Continue on another machine** moves the conversation but leaves changed files on the first machine; this would bring them along. | M | planned (next) |
 
 ## Listing in the community-scripts catalogue
 

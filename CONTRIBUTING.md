@@ -2,6 +2,8 @@
 
 Thanks for wanting to help. Agent Bullpen is a small project, and the most useful help is often not code.
 
+This repository is a release copy. Development happens elsewhere, and this repository changes only when a new version comes out, one commit per version, so a pull request can't be merged as it is. Open it anyway: I'll bring the change across by hand, credit you in the changelog and close the pull request. The rest of this page still applies to how you prepare it.
+
 ## What helps most
 
 1. **Running it on real hardware and saying what happened.** The installers have been tested with stand-in

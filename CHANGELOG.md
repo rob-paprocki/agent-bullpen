@@ -5,6 +5,14 @@ All notable changes to Agent Bullpen are listed here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The hub and the runner always share one
 version number, because the hub hands its own copy of the runner to every machine.
 
+## [1.1.1] - 2026-11-24
+
+**Upgrading:** nothing to do.
+
+### Fixed
+
+- `CONTRIBUTING.md` now says up front that this repository is a release copy, so pull requests are brought across by hand.
+
 ## [1.1.0] - 2026-11-22
 
 **Upgrading:** on a Mac that uses Apple's own Python, run the setup again to get the Python fix below
@@ -303,6 +311,7 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
   but not save them.
 - The installers download a release and check it against its `SHA256SUMS` before installing it.
 
+[1.1.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.1
 [1.1.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.0
 [1.0.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.1
 [1.0.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.0

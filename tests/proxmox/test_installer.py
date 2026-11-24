@@ -76,7 +76,8 @@ def build_codeload(releases, ref):
 
 
 class Releases:
-    """Built once for all tests: v1.0.0, v1.0.1, v1.0.2 and a 'main' branch download."""
+    """Built once for all tests: v1.0.0, v1.0.1, v1.0.2, the repository's own VERSION (which a test moves to
+    from main) and a 'main' branch download."""
     _dir = None
 
     @classmethod
@@ -84,7 +85,10 @@ class Releases:
         if cls._dir is None:
             cls._dir = Path(tempfile.mkdtemp(prefix="bullpen-releases-"))
             atexit.register(shutil.rmtree, cls._dir, True)
-            for version in ("1.0.0", "1.0.1", "1.0.2"):
+            # The fixed versions the tests name, plus whatever VERSION says now: after each release it moves
+            # on (1.1.0, 1.2.0, ...), and "installed from main moves to the first release" needs that one too.
+            current = (REPO / "VERSION").read_text(encoding="utf-8").strip()
+            for version in sorted({"1.0.0", "1.0.1", "1.0.2", current}):
                 build_release(cls._dir, version)
             build_codeload(cls._dir, "main")
         return cls._dir
