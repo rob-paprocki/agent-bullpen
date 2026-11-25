@@ -1,0 +1,66 @@
+name: Release kit
+
+# The release tooling's own tests, on current Python and on 3.9 (Apple's /usr/bin/python3 runs
+# the first publish). In the development repository (the one with private/) it also runs the
+# personal-value check and the changelog check. No secrets; nothing is pushed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 --version
+      - name: Release kit tests
+        run: python3 -I -B -m unittest discover -s scripts/release/tests -p 'test_*.py' -v
+
+  python39:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: python:3.9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trust the workspace (the container runs as root)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - run: python3 --version
+      - name: Release kit tests
+        run: python3 -I -B -m unittest discover -s scripts/release/tests -p 'test_*.py'
+
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0      # the changelog check reads the history and the tags
+          persist-credentials: false
+      - name: Settings (private/release.conf)
+        run: |
+          if [ ! -d private ]; then echo "No private/: this is a published copy; nothing to check."; exit 0; fi
+          python3 -I scripts/release/release_conf.py check
+      - name: Personal-value check (emails, IPs, MACs, unapproved binaries)
+        run: |
+          set -euo pipefail
+          [ -d private ] || exit 0
+          script=$(python3 -I scripts/release/release_conf.py get CHECK_SCRIPT)
+          if [ -n "$script" ]; then python3 -I "$script"; fi
+          if [ "$(python3 -I scripts/release/release_conf.py get BUILTIN_PATTERNS)" = 1 ]; then
+            python3 -I scripts/release/check_patterns.py
+          fi
+      - name: Changelog check (a CHANGELOG.md line for every visible change)
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          [ -d private ] || exit 0
+          python3 -I scripts/release/changelog_check.py ${PR_BASE:+"$PR_BASE"}

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Tests for the release scripts in scripts/release/: how next-version.py picks a version, the whole
-chain (next-version.py, bump-version.py, release-notes.py) in a throwaway copy of the repository, and
-the checks tests/check_repo.py makes before anything is published.
+"""Tests for tests/check_repo.py: the private/ folder and the excluded paths, and the personal-value
+checks (emails, IPs, MACs). The release tooling's own tests are in scripts/release/tests (the
+.default-settings release kit).
 
-    python3 tests/test_release.py
+    python3 tests/test_check_repo.py
 
 Standard library only; it changes nothing in this checkout.
 """
-
 from __future__ import annotations
 
 import importlib.util
@@ -21,142 +20,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("next_version", ROOT / "scripts" / "release" / "next-version.py")
-nv = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(nv)
 cr_spec = importlib.util.spec_from_file_location("check_repo", ROOT / "tests" / "check_repo.py")
 cr = importlib.util.module_from_spec(cr_spec)
 cr_spec.loader.exec_module(cr)
-
-TOP = "# Changelog\n\nIntro.\n\n"
-OLD = "## [0.3.0] - 2026-11-06\n\n### Added\n\n- Something old.\n\n[0.3.0]: https://example.com/v0.3.0\n"
-
-
-UPGRADE = "**Upgrading:** nothing to do.\n\n"
-
-
-def log(unreleased: str, heading: str = "## [Unreleased]", upgrading: str = UPGRADE) -> str:
-    return TOP + heading + "\n\n" + upgrading + unreleased + "\n" + OLD
-
-
-class Decide(unittest.TestCase):
-    def check(self, changelog, want, current="0.3.0", tags=("v0.3.0",), bump="auto"):
-        got, why = nv.decide(current, changelog, set(tags), bump)
-        self.assertEqual(got, want, why)
-        self.assertTrue(why)
-
-    def test_fixes_only_raise_the_last_number(self):
-        self.check(log("### Fixed\n\n- A fix.\n\n### Security\n\n- Another."), "0.3.1")
-
-    def test_features_raise_the_middle_number(self):
-        self.check(log("### Added\n\n- A feature."), "0.4.0")
-        self.check(log("### Fixed\n\n- A fix.\n\n### Changed\n\n- A change."), "0.4.0")
-        self.check(log("### Removed\n\n- Gone."), "0.4.0")  # before 1.0
-
-    def test_notes_without_a_heading_count_as_a_feature(self):
-        self.check(log("- Something."), "0.4.0")
-        self.check(log("### Docs\n\n- Unknown heading."), "0.4.0")
-
-    def test_breaking(self):
-        self.check(log("### Changed\n\n- **Breaking:** the config moved."), "0.4.0")
-        self.check(log("### Fixed\n\n- **Breaking:** the old flag is gone."), "0.4.0")  # before 1.0, even under Fixed
-        self.check(log("### Changed\n\n- **Breaking:** the config moved."), "2.0.0", current="1.2.3", tags=["v1.2.3"])
-        self.check(log("### Removed\n\n- Gone."), "2.0.0", current="1.2.3", tags=["v1.2.3"])
-        self.check(log("### Added\n\n- A feature."), "1.3.0", current="1.2.3", tags=["v1.2.3"])
-        self.check(log("### Fixed\n\n- A fix."), "1.2.4", current="1.2.3", tags=["v1.2.3"])
-
-    def test_nothing_to_release(self):
-        self.check(log(""), None)
-        self.check(log("### Added\n\n### Fixed\n"), None)
-        self.check(log("<!-- Add notes here.\n- not a note -->"), None)
-        self.check(TOP + OLD, None)  # the newest section is dated and tagged
-
-    def test_the_run_can_choose_the_number(self):
-        self.check(log("### Added\n\n- A feature."), "0.3.1", bump="patch")
-        self.check(log("### Fixed\n\n- A fix."), "1.0.0", bump="major")
-        self.check(log(""), None, bump="minor")
-
-    def test_a_named_version(self):
-        self.check(log("### Fixed\n\n- A fix.", "## [0.5.0] - Unreleased"), "0.5.0")
-        self.check(log("### Fixed\n\n- A fix.", "## [0.5.0] - Unreleased"), "0.5.0", bump="patch")
-        self.check(log("", "## [0.5.0] - Unreleased"), None)
-        # The first release: VERSION already says it, and nothing is tagged yet.
-        self.check(log("- Notes.", "## [0.3.0] - Unreleased"), "0.3.0", tags=())
-
-    def test_counts_from_the_newest_tag(self):
-        self.check(log("### Fixed\n\n- A fix."), "0.3.2", tags=["v0.3.0", "v0.3.1", "not-a-version"])
-
-    def test_problems_need_a_person(self):
-        for changelog, tags in [
-            (TOP + OLD, ()),                                            # dated, but not tagged
-            (log("- Notes.", "## [0.2.0] - Unreleased"), ("v0.3.0",)),  # older than VERSION
-            (log("- Notes.", "## [0.3.0] - Unreleased"), ("v0.3.0",)),  # already tagged
-            (log("- Notes.", "## [0.3.1] - Unreleased"), ("v0.3.0", "v0.4.0")),  # behind the newest tag
-            ("# Changelog\n", ()),                                      # no sections
-            # A second unreleased section: one release would leave the other's notes behind.
-            (TOP + "## [Unreleased]\n\n### Fixed\n\n- A fix.\n\n## [0.4.0] - Unreleased\n\n- A feature.\n\n" + OLD,
-             ("v0.3.0",)),
-            (TOP + "## [0.3.1] - 2026-11-07\n\n- A fix.\n\n## [0.4.0] - Unreleased\n\n- A feature.\n\n" + OLD,
-             ("v0.3.0", "v0.3.1")),
-        ] + [
-            # Headings in no form the scripts read: never taken for "already released".
-            (log("### Fixed\n\n- A fix.", heading), ("v0.3.0",))
-            for heading in ("## Unreleased", "## [unreleased]", "## [Unreleased] - next", "## [0.4.0]",
-                            "## [0.4.0] - TBD", "## [0.4.0] \u2013 Unreleased")
-        ]:
-            with self.assertRaises(nv.Problem, msg=changelog):
-                nv.decide("0.3.0", changelog, set(tags))
-
-    def test_a_release_needs_an_upgrading_line(self):
-        with self.assertRaisesRegex(nv.Problem, r"\*\*Upgrading:\*\*"):
-            nv.decide("0.3.0", log("### Fixed\n\n- A fix.", upgrading=""), {"v0.3.0"})
-        with self.assertRaisesRegex(nv.Problem, r"\*\*Upgrading:\*\*"):  # not the first line
-            nv.decide("0.3.0", log("### Fixed\n\n- A fix.\n\n**Upgrading:** nothing to do.", upgrading=""),
-                      {"v0.3.0"})
-        with self.assertRaisesRegex(nv.Problem, r"\*\*Upgrading:\*\*"):  # a comment first: the release notes would start with it
-            nv.decide("0.3.0", log("### Fixed\n\n- A fix.", upgrading="<!-- note -->\n**Upgrading:** nothing to do.\n\n"),
-                      {"v0.3.0"})
-        with self.assertRaisesRegex(nv.Problem, r"\*\*Upgrading:\*\*"):  # a named version too
-            nv.decide("0.3.0", log("### Fixed\n\n- A fix.", "## [0.5.0] - Unreleased", upgrading=""), {"v0.3.0"})
-
-    def test_the_upgrading_line_is_not_a_note(self):
-        self.check(log("### Fixed\n\n- A fix."), "0.3.1")  # still a patch, not a minor
-        self.check(log("", upgrading=UPGRADE), None)  # the line alone is nothing to release
-
-    def test_a_bare_upgrading_marker_is_not_enough(self):
-        with self.assertRaises(nv.Problem):
-            nv.decide("0.3.0", log("### Fixed\n\n- A fix.", upgrading="**Upgrading:**\n\n"), {"v0.3.0"})
-
-    def test_upgrading_steps_dont_make_a_major(self):
-        steps = "**Upgrading:** restart the runner after updating.\n\n"
-        self.check(log("### Added\n\n- A feature.", upgrading=steps), "1.3.0", current="1.2.3", tags=["v1.2.3"])
-
-    def test_the_link_list_is_not_notes(self):
-        self.check(TOP + "## [Unreleased]\n\n[0.3.0]: https://example.com/v0.3.0\n", None)
-
-
-def workflow_step(workflow: Path, name: str) -> str:
-    """The run: script of the step called `name` in a workflow file (enough YAML for this repo's files)."""
-    lines = workflow.read_text(encoding="utf-8").splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() != f"- name: {name}":
-            continue
-        for j in range(i + 1, len(lines)):
-            text = lines[j].strip()
-            if text.startswith("- name:") or text.startswith("- uses:"):
-                break
-            if text.startswith("run: ") and text != "run: |":
-                return text[len("run: "):]
-            if text == "run: |":
-                indent = len(lines[j]) - len(lines[j].lstrip())
-                body = []
-                for following in lines[j + 1:]:
-                    if following.strip() and len(following) - len(following.lstrip()) <= indent:
-                        break
-                    body.append(following)
-                return textwrap.dedent("\n".join(body))
-    raise AssertionError(f"{workflow.name}: no step '{name}' with a run: script")
-
 
 def run(cmd, cwd, env=None, check=True):
     result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
@@ -411,131 +277,7 @@ class PersonalValues(unittest.TestCase):
         self.assertNotIn("private/notes.md", again.stdout)
 
 
-class WholeChain(unittest.TestCase):
-    """next-version.py, bump-version.py, release-notes.py, check_repo.py and release.yml's own steps on a
-    throwaway copy of this repository, whatever state its CHANGELOG.md is in."""
-
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.tmp = Path(tmp.name)
-        self.repo = throwaway_repo(self.tmp)
-        self.git = GIT
-        self.py = [sys.executable, "-I"]
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
-        self.version = (self.repo / "VERSION").read_text().strip()
-
-    def script(self, name, *args, check=True, **env):
-        return run(self.py + [f"scripts/release/{name}", *args], self.repo, env={**self.env, **env}, check=check)
-
-    def changelog(self, text=None):
-        path = self.repo / "CHANGELOG.md"
-        if text is None:
-            return path.read_text()
-        path.write_text(text)
-
-    def commit_and_tag(self, version):
-        run(self.git + ["commit", "-qam", f"Release {version}"], self.repo)
-        run(self.git + ["tag", "-a", f"v{version}", "-m", "release"], self.repo)
-
-    def released_state(self):
-        """VERSION released and tagged, as in the real repository; unreleased notes set aside."""
-        text = self.changelog()
-        if f"## [{self.version}] - Unreleased" in text:
-            # Before the first release: release it here, as a maintainer would.
-            self.assertEqual(self.script("next-version.py").stdout.strip(), self.version)
-            self.script("bump-version.py", self.version)
-            run(self.git + ["commit", "-qam", f"Release {self.version}"], self.repo)
-            # Dated but not tagged: a person has to look.
-            self.assertEqual(self.script("next-version.py", check=False).returncode, 1)
-            run(self.git + ["tag", "-a", f"v{self.version}", "-m", "release"], self.repo)
-            return
-        run(self.git + ["tag", "-a", f"v{self.version}", "-m", "release"], self.repo)
-        first = text.index("\n## ") + 1
-        if not nv.DATED.match(text[first:].split("\n", 1)[0]):
-            following = text.find("\n## ", first)
-            self.changelog(text[:first] + text[following + 1:])
-            run(self.git + ["commit", "-qam", "set aside the unreleased notes"], self.repo)
-
-    def release_steps(self, version) -> str:
-        """release.yml's own steps, in the shell GitHub runs them in (bash -eo pipefail), with `python`
-        on the PATH as in the workflow. Returns the release notes."""
-        shim = self.tmp / "bin"
-        if not shim.exists():
-            shim.mkdir()
-            (shim / "python").symlink_to(sys.executable)
-        env = {**self.env, "TAG": f"v{version}", "PATH": f"{shim}{os.pathsep}{self.env.get('PATH', '')}"}
-        workflow = self.repo / ".github" / "workflows" / "release.yml"
-        for name in ("Check the tag matches every version number", "Repository checks for a release",
-                     "Build agent-bullpen-X.Y.Z.tar.gz and SHA256SUMS", "Release notes from CHANGELOG.md"):
-            result = run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", workflow_step(workflow, name)],
-                         self.repo, env=env, check=False)
-            self.assertEqual(result.returncode, 0, f"release.yml step '{name}':\n{result.stdout}\n{result.stderr}")
-        dist = self.repo / "dist"
-        self.assertTrue((dist / f"agent-bullpen-{version}.tar.gz").is_file())
-        run(["sha256sum", "-c", "SHA256SUMS"], dist)
-        notes = (dist / "notes.md").read_text()
-        shutil.rmtree(dist)
-        return notes
-
-    def test_a_fix_release(self):
-        self.released_state()
-        done = self.script("next-version.py")
-        self.assertEqual(done.stdout.strip(), "", done.stderr)  # nothing new yet
-
-        # A fix goes in under ## [Unreleased]; the next version raises the last number.
-        text = self.changelog()
-        first = text.index("\n## ") + 1
-        self.changelog(text[:first] + "## [Unreleased]\n\n" + UPGRADE + "### Fixed\n\n- A test fix.\n\n" + text[first:])
-        major, minor, patch = (int(x) for x in self.version.split("."))
-        want = f"{major}.{minor}.{patch + 1}"
-        out = self.tmp / "github_output"
-        self.assertEqual(self.script("next-version.py", GITHUB_OUTPUT=str(out)).stdout.strip(), want)
-        self.assertEqual(out.read_text(), f"version={want}\n")
-
-        self.script("bump-version.py", want)
-        self.assertEqual((self.repo / "VERSION").read_text().strip(), want)
-        dated = self.changelog()
-        self.assertRegex(dated, rf"(?m)^## \[{want}\] - \d{{4}}-\d{{2}}-\d{{2}}\n\n\*\*Upgrading:\*\* nothing to do\.\n\n### Fixed$")  # blank lines kept
-        self.assertIn(f"/releases/tag/v{want}", dated)
-        for rel in ("hub/app.py", "runner/runner.py"):
-            self.assertIn(f'VERSION = "{want}"', (self.repo / rel).read_text())
-        self.commit_and_tag(want)
-
-        notes = self.release_steps(want)
-        self.assertIn("A test fix.", notes)
-        self.assertTrue(notes.startswith("**Upgrading:**"))
-        self.assertNotIn(f"[{self.version}]", notes)
-        done = self.script("next-version.py")
-        self.assertEqual((done.returncode, done.stdout.strip()), (0, ""), done.stderr)
-
-    def test_problems_stop_before_anything_changes(self):
-        self.released_state()
-        text = self.changelog()
-        first = text.index("\n## ") + 1
-        watched = ("VERSION", "hub/app.py", "runner/runner.py", "CHANGELOG.md")
-        for top in ("## [Unreleased]\n\n" + UPGRADE + "### Fixed\n\n- A fix.\n\n"
-                    "## [9.9.9] - Unreleased\n\n" + UPGRADE + "- A feature.\n\n",
-                    "## Unreleased\n\n" + UPGRADE + "### Fixed\n\n- A fix.\n\n"):
-            with self.subTest(top=top.split("\n", 1)[0]):
-                self.changelog(text[:first] + top + text[first:])
-                before = {rel: (self.repo / rel).read_bytes() for rel in watched}
-                self.assertEqual(self.script("next-version.py", check=False).returncode, 1)
-                bumped = self.script("bump-version.py", "9.9.9", check=False)
-                self.assertNotEqual(bumped.returncode, 0)
-                self.assertIn("Nothing was changed", bumped.stderr)
-                self.assertEqual({rel: (self.repo / rel).read_bytes() for rel in watched}, before)
-                checked = run(self.py + ["tests/check_repo.py"], self.repo, env=self.env, check=False)
-                self.assertEqual(checked.returncode, 1, checked.stdout)
-                self.assertIn("CHANGELOG.md:", checked.stdout)
-
-
 class Workflows(unittest.TestCase):
-    def test_release_yml_runs_only_in_the_public_repository(self):
-        text = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("github.repository == 'rob-paprocki/agent-bullpen'", text)
-        self.assertNotIn("workflow_call", text)
-
     def test_there_is_no_schedule(self):
         self.assertFalse((ROOT / ".github/workflows/scheduled-release.yml").exists())
         for wf in (ROOT / ".github/workflows").glob("*.yml"):

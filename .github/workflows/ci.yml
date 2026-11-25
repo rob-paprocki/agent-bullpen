@@ -135,8 +135,8 @@ jobs:
           # Optional: private words to keep out, one regular expression per line (never printed).
           PRIVATE_WORDLIST: ${{ secrets.PRIVATE_WORDLIST }}
         run: python tests/check_repo.py
-      - name: The release scripts (tests/test_release.py)
-        run: python tests/test_release.py
+      - name: check_repo.py's own tests (tests/test_check_repo.py)
+        run: python tests/test_check_repo.py
 
   proxmox:
     name: Proxmox installer tests

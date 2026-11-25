@@ -93,7 +93,7 @@ Linux-only. CI also checks that the runner starts on Windows and macOS.
    | The hub's database, shared helpers and usage figures, and a few parts of the web app | `.venv/bin/python tests/test_hub_units.py` | seconds |
    | The runner on its own: jobs with the fake agent and a stand-in for the hub | `python3 tests/test_runner_units.py` | seconds |
    | Versions, personal references, links in the docs | `python3 tests/check_repo.py` | seconds |
-   | The release scripts: how the next version is picked, and a release in a throwaway copy | `python3 tests/test_release.py` | seconds |
+   | check_repo.py's own checks: the private folder, and the email, IP and MAC rules | `python3 tests/test_check_repo.py` | seconds |
    | Shell scripts | `shellcheck --shell=bash scripts/*/*.sh` | seconds |
    | The Proxmox installer, with stand-in commands | `sudo python3 tests/proxmox/test_installer.py` (as root, like the installer itself; nothing outside a temporary folder is touched; [guide 4](docs/04-proxmox-hub.md#how-the-installer-is-built)) | under a minute |
 
@@ -140,60 +140,27 @@ release.
 
 ### How releases reach this repository
 
-Each release is one commit, `Agent Bullpen X.Y.Z`, with its tag `vX.Y.Z`. The tag starts
-[.github/workflows/release.yml](.github/workflows/release.yml), which publishes the release (step 6 below).
-The version comes from the headings in `CHANGELOG.md`
-([scripts/release/next-version.py](scripts/release/next-version.py)):
+Each release is one commit, `Agent Bullpen X.Y.Z`, with its tag `vX.Y.Z`. Both come from the release
+workflow in the development repository. It runs the whole CI, reads the version from `CHANGELOG.md`, writes
+it to `VERSION`, `hub/app.py` and `runner/runner.py`, and dates the notes. The tag then starts
+[.github/workflows/release.yml](.github/workflows/release.yml) here. It checks that the tag and the three
+version numbers agree (`python3 tests/check_repo.py --tag vX.Y.Z`), then publishes the GitHub release with
+that changelog section as its notes, `agent-bullpen-X.Y.Z.tar.gz` (the repository at the tag, in a folder
+`agent-bullpen-X.Y.Z/`) and `SHA256SUMS`. The installers pick up the newest release on their own and check
+the download against `SHA256SUMS`.
+
+The version comes from the headings in `CHANGELOG.md`:
 
 - notes only under `### Fixed` or `### Security` raise the last number (1.0.0 to 1.0.1);
 - notes under `### Removed`, or an entry that starts with `**Breaking**` under any heading, raise the first
-  one (1.0.0 to 2.0.0);
+  one (1.0.0 to 2.0.0), or the middle one while the version is still below 1.0.0;
 - any other notes raise the middle one (1.0.0 to 1.1.0);
 - a heading written as `## [X.Y.Z] - Unreleased` (instead of `## [Unreleased]`) names the version itself.
 
 Every release section starts with an **Upgrading** line, right under its heading: `**Upgrading:** nothing
 to do.`, or `**Upgrading:**` followed by the steps (or a link to the guide that has them). A section
-without it is not released. The line is not a note, so it never changes the number.
-
-### By hand
-
-1. Check that CI passes on `main`.
-2. Write the release notes in `CHANGELOG.md`, under `## [Unreleased]` (or an existing
-   `## [X.Y.Z] - Unreleased` heading). The section starts with the **Upgrading** line.
-3. Set the new version everywhere and date the notes:
-
-   ```bash
-   python3 scripts/release/bump-version.py X.Y.Z
-   ```
-
-   It changes `VERSION`, `VERSION = "…"` in `hub/app.py` and `runner/runner.py`, and the changelog heading to
-   `## [X.Y.Z] - <today>`. Then it runs `tests/check_repo.py --tag vX.Y.Z`. To do it by hand, change those
-   four places yourself.
-4. Run the end-to-end test once more, then commit:
-
-   ```bash
-   git commit -am "Release X.Y.Z"
-   ```
-
-5. Tag the commit and push both:
-
-   ```bash
-   git tag -a vX.Y.Z -m "Agent Bullpen X.Y.Z"
-   ```
-
-   ```bash
-   git push origin main vX.Y.Z
-   ```
-
-6. The tag starts [.github/workflows/release.yml](.github/workflows/release.yml). It checks that the tag,
-   `VERSION` and both code versions agree. Then it builds `agent-bullpen-X.Y.Z.tar.gz` (the repository at the
-   tag, in a folder `agent-bullpen-X.Y.Z/`) and `SHA256SUMS`, and publishes them as a GitHub release with the
-   changelog section as its notes.
-7. Check the release page: it should have both files. The installers pick up the newest release on their
-   own and check the download against `SHA256SUMS`.
-
-If the workflow fails, fix the problem, delete the tag (`git tag -d vX.Y.Z` and
-`git push origin :refs/tags/vX.Y.Z`), and tag again.
+without it is not released. The line is not a note, so it never changes the number. Notes need at least one
+of those `###` headings.
 
 ## Moving the repository
 

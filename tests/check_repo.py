@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Checks that keep the repository ready to publish. Standard library only.
 
-    python3 tests/check_repo.py               run every check
-    python3 tests/check_repo.py --tag v1.0.0  also check that a release tag matches (used by
-                                              .github/workflows/release.yml)
+    python3 tests/check_repo.py [DIR]               run every check (on DIR, default this repository;
+                                                    the release kit runs it on the public copy)
+    python3 tests/check_repo.py [DIR] --tag v1.0.0  also check that a release tag matches (the
+                                                    release's RELEASE_TEST_COMMAND)
 
 It checks that:
 
@@ -152,7 +153,7 @@ PENDING_HEADING = re.compile(r"^## (?:\[Unreleased\]|\[\d+\.\d+\.\d+\] - Unrelea
 
 def check_changelog_sections(text: str, tag: str | None) -> None:
     """Only the newest section may be unreleased, in one of the forms the release scripts read
-    (scripts/release/next-version.py); with --tag, none may be, or code would ship without its notes."""
+    (scripts/release/changelog.py); with --tag, none may be, or code would ship without its notes."""
     headings = [(n, line.rstrip()) for n, line in enumerate(text.splitlines(), 1) if line.startswith("## ")]
     for i, (n, heading) in enumerate(headings):
         if DATED_HEADING.match(heading):
@@ -260,7 +261,7 @@ def check_denylist(files: list[str]) -> None:
 # from each @, since a regular expression would search a long run of letters again from every position.
 EMAIL_LOCAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._%+-")
 EMAIL_DOMAIN_RE = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]+")
-ALLOWED_EMAILS = {"hi@rpaprocki.com", "git@github.com",
+ALLOWED_EMAILS = {"hi@rpaprocki.com", "git@github.com", "noreply@github.com",
                   # The [bot] part keeps the pattern from matching this one at all; listed in case it changes.
                   "41898282+github-actions[bot]@users.noreply.github.com"}
 PLACEHOLDER_DOMAINS = ("example.com", "example.org", "example.net")  # and their subdomains
@@ -587,12 +588,20 @@ def check_reminders() -> None:
 
 
 def main(argv: list[str]) -> int:
-    tag = None
-    if argv[:1] == ["--tag"] and len(argv) == 2:
-        tag = argv[1]
-    elif argv:
+    global ROOT
+    args, tag = list(argv), None
+    if "--tag" in args:
+        i = args.index("--tag")
+        if i + 1 >= len(args):
+            print(__doc__.strip())
+            return 2
+        tag = args[i + 1]
+        del args[i:i + 2]
+    if len(args) > 1 or (args and (args[0].startswith("-") or not Path(args[0]).is_dir())):
         print(__doc__.strip())
         return 2
+    if args:
+        ROOT = Path(args[0]).resolve()
     files = tracked_files()
     check_versions(tag)
     check_denylist(files)

@@ -5,6 +5,16 @@ All notable changes to Agent Bullpen are listed here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The hub and the runner always share one
 version number, because the hub hands its own copy of the runner to every machine.
 
+## [Unreleased]
+
+## [1.2.0] - 2026-11-25
+
+**Upgrading:** nothing to do.
+
+### Changed
+
+- Releases come from a release workflow shared with the maintainer's other projects. The release commit, the tag, the tarball and `SHA256SUMS` have the same shape as before, so the installers need no change. `CONTRIBUTING.md` describes the new path.
+
 ## [1.1.1] - 2026-11-24
 
 **Upgrading:** nothing to do.
@@ -311,6 +321,7 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
   but not save them.
 - The installers download a release and check it against its `SHA256SUMS` before installing it.
 
+[1.2.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.2.0
 [1.1.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.1
 [1.1.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.0
 [1.0.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.0.1

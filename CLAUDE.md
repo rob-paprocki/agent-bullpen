@@ -76,7 +76,7 @@ python3 tests/check_repo.py
 ```
 
 ```bash
-python3 tests/test_release.py
+python3 tests/test_check_repo.py
 ```
 
 ```bash

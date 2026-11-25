@@ -257,11 +257,11 @@ scripts/
   proxmox/            create-hub-lxc.sh, upgrade-hub-lxc.sh (the installer, from a local copy)
   linux/              install-hub.sh, setup-workstation.sh (Linux and macOS), setup-api-gateway.sh
   windows/            Setup-Workstation.ps1
-  release/            bump-version.py, next-version.py, release-notes.py, set-repo.sh
+  release/            set-repo.sh (renames the repository) and the release tooling's scripts
 stack/                Docker files and the settings generator for LiteLLM and LibreChat
 agent-kit/            add-ons every machine installs: /remember, /recall, "second opinion"
 docs/                 the step-by-step guides
-tests/                the end-to-end test, the installer tests, the release tests and tests/check_repo.py
+tests/                the end-to-end test, the installer tests and tests/check_repo.py with its tests
 ```
 
 </details>
