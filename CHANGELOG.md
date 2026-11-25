@@ -7,6 +7,14 @@ version number, because the hub hands its own copy of the runner to every machin
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-25
+
+**Upgrading:** nothing to do.
+
+### Fixed
+
+- The release check no longer fails on the empty `[Unreleased]` heading that the release workflow leaves at the top of this file. That failure is why 1.2.0 has a tag but no release page or tarball; this release carries 1.2.0's change too.
+
 ## [1.2.0] - 2026-11-25
 
 **Upgrading:** nothing to do.
@@ -321,6 +329,7 @@ from one self-hosted dashboard, with any number of machines, accounts per machin
   but not save them.
 - The installers download a release and check it against its `SHA256SUMS` before installing it.
 
+[1.2.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.2.1
 [1.2.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.2.0
 [1.1.1]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.1
 [1.1.0]: https://github.com/rob-paprocki/agent-bullpen/releases/tag/v1.1.0

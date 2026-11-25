@@ -154,7 +154,8 @@ PENDING_HEADING = re.compile(r"^## (?:\[Unreleased\]|\[\d+\.\d+\.\d+\] - Unrelea
 def check_changelog_sections(text: str, tag: str | None) -> None:
     """Only the newest section may be unreleased, in one of the forms the release scripts read
     (scripts/release/changelog.py); with --tag, none may be, or code would ship without its notes."""
-    headings = [(n, line.rstrip()) for n, line in enumerate(text.splitlines(), 1) if line.startswith("## ")]
+    lines = text.splitlines()
+    headings = [(n, line.rstrip()) for n, line in enumerate(lines, 1) if line.startswith("## ")]
     for i, (n, heading) in enumerate(headings):
         if DATED_HEADING.match(heading):
             continue
@@ -164,7 +165,10 @@ def check_changelog_sections(text: str, tag: str | None) -> None:
         elif not PENDING_HEADING.match(heading):
             error(f"CHANGELOG.md:{n}: '{heading}' should be '## [Unreleased]', '## [X.Y.Z] - Unreleased' "
                   "or '## [X.Y.Z] - YYYY-MM-DD'")
-        elif tag is not None:
+        elif tag is not None and any(line.strip() for line in
+                                     lines[n:headings[i + 1][0] - 1 if i + 1 < len(headings) else None]):
+            # The release scripts leave an empty "## [Unreleased]" above the released section; only
+            # notes under it would ship without being in this release.
             error(f"CHANGELOG.md:{n}: '{heading}' has notes that aren't in this release: release them "
                   "together (date this section as the release) or move them out first")
 

@@ -277,6 +277,34 @@ class PersonalValues(unittest.TestCase):
         self.assertNotIn("private/notes.md", again.stdout)
 
 
+class ChangelogSections(unittest.TestCase):
+    """With --tag, an [Unreleased] section is an error only when it has notes under it."""
+
+    HEAD = "# Changelog\n\nIntro.\n\n"
+    RELEASED = "## [1.2.0] - 2026-11-25\n\n**Upgrading:** nothing to do.\n\n### Changed\n\n- A change.\n"
+
+    def problems(self, text, tag="v1.2.0"):
+        cr.errors.clear()
+        cr.check_changelog_sections(text, tag)
+        found = list(cr.errors)
+        cr.errors.clear()
+        return found
+
+    def test_empty_unreleased_on_a_tag_passes(self):
+        self.assertEqual(self.problems(self.HEAD + "## [Unreleased]\n\n" + self.RELEASED), [])
+
+    def test_unreleased_notes_on_a_tag_fail(self):
+        found = self.problems(self.HEAD + "## [Unreleased]\n\n### Fixed\n\n- Not released.\n\n" + self.RELEASED)
+        self.assertEqual(len(found), 1)
+        self.assertIn("has notes that aren't in this release", found[0])
+
+    def test_unreleased_notes_without_a_tag_pass(self):
+        self.assertEqual(self.problems(self.HEAD + "## [Unreleased]\n\n- Pending.\n\n" + self.RELEASED, None), [])
+
+    def test_only_an_unreleased_section_with_notes_fails_on_a_tag(self):
+        self.assertEqual(len(self.problems(self.HEAD + "## [Unreleased]\n\n- Pending.\n")), 1)
+
+
 class Workflows(unittest.TestCase):
     def test_there_is_no_schedule(self):
         self.assertFalse((ROOT / ".github/workflows/scheduled-release.yml").exists())
